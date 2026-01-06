@@ -398,7 +398,16 @@ class LTXVideoGeneratorWithOffloading:
             fp8transformer=fp8transformer,
         )
 
+        # Store params for stage 2 (create fresh ledger later to avoid shared state issues)
+        self._stage_2_checkpoint_path = checkpoint_path
+        self._stage_2_gemma_root = gemma_root
+        self._stage_2_spatial_upsampler_path = spatial_upsampler_path
+        self._stage_2_loras = loras
+        self._stage_2_distilled_lora = distilled_lora
+        self._stage_2_fp8transformer = fp8transformer
+
         # Create model ledger for stage 2 (with distilled LoRA)
+        # Note: Creating via with_loras for now, will create fresh in generate if needed
         self.stage_2_model_ledger = self.stage_1_model_ledger.with_loras(
             loras=distilled_lora,
         )
@@ -649,16 +658,34 @@ class LTXVideoGeneratorWithOffloading:
         print(">>> Stage 2: Loading transformer with distilled LoRA...", flush=True)
         stage2_start = time.time()
 
+        # Force complete cleanup before loading stage 2 transformer
+        print(">>> DEBUG: Forcing GC before stage 2 load...", flush=True)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        print(">>> DEBUG: GC complete", flush=True)
+
+        # Create fresh ModelLedger for stage 2 to avoid any shared state issues
+        print(">>> DEBUG: Creating fresh stage 2 model ledger...", flush=True)
+        stage_2_ledger = ModelLedger(
+            dtype=self.dtype,
+            device=torch.device("cpu") if self.enable_block_swap else self.device,
+            checkpoint_path=self._stage_2_checkpoint_path,
+            gemma_root_path=self._stage_2_gemma_root,
+            spatial_upsampler_path=self._stage_2_spatial_upsampler_path,
+            loras=(*self._stage_2_loras, *self._stage_2_distilled_lora) if self._stage_2_distilled_lora else self._stage_2_loras,
+            fp8transformer=self._stage_2_fp8transformer,
+        )
+        print(">>> DEBUG: Fresh stage 2 model ledger created", flush=True)
+
         # For block swapping, load transformer to CPU first
         block_swap_manager = None
         if self.enable_block_swap:
             print(f">>> DEBUG: About to load stage 2 transformer to CPU...", flush=True)
-            original_device = self.stage_2_model_ledger.device
-            self.stage_2_model_ledger.device = torch.device("cpu")
-            print(f">>> DEBUG: Calling stage_2_model_ledger.transformer()...", flush=True)
-            transformer = self.stage_2_model_ledger.transformer()
+            print(f">>> DEBUG: Calling stage_2_ledger.transformer()...", flush=True)
+            transformer = stage_2_ledger.transformer()
             print(f">>> DEBUG: Stage 2 transformer loaded", flush=True)
-            self.stage_2_model_ledger.device = original_device
 
             # Move non-block components to GPU
             print(f">>> Enabling block swapping for stage 2 ({self.blocks_in_memory} blocks in GPU)...")
@@ -700,7 +727,7 @@ class LTXVideoGeneratorWithOffloading:
                 device=self.device,
             )
         else:
-            transformer = self.stage_2_model_ledger.transformer()
+            transformer = stage_2_ledger.transformer()
 
         distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
 
