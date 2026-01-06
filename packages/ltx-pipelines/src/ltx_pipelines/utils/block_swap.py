@@ -207,6 +207,12 @@ def offload_all_blocks(model: X0Model | LTXModel) -> None:
             offloader._wait_blocks_move(idx)
             print(f"[BlockSwap] Block {idx} wait complete", flush=True)
 
+    # Shutdown the ThreadPoolExecutor to prevent hang on deletion
+    print("[BlockSwap] Shutting down thread pool...", flush=True)
+    offloader.thread_pool.shutdown(wait=True)
+    offloader.futures.clear()
+    print("[BlockSwap] Thread pool shutdown complete", flush=True)
+
     # Move all blocks to CPU
     print("[BlockSwap] Moving all blocks to CPU...", flush=True)
     for i, block in enumerate(ltx_model.transformer_blocks):
