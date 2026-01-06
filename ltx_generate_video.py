@@ -619,11 +619,17 @@ class LTXVideoGeneratorWithOffloading:
         print(">>> Upsampling latents (2x)...", flush=True)
         upsample_start = time.time()
 
+        print(">>> DEBUG: Loading spatial upsampler...", flush=True)
+        spatial_upsampler = self.stage_2_model_ledger.spatial_upsampler()
+        print(">>> DEBUG: Spatial upsampler loaded", flush=True)
+
+        print(">>> DEBUG: Calling upsample_video...", flush=True)
         upscaled_video_latent = upsample_video(
             latent=video_state.latent[:1],
             video_encoder=video_encoder,
-            upsampler=self.stage_2_model_ledger.spatial_upsampler(),
+            upsampler=spatial_upsampler,
         )
+        print(">>> DEBUG: upsample_video returned", flush=True)
 
         torch.cuda.synchronize()
         cleanup_memory()
