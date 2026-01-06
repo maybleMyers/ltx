@@ -579,6 +579,7 @@ class LTXVideoGeneratorWithOffloading:
         )
 
         print(f">>> Stage 1: Generating at {stage_1_output_shape.width}x{stage_1_output_shape.height}...")
+        import sys; sys.stdout.flush()
         video_state, audio_state = denoise_audio_video(
             output_shape=stage_1_output_shape,
             conditionings=stage_1_conditionings,
@@ -590,6 +591,7 @@ class LTXVideoGeneratorWithOffloading:
             dtype=dtype,
             device=self.device,
         )
+        print(">>> DEBUG: denoise_audio_video returned"); sys.stdout.flush()
 
         print(f">>> Stage 1 completed in {time.time() - stage1_start:.1f}s")
 
