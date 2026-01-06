@@ -640,11 +640,13 @@ class LTXVideoGeneratorWithOffloading:
         import sys; sys.stdout.flush(); sys.stderr.flush()
         print(">>> DEBUG: About to print upsampling time", flush=True)
         print(f">>> Upsampling completed in {time.time() - upsample_start:.1f}s", flush=True)
+        print(">>> DEBUG: After upsampling print", flush=True)
 
         # =====================================================================
         # Phase 4: Stage 2 - High Resolution Refinement
         # =====================================================================
-        print(">>> Stage 2: Loading transformer with distilled LoRA...")
+        print(">>> DEBUG: About to print Stage 2 loading message", flush=True)
+        print(">>> Stage 2: Loading transformer with distilled LoRA...", flush=True)
         stage2_start = time.time()
 
         # For block swapping, load transformer to CPU first
