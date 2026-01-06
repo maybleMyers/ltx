@@ -652,10 +652,12 @@ class LTXVideoGeneratorWithOffloading:
         # For block swapping, load transformer to CPU first
         block_swap_manager = None
         if self.enable_block_swap:
-            print(f">>> Loading stage 2 transformer to CPU for block swapping...")
+            print(f">>> DEBUG: About to load stage 2 transformer to CPU...", flush=True)
             original_device = self.stage_2_model_ledger.device
             self.stage_2_model_ledger.device = torch.device("cpu")
+            print(f">>> DEBUG: Calling stage_2_model_ledger.transformer()...", flush=True)
             transformer = self.stage_2_model_ledger.transformer()
+            print(f">>> DEBUG: Stage 2 transformer loaded", flush=True)
             self.stage_2_model_ledger.device = original_device
 
             # Move non-block components to GPU
