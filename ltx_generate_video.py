@@ -462,15 +462,11 @@ class LTXVideoGeneratorWithOffloading:
         v_context_p, a_context_p = context_p
         v_context_n, a_context_n = context_n
 
-        # Offload text encoder
-        if self.offload:
-            print(">>> Offloading text encoder to CPU...")
-            del text_encoder
-            synchronize_and_cleanup()
-        else:
-            torch.cuda.synchronize()
-            del text_encoder
-            cleanup_memory()
+        # Offload text encoder - must explicitly move to CPU first to free VRAM
+        print(">>> Releasing text encoder from GPU...")
+        text_encoder.to("cpu")
+        del text_encoder
+        synchronize_and_cleanup()
 
         print(f">>> Text encoding completed in {time.time() - start_time:.1f}s")
 
@@ -481,17 +477,56 @@ class LTXVideoGeneratorWithOffloading:
         stage1_start = time.time()
 
         video_encoder = self.stage_1_model_ledger.video_encoder()
-        transformer = self.stage_1_model_ledger.transformer()
 
-        # Enable block swapping if requested
+        # For block swapping, load transformer to CPU first, then selectively move blocks
         block_swap_manager = None
         if self.enable_block_swap:
+            print(f">>> Loading transformer to CPU for block swapping...")
+            # Temporarily override device to load to CPU
+            original_device = self.stage_1_model_ledger.device
+            self.stage_1_model_ledger.device = torch.device("cpu")
+            transformer = self.stage_1_model_ledger.transformer()
+            self.stage_1_model_ledger.device = original_device
+
+            # Move non-block components to GPU, keep blocks on CPU
             print(f">>> Enabling block swapping ({self.blocks_in_memory} blocks in GPU)...")
+            # Move the wrapper and non-block parts to GPU
+            transformer.velocity_model.patchify_proj.to(self.device)
+            transformer.velocity_model.adaln_single.to(self.device)
+            transformer.velocity_model.caption_projection.to(self.device)
+            transformer.velocity_model.norm_out.to(self.device)
+            transformer.velocity_model.proj_out.to(self.device)
+            transformer.velocity_model.scale_shift_table = torch.nn.Parameter(
+                transformer.velocity_model.scale_shift_table.to(self.device)
+            )
+            # Audio components
+            if hasattr(transformer.velocity_model, "audio_patchify_proj"):
+                transformer.velocity_model.audio_patchify_proj.to(self.device)
+            if hasattr(transformer.velocity_model, "audio_adaln_single"):
+                transformer.velocity_model.audio_adaln_single.to(self.device)
+            if hasattr(transformer.velocity_model, "audio_caption_projection"):
+                transformer.velocity_model.audio_caption_projection.to(self.device)
+            if hasattr(transformer.velocity_model, "audio_norm_out"):
+                transformer.velocity_model.audio_norm_out.to(self.device)
+            if hasattr(transformer.velocity_model, "audio_proj_out"):
+                transformer.velocity_model.audio_proj_out.to(self.device)
+            if hasattr(transformer.velocity_model, "audio_scale_shift_table"):
+                transformer.velocity_model.audio_scale_shift_table = torch.nn.Parameter(
+                    transformer.velocity_model.audio_scale_shift_table.to(self.device)
+                )
+            # Preprocessors (includes RoPE embeddings)
+            if hasattr(transformer.velocity_model, "video_args_preprocessor"):
+                transformer.velocity_model.video_args_preprocessor.to(self.device)
+            if hasattr(transformer.velocity_model, "audio_args_preprocessor"):
+                transformer.velocity_model.audio_args_preprocessor.to(self.device)
+
             block_swap_manager = enable_block_swap(
                 transformer,
                 blocks_in_memory=self.blocks_in_memory,
                 device=self.device,
             )
+        else:
+            transformer = self.stage_1_model_ledger.transformer()
 
         # Create diffusion schedule
         sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(
@@ -586,17 +621,51 @@ class LTXVideoGeneratorWithOffloading:
         print(">>> Stage 2: Loading transformer with distilled LoRA...")
         stage2_start = time.time()
 
-        transformer = self.stage_2_model_ledger.transformer()
-
-        # Enable block swapping for stage 2 if requested
+        # For block swapping, load transformer to CPU first
         block_swap_manager = None
         if self.enable_block_swap:
+            print(f">>> Loading stage 2 transformer to CPU for block swapping...")
+            original_device = self.stage_2_model_ledger.device
+            self.stage_2_model_ledger.device = torch.device("cpu")
+            transformer = self.stage_2_model_ledger.transformer()
+            self.stage_2_model_ledger.device = original_device
+
+            # Move non-block components to GPU
             print(f">>> Enabling block swapping for stage 2 ({self.blocks_in_memory} blocks in GPU)...")
+            transformer.velocity_model.patchify_proj.to(self.device)
+            transformer.velocity_model.adaln_single.to(self.device)
+            transformer.velocity_model.caption_projection.to(self.device)
+            transformer.velocity_model.norm_out.to(self.device)
+            transformer.velocity_model.proj_out.to(self.device)
+            transformer.velocity_model.scale_shift_table = torch.nn.Parameter(
+                transformer.velocity_model.scale_shift_table.to(self.device)
+            )
+            if hasattr(transformer.velocity_model, "audio_patchify_proj"):
+                transformer.velocity_model.audio_patchify_proj.to(self.device)
+            if hasattr(transformer.velocity_model, "audio_adaln_single"):
+                transformer.velocity_model.audio_adaln_single.to(self.device)
+            if hasattr(transformer.velocity_model, "audio_caption_projection"):
+                transformer.velocity_model.audio_caption_projection.to(self.device)
+            if hasattr(transformer.velocity_model, "audio_norm_out"):
+                transformer.velocity_model.audio_norm_out.to(self.device)
+            if hasattr(transformer.velocity_model, "audio_proj_out"):
+                transformer.velocity_model.audio_proj_out.to(self.device)
+            if hasattr(transformer.velocity_model, "audio_scale_shift_table"):
+                transformer.velocity_model.audio_scale_shift_table = torch.nn.Parameter(
+                    transformer.velocity_model.audio_scale_shift_table.to(self.device)
+                )
+            if hasattr(transformer.velocity_model, "video_args_preprocessor"):
+                transformer.velocity_model.video_args_preprocessor.to(self.device)
+            if hasattr(transformer.velocity_model, "audio_args_preprocessor"):
+                transformer.velocity_model.audio_args_preprocessor.to(self.device)
+
             block_swap_manager = enable_block_swap(
                 transformer,
                 blocks_in_memory=self.blocks_in_memory,
                 device=self.device,
             )
+        else:
+            transformer = self.stage_2_model_ledger.transformer()
 
         distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
 
