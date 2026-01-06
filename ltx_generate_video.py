@@ -43,6 +43,7 @@ from ltx_core.text_encoders.gemma import encode_text
 from ltx_core.types import LatentState, VideoPixelShape
 
 from ltx_pipelines.utils import ModelLedger
+from ltx_pipelines.utils.block_swap import enable_block_swap, get_block_swap_manager
 from ltx_pipelines.utils.constants import (
     AUDIO_SAMPLE_RATE,
     DEFAULT_CFG_GUIDANCE_SCALE,
@@ -76,6 +77,9 @@ from ltx_pipelines.utils.types import PipelineComponents
 DEFAULT_WIDTH = 1024
 DEFAULT_HEIGHT = 1024
 DEFAULT_GEMMA_ROOT = "./gemma-3-12b-it-qat-q4_0-unquantized"
+DEFAULT_CHECKPOINT_PATH = "./weights/ltx-2-19b-dev.safetensors"
+DEFAULT_SPATIAL_UPSAMPLER_PATH = "./weights/ltx-2-spatial-upscaler-x2-1.0.safetensors"
+DEFAULT_DISTILLED_LORA_PATH = "./weights/ltx-2-19b-distilled-lora-384.safetensors"
 
 
 # =============================================================================
@@ -160,8 +164,8 @@ Examples:
     model_group.add_argument(
         "--checkpoint-path",
         type=resolve_path,
-        required=True,
-        help="Path to LTX-2 model checkpoint (.safetensors file).",
+        default=DEFAULT_CHECKPOINT_PATH,
+        help=f"Path to LTX-2 model checkpoint (default: {DEFAULT_CHECKPOINT_PATH}).",
     )
     model_group.add_argument(
         "--gemma-root",
@@ -172,8 +176,8 @@ Examples:
     model_group.add_argument(
         "--spatial-upsampler-path",
         type=resolve_path,
-        required=True,
-        help="Path to spatial upsampler model for 2x resolution increase.",
+        default=DEFAULT_SPATIAL_UPSAMPLER_PATH,
+        help=f"Path to spatial upsampler model (default: {DEFAULT_SPATIAL_UPSAMPLER_PATH}).",
     )
     model_group.add_argument(
         "--distilled-lora",
@@ -181,8 +185,8 @@ Examples:
         action=LoraAction,
         nargs="+",
         metavar=("PATH", "STRENGTH"),
-        required=True,
-        help="Distilled LoRA for stage 2 refinement. Example: --distilled-lora path.safetensors 1.0",
+        default=None,
+        help=f"Distilled LoRA for stage 2 (default: {DEFAULT_DISTILLED_LORA_PATH} 1.0).",
     )
 
     # ==========================================================================
@@ -479,6 +483,16 @@ class LTXVideoGeneratorWithOffloading:
         video_encoder = self.stage_1_model_ledger.video_encoder()
         transformer = self.stage_1_model_ledger.transformer()
 
+        # Enable block swapping if requested
+        block_swap_manager = None
+        if self.enable_block_swap:
+            print(f">>> Enabling block swapping ({self.blocks_in_memory} blocks in GPU)...")
+            block_swap_manager = enable_block_swap(
+                transformer,
+                blocks_in_memory=self.blocks_in_memory,
+                device=self.device,
+            )
+
         # Create diffusion schedule
         sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(
             dtype=torch.float32, device=self.device
@@ -541,10 +555,13 @@ class LTXVideoGeneratorWithOffloading:
         print(f">>> Stage 1 completed in {time.time() - stage1_start:.1f}s")
 
         # Cleanup stage 1 transformer
+        if block_swap_manager:
+            block_swap_manager.offload_all()
         if self.offload:
             print(">>> Offloading stage 1 transformer to CPU...")
         torch.cuda.synchronize()
         del transformer
+        del block_swap_manager
         cleanup_memory()
 
         # =====================================================================
@@ -570,6 +587,17 @@ class LTXVideoGeneratorWithOffloading:
         stage2_start = time.time()
 
         transformer = self.stage_2_model_ledger.transformer()
+
+        # Enable block swapping for stage 2 if requested
+        block_swap_manager = None
+        if self.enable_block_swap:
+            print(f">>> Enabling block swapping for stage 2 ({self.blocks_in_memory} blocks in GPU)...")
+            block_swap_manager = enable_block_swap(
+                transformer,
+                blocks_in_memory=self.blocks_in_memory,
+                device=self.device,
+            )
+
         distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
 
         # Define denoising function for stage 2 (no CFG, just positive)
@@ -629,8 +657,11 @@ class LTXVideoGeneratorWithOffloading:
         print(f">>> Stage 2 completed in {time.time() - stage2_start:.1f}s")
 
         # Cleanup stage 2 models
+        if block_swap_manager:
+            block_swap_manager.offload_all()
         torch.cuda.synchronize()
         del transformer
+        del block_swap_manager
         del video_encoder
         cleanup_memory()
 
@@ -674,6 +705,14 @@ def main():
     # Configure logging
     log_level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(level=log_level, format="%(message)s")
+
+    # Handle default distilled LoRA
+    if args.distilled_lora is None:
+        args.distilled_lora = [LoraPathStrengthAndSDOps(
+            resolve_path(DEFAULT_DISTILLED_LORA_PATH),
+            DEFAULT_LORA_STRENGTH,
+            LTXV_LORA_COMFY_RENAMING_MAP
+        )]
 
     print("=" * 60)
     print("LTX-2 Video Generation")

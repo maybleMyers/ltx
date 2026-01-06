@@ -512,27 +512,27 @@ def create_interface():
                     # Left column - Parameters
                     with gr.Column():
                         # Model Configuration
-                        with gr.Accordion("Model Configuration", open=True):
+                        with gr.Accordion("Model Configuration", open=False):
                             checkpoint_path = gr.Textbox(
                                 label="LTX Checkpoint Path",
-                                placeholder="/path/to/ltx-model.safetensors",
-                                info="Required: Path to LTX-2 model checkpoint"
+                                value="./weights/ltx-2-19b-dev.safetensors",
+                                info="Path to LTX-2 model checkpoint"
                             )
                             gemma_root = gr.Textbox(
                                 label="Gemma Root Path",
                                 value="./gemma-3-12b-it-qat-q4_0-unquantized",
-                                info="Required: Path to Gemma text encoder"
+                                info="Path to Gemma text encoder"
                             )
                             spatial_upsampler_path = gr.Textbox(
                                 label="Spatial Upsampler Path",
-                                placeholder="/path/to/upsampler.safetensors",
-                                info="Required: Path to 2x spatial upsampler"
+                                value="./weights/ltx-2-spatial-upscaler-x2-1.0.safetensors",
+                                info="Path to 2x spatial upsampler"
                             )
                             with gr.Row():
                                 distilled_lora_path = gr.Textbox(
                                     label="Distilled LoRA Path",
-                                    placeholder="/path/to/distilled.safetensors",
-                                    info="Required: For stage 2 refinement",
+                                    value="./weights/ltx-2-19b-distilled-lora-384.safetensors",
+                                    info="For stage 2 refinement",
                                     scale=3
                                 )
                                 distilled_lora_strength = gr.Slider(
