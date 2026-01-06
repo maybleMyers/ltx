@@ -60,7 +60,7 @@ def image_conditionings_by_replacing_latent(
             VideoConditionByLatentIndex(
                 latent=encoded_image,
                 strength=strength,
-                latent_idx=frame_idx,
+                latent_idx=frame_idx // 8,
             )
         )
 
