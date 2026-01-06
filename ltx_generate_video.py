@@ -356,6 +356,88 @@ def synchronize_and_cleanup():
         torch.cuda.empty_cache()
 
 
+def apply_loras_chunked_gpu(
+    model: torch.nn.Module,
+    lora_state_dicts: list,
+    lora_strengths: list[float],
+    gpu_device: torch.device,
+    dtype: torch.dtype = torch.bfloat16,
+) -> None:
+    """
+    Apply LoRAs to a model in a chunked manner using GPU for computation.
+
+    This function processes each layer's weight individually:
+    1. Move weight and LoRA matrices to GPU
+    2. Compute LoRA delta on GPU: delta = lora_B @ lora_A * strength
+    3. Add delta to weight on GPU
+    4. Move result back to CPU
+
+    This keeps peak GPU memory low while using GPU for fast computation.
+
+    Key naming conventions:
+    - Model parameter: velocity_model.adaln_single.xxx.weight
+    - LoRA keys (after sd_ops): adaln_single.xxx.lora_A.weight
+    - So we strip "velocity_model." prefix when looking up LoRA keys
+    """
+    from tqdm import tqdm
+
+    # Build a map of LoRA weights for quick lookup
+    lora_maps = []
+    for lsd in lora_state_dicts:
+        lora_map = {}
+        for key in lsd.sd.keys():
+            if ".lora_A.weight" in key or ".lora_B.weight" in key:
+                lora_map[key] = lsd.sd[key]
+        lora_maps.append(lora_map)
+
+    # Get all named parameters that might have LoRAs
+    params_to_process = []
+    for name, param in model.named_parameters():
+        if param is not None and name.endswith(".weight"):
+            # Model param: velocity_model.adaln_single.xxx.weight
+            # LoRA key: adaln_single.xxx.lora_A.weight
+            # Strip velocity_model. prefix if present
+            lora_prefix = name[:-len(".weight")]
+            if lora_prefix.startswith("velocity_model."):
+                lora_prefix = lora_prefix[len("velocity_model."):]
+
+            key_a = f"{lora_prefix}.lora_A.weight"
+            key_b = f"{lora_prefix}.lora_B.weight"
+            # Check if any LoRA has weights for this layer
+            has_lora = any(key_a in lora_map and key_b in lora_map for lora_map in lora_maps)
+            if has_lora:
+                params_to_process.append((name, param, lora_prefix, key_a, key_b))
+
+    print(f">>> Applying LoRAs to {len(params_to_process)} layers using GPU...")
+
+    for name, param, lora_prefix, key_a, key_b in tqdm(params_to_process, desc="Applying LoRAs"):
+        # Collect all LoRA deltas for this weight
+        deltas = []
+        for lora_map, strength in zip(lora_maps, lora_strengths):
+            if key_a in lora_map and key_b in lora_map:
+                lora_a = lora_map[key_a].to(device=gpu_device, dtype=dtype)
+                lora_b = lora_map[key_b].to(device=gpu_device, dtype=dtype)
+                delta = torch.matmul(lora_b * strength, lora_a)
+                deltas.append(delta)
+                # Free GPU memory immediately
+                del lora_a, lora_b
+
+        if deltas:
+            # Move weight to GPU, apply deltas, move back to CPU
+            weight_gpu = param.data.to(device=gpu_device, dtype=dtype)
+            for delta in deltas:
+                weight_gpu.add_(delta)
+                del delta
+            param.data = weight_gpu.to(device="cpu", dtype=dtype)
+            del weight_gpu
+
+            # Periodically clean up GPU memory
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    print(">>> LoRA application complete")
+
+
 # =============================================================================
 # Pipeline with Offloading
 # =============================================================================
@@ -628,64 +710,79 @@ class LTXVideoGeneratorWithOffloading:
         print(">>> Upsampling latents (2x)...", flush=True)
         upsample_start = time.time()
 
-        print(">>> DEBUG: Loading spatial upsampler...", flush=True)
         spatial_upsampler = self.stage_2_model_ledger.spatial_upsampler()
-        print(">>> DEBUG: Spatial upsampler loaded", flush=True)
-
-        print(">>> DEBUG: Calling upsample_video...", flush=True)
         upscaled_video_latent = upsample_video(
             latent=video_state.latent[:1],
             video_encoder=video_encoder,
             upsampler=spatial_upsampler,
         )
-        print(">>> DEBUG: upsample_video returned", flush=True)
 
-        print(">>> DEBUG: About to cuda.synchronize...", flush=True)
         torch.cuda.synchronize()
-        print(">>> DEBUG: cuda.synchronize done", flush=True)
-        print(">>> DEBUG: About to cleanup_memory...", flush=True)
         cleanup_memory()
-        print(">>> DEBUG: cleanup_memory done", flush=True)
-        import sys; sys.stdout.flush(); sys.stderr.flush()
-        print(">>> DEBUG: About to print upsampling time", flush=True)
         print(f">>> Upsampling completed in {time.time() - upsample_start:.1f}s", flush=True)
-        print(">>> DEBUG: After upsampling print", flush=True)
 
         # =====================================================================
         # Phase 4: Stage 2 - High Resolution Refinement
         # =====================================================================
-        print(">>> DEBUG: About to print Stage 2 loading message", flush=True)
         print(">>> Stage 2: Loading transformer with distilled LoRA...", flush=True)
         stage2_start = time.time()
 
         # Force complete cleanup before loading stage 2 transformer
-        print(">>> DEBUG: Forcing GC before stage 2 load...", flush=True)
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
-        print(">>> DEBUG: GC complete", flush=True)
 
-        # Create fresh ModelLedger for stage 2 to avoid any shared state issues
-        print(">>> DEBUG: Creating fresh stage 2 model ledger...", flush=True)
-        stage_2_ledger = ModelLedger(
-            dtype=self.dtype,
-            device=torch.device("cpu") if self.enable_block_swap else self.device,
-            checkpoint_path=self._stage_2_checkpoint_path,
-            gemma_root_path=self._stage_2_gemma_root,
-            spatial_upsampler_path=self._stage_2_spatial_upsampler_path,
-            loras=(*self._stage_2_loras, *self._stage_2_distilled_lora) if self._stage_2_distilled_lora else self._stage_2_loras,
-            fp8transformer=self._stage_2_fp8transformer,
-        )
-        print(">>> DEBUG: Fresh stage 2 model ledger created", flush=True)
-
-        # For block swapping, load transformer to CPU first
+        # For block swapping with LoRAs, we need to:
+        # 1. Load transformer WITHOUT LoRAs to CPU (fast)
+        # 2. Load LoRA state dicts
+        # 3. Apply LoRAs using chunked GPU computation (fast, low memory)
+        # This avoids the slow CPU-only LoRA application that appears to hang.
         block_swap_manager = None
         if self.enable_block_swap:
-            print(f">>> DEBUG: About to load stage 2 transformer to CPU...", flush=True)
-            print(f">>> DEBUG: Calling stage_2_ledger.transformer()...", flush=True)
-            transformer = stage_2_ledger.transformer()
-            print(f">>> DEBUG: Stage 2 transformer loaded", flush=True)
+            # Create ledger WITHOUT LoRAs - loading will be fast
+            stage_2_ledger_no_lora = ModelLedger(
+                dtype=self.dtype,
+                device=torch.device("cpu"),
+                checkpoint_path=self._stage_2_checkpoint_path,
+                gemma_root_path=self._stage_2_gemma_root,
+                spatial_upsampler_path=self._stage_2_spatial_upsampler_path,
+                loras=(),  # No LoRAs - load base model only
+                fp8transformer=self._stage_2_fp8transformer,
+            )
+
+            # Load transformer without LoRAs (fast - just loading weights)
+            print(">>> Loading stage 2 transformer to CPU...", flush=True)
+            transformer = stage_2_ledger_no_lora.transformer()
+
+            # Now apply LoRAs using chunked GPU computation
+            all_loras = (*self._stage_2_loras, *self._stage_2_distilled_lora) if self._stage_2_distilled_lora else self._stage_2_loras
+            if all_loras:
+                print(f">>> Loading {len(all_loras)} LoRA(s)...", flush=True)
+                from ltx_core.loader.sft_loader import SafetensorsStateDictLoader
+                lora_loader = SafetensorsStateDictLoader()
+                lora_state_dicts = []
+                lora_strengths = []
+                for lora in all_loras:
+                    lora_sd = lora_loader.load(lora.path, sd_ops=lora.sd_ops, device=torch.device("cpu"))
+                    lora_state_dicts.append(lora_sd)
+                    lora_strengths.append(lora.strength)
+
+                # Apply LoRAs using chunked GPU computation
+                apply_loras_chunked_gpu(
+                    model=transformer,
+                    lora_state_dicts=lora_state_dicts,
+                    lora_strengths=lora_strengths,
+                    gpu_device=self.device,
+                    dtype=self.dtype,
+                )
+
+                # Clean up LoRA state dicts
+                del lora_state_dicts
+                synchronize_and_cleanup()
+
+            # For VAE operations later
+            stage_2_ledger = stage_2_ledger_no_lora
 
             # Move non-block components to GPU
             print(f">>> Enabling block swapping for stage 2 ({self.blocks_in_memory} blocks in GPU)...")
@@ -727,6 +824,16 @@ class LTXVideoGeneratorWithOffloading:
                 device=self.device,
             )
         else:
+            # Non-block-swap case: load with LoRAs directly to GPU (fast)
+            stage_2_ledger = ModelLedger(
+                dtype=self.dtype,
+                device=self.device,
+                checkpoint_path=self._stage_2_checkpoint_path,
+                gemma_root_path=self._stage_2_gemma_root,
+                spatial_upsampler_path=self._stage_2_spatial_upsampler_path,
+                loras=(*self._stage_2_loras, *self._stage_2_distilled_lora) if self._stage_2_distilled_lora else self._stage_2_loras,
+                fp8transformer=self._stage_2_fp8transformer,
+            )
             transformer = stage_2_ledger.transformer()
 
         distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
