@@ -507,6 +507,140 @@ def apply_loras_chunked_gpu(
 
 
 # =============================================================================
+# Chunked Video Encoding
+# =============================================================================
+
+def encode_video_chunked(
+    video_tensor: torch.Tensor,
+    video_encoder,
+    chunk_frames: int = 65,  # 8*8 + 1
+    overlap_frames: int = 8,
+) -> torch.Tensor:
+    """
+    Encode video in temporal chunks to reduce memory usage.
+    Uses trapezoidal blending for smooth transitions.
+
+    Args:
+        video_tensor: Shape (1, C, F, H, W) normalized video
+        video_encoder: VideoEncoder model
+        chunk_frames: Frames per chunk (must be 8*k+1)
+        overlap_frames: Overlap between chunks (must be multiple of 8)
+
+    Returns:
+        Encoded latent tensor (1, latent_channels, F', H', W')
+    """
+    _, c, total_frames, h, w = video_tensor.shape
+
+    # If video fits in one chunk, encode directly
+    if total_frames <= chunk_frames:
+        return video_encoder(video_tensor)
+
+    # Validate
+    assert (chunk_frames - 1) % 8 == 0, "chunk_frames must be 8*k+1"
+    assert overlap_frames % 8 == 0, "overlap must be multiple of 8"
+
+    # Calculate latent overlap (temporal compression is 8x)
+    latent_overlap = overlap_frames // 8
+
+    # Collect chunks
+    chunks_info = []  # (start_frame, end_frame, pad_frames)
+    start = 0
+    while start < total_frames:
+        end = min(start + chunk_frames, total_frames)
+        actual_frames = end - start
+
+        # Pad last chunk if needed to satisfy 8*k+1
+        if (actual_frames - 1) % 8 != 0:
+            # Find next valid size
+            target = 8 * ((actual_frames - 1) // 8 + 1) + 1
+            pad_frames = target - actual_frames
+            chunks_info.append((start, end, pad_frames))
+        else:
+            chunks_info.append((start, end, 0))
+
+        # Move to next chunk
+        if end >= total_frames:
+            break
+        start = end - overlap_frames
+
+    print(f">>> Encoding {len(chunks_info)} chunk(s) of {chunk_frames} frames each...")
+
+    # Encode each chunk
+    latent_chunks = []
+    for i, (start, end, pad) in enumerate(chunks_info):
+        print(f">>> Encoding chunk {i+1}/{len(chunks_info)} (frames {start}-{end})...")
+        chunk = video_tensor[:, :, start:end, :, :]
+
+        # Pad if necessary
+        if pad > 0:
+            last_frame = chunk[:, :, -1:, :, :]
+            padding = last_frame.expand(-1, -1, pad, -1, -1)
+            chunk = torch.cat([chunk, padding], dim=2)
+
+        # Encode
+        with torch.no_grad():
+            latent = video_encoder(chunk)
+
+        # Remove padded latent tokens if we padded
+        if pad > 0:
+            valid_tokens = (end - start - 1) // 8 + 1
+            latent = latent[:, :, :valid_tokens, :, :]
+
+        latent_chunks.append(latent)
+
+        # Free memory
+        del chunk
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # Combine chunks with blending
+    if len(latent_chunks) == 1:
+        return latent_chunks[0]
+
+    # Calculate total latent frames
+    total_latent_frames = (total_frames - 1) // 8 + 1
+    result_shape = list(latent_chunks[0].shape)
+    result_shape[2] = total_latent_frames
+    result = torch.zeros(result_shape, dtype=latent_chunks[0].dtype, device=latent_chunks[0].device)
+    weight_sum = torch.zeros(total_latent_frames, dtype=torch.float32, device=result.device)
+
+    latent_pos = 0
+    for i, latent in enumerate(latent_chunks):
+        chunk_len = latent.shape[2]
+
+        # Create weight mask
+        weight = torch.ones(chunk_len, device=latent.device)
+
+        # Fade in for non-first chunks
+        if i > 0 and latent_overlap > 0:
+            fade_in = torch.linspace(0, 1, latent_overlap + 1, device=latent.device)[1:]
+            weight[:latent_overlap] = fade_in
+
+        # Fade out for non-last chunks
+        if i < len(latent_chunks) - 1 and latent_overlap > 0:
+            fade_out = torch.linspace(1, 0, latent_overlap + 1, device=latent.device)[1:]
+            weight[-latent_overlap:] = fade_out
+
+        # Add weighted latent to result
+        end_pos = min(latent_pos + chunk_len, total_latent_frames)
+        actual_len = end_pos - latent_pos
+
+        weight_expanded = weight[:actual_len].view(1, 1, actual_len, 1, 1)
+        result[:, :, latent_pos:end_pos, :, :] += latent[:, :, :actual_len, :, :] * weight_expanded
+        weight_sum[latent_pos:end_pos] += weight[:actual_len]
+
+        # Move position (accounting for overlap)
+        if i < len(latent_chunks) - 1:
+            latent_pos = latent_pos + chunk_len - latent_overlap
+
+    # Normalize by weight sum
+    weight_sum = weight_sum.clamp(min=1e-8).view(1, 1, -1, 1, 1)
+    result = result / weight_sum
+
+    return result
+
+
+# =============================================================================
 # Pipeline with Offloading
 # =============================================================================
 
@@ -667,7 +801,7 @@ class LTXVideoGeneratorWithOffloading:
 
             video_encoder = self.stage_1_model_ledger.video_encoder()
 
-            # Load and encode input video
+            # Load and encode input video (using chunked encoding to manage memory)
             video_tensor = load_video_conditioning(
                 video_path=input_video,
                 height=height,
@@ -676,7 +810,12 @@ class LTXVideoGeneratorWithOffloading:
                 dtype=dtype,
                 device=self.device,
             )
-            upscaled_video_latent = video_encoder(video_tensor)
+            upscaled_video_latent = encode_video_chunked(
+                video_tensor=video_tensor,
+                video_encoder=video_encoder,
+                chunk_frames=65,  # 8*8 + 1 frames per chunk
+                overlap_frames=8,  # 1 latent token overlap
+            )
 
             # For audio, generate fresh audio latent that will be denoised in stage 2
             audio_shape = self.pipeline_components.get_audio_shape(
