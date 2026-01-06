@@ -9,7 +9,9 @@
 **LTX-2** is the first DiT-based audio-video foundation model that contains all core capabilities of modern video generation in one model: synchronized audio and video, high fidelity, multiple performance modes, production-ready outputs, API access, and open access.
 
 
-https://github.com/user-attachments/assets/1922e7f0-cc5d-430c-9e1a-93c589e85fb4
+<div align="center">
+  <video src="https://github.com/user-attachments/assets/1922e7f0-cc5d-430c-9e1a-93c589e85fb4" width="70%" poster=""> </video>
+</div>
 
 
 ## 🚀 Quick Start
