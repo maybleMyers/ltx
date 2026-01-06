@@ -707,15 +707,50 @@ def create_interface():
 
 
 # =============================================================================
+# Port Detection
+# =============================================================================
+
+def find_available_port(start_port: int = 7860, max_attempts: int = 100) -> int:
+    """Find the first available port starting from start_port."""
+    import socket
+    for port in range(start_port, start_port + max_attempts):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(('', port))
+                return port
+        except OSError:
+            continue
+    raise RuntimeError(f"Could not find available port in range {start_port}-{start_port + max_attempts}")
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="LTX-2 Video Generation UI")
+    parser.add_argument("--port", type=int, default=None,
+                        help="Server port. Auto-detects available port if not specified.")
+    parser.add_argument("--share", action="store_true",
+                        help="Create a public Gradio link.")
+    args = parser.parse_args()
+
+    # Determine port (auto-detect if not specified)
+    if args.port is not None:
+        port = args.port
+    else:
+        port = find_available_port(7860)
+
+    cuda_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "all")
+    print(f"[lt1.py] Starting on port {port}, CUDA_VISIBLE_DEVICES={cuda_devices}")
+
     demo = create_interface()
     demo.queue()
     demo.launch(
         server_name="0.0.0.0",
-        server_port=7860,
-        share=False,
+        server_port=port,
+        share=args.share,
         inbrowser=False
     )
