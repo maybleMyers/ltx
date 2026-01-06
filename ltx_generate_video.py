@@ -592,6 +592,8 @@ class LTXVideoGeneratorWithOffloading:
             device=self.device,
         )
         print(">>> DEBUG: denoise_audio_video returned"); sys.stdout.flush()
+        torch.cuda.synchronize()  # Must sync before any other operations
+        print(">>> DEBUG: cuda synced"); sys.stdout.flush()
 
         print(f">>> Stage 1 completed in {time.time() - stage1_start:.1f}s")
 
