@@ -591,16 +591,22 @@ class LTXVideoGeneratorWithOffloading:
             device=self.device,
         )
 
-        print(f">>> Stage 1 completed in {time.time() - stage1_start:.1f}s")
+        print(f">>> Stage 1 completed in {time.time() - stage1_start:.1f}s", flush=True)
 
         # Cleanup stage 1 transformer
+        print(">>> DEBUG: About to cleanup stage 1 transformer", flush=True)
         if block_swap_manager:
+            print(">>> DEBUG: Calling offload_all_blocks", flush=True)
             offload_all_blocks(transformer)
+            print(">>> DEBUG: offload_all_blocks returned", flush=True)
         if self.offload:
             print(">>> Offloading stage 1 transformer to CPU...")
+        print(">>> DEBUG: About to delete transformer", flush=True)
         del transformer
         del block_swap_manager
+        print(">>> DEBUG: About to cleanup_memory", flush=True)
         cleanup_memory()
+        print(">>> DEBUG: Stage 1 cleanup complete", flush=True)
 
         # =====================================================================
         # Phase 3: Spatial Upsampling

@@ -188,6 +188,7 @@ def offload_all_blocks(model: X0Model | LTXModel) -> None:
     Args:
         model: Model with block swapping enabled.
     """
+    print("[BlockSwap] offload_all_blocks called", flush=True)
     if isinstance(model, X0Model):
         ltx_model = model.velocity_model
     else:
@@ -195,16 +196,24 @@ def offload_all_blocks(model: X0Model | LTXModel) -> None:
 
     offloader = getattr(ltx_model, "_block_swap_offloader", None)
     if offloader is None:
+        print("[BlockSwap] No offloader found, returning", flush=True)
         return
 
     # Wait for any pending operations
+    print(f"[BlockSwap] Waiting for pending futures: {list(offloader.futures.keys())}", flush=True)
     for idx in range(len(ltx_model.transformer_blocks)):
         if idx in offloader.futures:
+            print(f"[BlockSwap] Waiting for block {idx}...", flush=True)
             offloader._wait_blocks_move(idx)
+            print(f"[BlockSwap] Block {idx} wait complete", flush=True)
 
     # Move all blocks to CPU
-    for block in ltx_model.transformer_blocks:
+    print("[BlockSwap] Moving all blocks to CPU...", flush=True)
+    for i, block in enumerate(ltx_model.transformer_blocks):
         weighs_to_device(block, "cpu")
+        if i % 10 == 0:
+            print(f"[BlockSwap] Moved block {i} to CPU", flush=True)
 
+    print("[BlockSwap] Cleaning memory...", flush=True)
     clean_memory_on_device(offloader.device)
     print("[BlockSwap] All blocks offloaded to CPU")
