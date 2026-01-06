@@ -577,7 +577,7 @@ def create_interface():
                                 offload = gr.Checkbox(label="CPU Offloading", value=False, info="Offload models to CPU when not in use")
                                 enable_fp8 = gr.Checkbox(label="FP8 Mode", value=False, info="Reduce memory with FP8 transformer")
                             with gr.Row():
-                                enable_block_swap = gr.Checkbox(label="Block Swapping", value=False, info="~40% VRAM reduction")
+                                enable_block_swap = gr.Checkbox(label="Block Swapping", value=True)
                                 blocks_in_memory = gr.Slider(minimum=1, maximum=47, value=22, step=1, label="Blocks in GPU", visible=False)
 
                         # User LoRA

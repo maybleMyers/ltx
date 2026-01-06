@@ -136,7 +136,7 @@ class BlockSwapManager:
         self._blocks_on_gpu.clear()
 
         if torch.cuda.is_available():
-            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
 
 def _create_block_swap_forward(
@@ -166,20 +166,12 @@ def _create_block_swap_forward(
             # Ensure current block is on GPU
             manager.ensure_block_on_gpu(i)
 
-            # Synchronize to ensure block is fully loaded
-            if i > 0 and torch.cuda.is_available():
-                torch.cuda.synchronize()
-
             # Process block
             video, audio = block(
                 video=video,
                 audio=audio,
                 perturbations=perturbations,
             )
-
-        # Synchronize to ensure all async transfers complete before returning
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
 
         return video, audio
 

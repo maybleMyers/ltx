@@ -417,16 +417,11 @@ def denoise_audio_video(  # noqa: PLR0913
         audio_state,
         stepper,
     )
-    print(">>> DEBUG: denoising_loop_fn done"); import sys; sys.stdout.flush()
 
     video_state = video_tools.clear_conditioning(video_state)
-    print(">>> DEBUG: video clear_conditioning done"); sys.stdout.flush()
     video_state = video_tools.unpatchify(video_state)
-    print(">>> DEBUG: video unpatchify done"); sys.stdout.flush()
     audio_state = audio_tools.clear_conditioning(audio_state)
-    print(">>> DEBUG: audio clear_conditioning done"); sys.stdout.flush()
     audio_state = audio_tools.unpatchify(audio_state)
-    print(">>> DEBUG: audio unpatchify done"); sys.stdout.flush()
 
     return video_state, audio_state
 

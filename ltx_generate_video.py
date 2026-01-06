@@ -579,7 +579,6 @@ class LTXVideoGeneratorWithOffloading:
         )
 
         print(f">>> Stage 1: Generating at {stage_1_output_shape.width}x{stage_1_output_shape.height}...")
-        import sys; sys.stdout.flush()
         video_state, audio_state = denoise_audio_video(
             output_shape=stage_1_output_shape,
             conditionings=stage_1_conditionings,
@@ -591,21 +590,14 @@ class LTXVideoGeneratorWithOffloading:
             dtype=dtype,
             device=self.device,
         )
-        print(">>> DEBUG: denoise_audio_video returned"); sys.stdout.flush()
-        torch.cuda.synchronize()  # Must sync before any other operations
-        print(">>> DEBUG: cuda synced"); sys.stdout.flush()
 
-        print(f">>> Stage 1 completed in {time.time() - stage1_start:.1f}s"); sys.stdout.flush()
-        print(">>> DEBUG: about to cleanup stage 1"); sys.stdout.flush()
+        print(f">>> Stage 1 completed in {time.time() - stage1_start:.1f}s")
 
         # Cleanup stage 1 transformer
         if block_swap_manager:
-            print(">>> DEBUG: calling offload_all"); sys.stdout.flush()
             block_swap_manager.offload_all()
-            print(">>> DEBUG: offload_all done"); sys.stdout.flush()
         if self.offload:
             print(">>> Offloading stage 1 transformer to CPU...")
-        torch.cuda.synchronize()
         del transformer
         del block_swap_manager
         cleanup_memory()
