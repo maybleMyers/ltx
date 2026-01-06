@@ -216,3 +216,303 @@ def offload_all_blocks(model: X0Model | LTXModel) -> None:
 
     clean_memory_on_device(device)
     print("[BlockSwap] All blocks offloaded to CPU")
+
+
+# =============================================================================
+# Text Encoder (Gemma3) Block Swapping
+# =============================================================================
+
+def enable_text_encoder_block_swap(
+    text_encoder,
+    blocks_in_memory: int = 6,
+    device: torch.device | str = "cuda",
+) -> ModelOffloader:
+    """
+    Enable block swapping for the Gemma3 text encoder.
+
+    This function:
+    1. Creates a ModelOffloader for async block transfers
+    2. Prepares initial block positions (first N on GPU, rest on CPU)
+    3. Monkey-patches Gemma3TextModel.forward() to use wait/submit pattern
+
+    Args:
+        text_encoder: AVGemmaTextEncoderModel or similar with .model attribute.
+        blocks_in_memory: Number of decoder layers to keep in GPU (default: 6).
+        device: Target GPU device.
+
+    Returns:
+        ModelOffloader instance for controlling the swapping behavior.
+    """
+    # Get the Gemma3TextModel that has the layers
+    # Structure: text_encoder.model (Gemma3ForConditionalGeneration).language_model (Gemma3TextModel)
+    gemma_text_model = text_encoder.model.language_model
+    layers = gemma_text_model.layers
+
+    device = torch.device(device) if isinstance(device, str) else device
+    num_layers = len(layers)
+    blocks_to_swap = num_layers - blocks_in_memory
+
+    if blocks_to_swap <= 0:
+        print(f"[TextEncoderBlockSwap] blocks_in_memory ({blocks_in_memory}) >= num_layers ({num_layers}), no swapping needed")
+        return None
+
+    # Create offloader with ThreadPoolExecutor for async transfers
+    offloader = ModelOffloader(
+        block_type="gemma_decoder_layer",
+        blocks=list(layers),
+        num_blocks=num_layers,
+        blocks_to_swap=blocks_to_swap,
+        supports_backward=False,
+        device=device,
+    )
+
+    # Store on model for access in forward pass
+    gemma_text_model._block_swap_offloader = offloader
+    gemma_text_model._blocks_to_swap = blocks_to_swap
+    gemma_text_model._blocks_ref = list(layers)
+    gemma_text_model._block_swap_device = device
+
+    # Move non-layer components to GPU
+    gemma_text_model.embed_tokens.to(device)
+    gemma_text_model.rotary_emb.to(device)
+    gemma_text_model.rotary_emb_local.to(device)
+    gemma_text_model.norm.to(device)
+
+    # Move text encoder's non-Gemma components to GPU
+    # These are used after hidden states extraction
+    if hasattr(text_encoder, "feature_extractor_linear"):
+        text_encoder.feature_extractor_linear.to(device)
+    if hasattr(text_encoder, "embeddings_connector"):
+        text_encoder.embeddings_connector.to(device)
+    if hasattr(text_encoder, "audio_embeddings_connector"):
+        text_encoder.audio_embeddings_connector.to(device)
+
+    # Prepare block positions: first (num_layers - blocks_to_swap) on GPU, rest on CPU
+    offloader.prepare_block_devices_before_forward(list(layers))
+
+    # Patch the text encoder's _preprocess_text to use the correct device for tensors
+    # The issue is that _preprocess_text creates tensors on self.model.device (CPU),
+    # but with block swapping, we need them on GPU for the model and feature extraction.
+    text_encoder._original_preprocess_text = text_encoder._preprocess_text
+
+    def device_aware_preprocess_text(text: str, padding_side: str = "left"):
+        """Patched _preprocess_text that creates tensors on the correct device."""
+        token_pairs = text_encoder.tokenizer.tokenize_with_weights(text)["gemma"]
+        # Create tensors on the block swap device (GPU) instead of self.model.device (CPU)
+        input_ids = torch.tensor([[t[0] for t in token_pairs]], device=device)
+        attention_mask = torch.tensor([[w[1] for w in token_pairs]], device=device)
+        outputs = text_encoder.model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+        projected = text_encoder._run_feature_extractor(
+            hidden_states=outputs.hidden_states, attention_mask=attention_mask, padding_side=padding_side
+        )
+        return projected, attention_mask
+
+    text_encoder._preprocess_text = device_aware_preprocess_text
+
+    # Store original forward method
+    gemma_text_model._original_forward = gemma_text_model.forward
+
+    # Import required types for the replacement forward
+    from transformers.modeling_outputs import BaseModelOutputWithPast
+    from transformers.cache_utils import DynamicCache
+    from transformers.models.gemma3.modeling_gemma3 import (
+        create_causal_mask,
+        create_sliding_window_causal_mask,
+    )
+
+    def block_swap_forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        use_cache=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        cache_position=None,
+        **kwargs,
+    ):
+        """Forward pass with block swapping for Gemma3TextModel."""
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if self.gradient_checkpointing and self.training and use_cache:
+            use_cache = False
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        if use_cache and past_key_values is None and not self.training:
+            past_key_values = DynamicCache(config=self.config)
+
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(
+                past_seen_tokens,
+                past_seen_tokens + inputs_embeds.shape[1],
+                device=inputs_embeds.device,
+            )
+
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
+
+        # Prepare mask arguments
+        if not isinstance(causal_mask_mapping := attention_mask, dict):
+            mask_kwargs = {
+                "config": self.config,
+                "input_embeds": inputs_embeds,
+                "attention_mask": attention_mask,
+                "cache_position": cache_position,
+                "past_key_values": past_key_values,
+                "position_ids": position_ids,
+            }
+            sliding_mask_kwargs = mask_kwargs.copy()
+
+            causal_mask_mapping = {
+                "full_attention": create_causal_mask(**mask_kwargs),
+                "sliding_attention": create_sliding_window_causal_mask(**sliding_mask_kwargs),
+            }
+
+        # embed positions
+        hidden_states = inputs_embeds
+
+        # create position embeddings to be shared across the decoder layers
+        position_embeddings_global = self.rotary_emb(hidden_states, position_ids)
+        position_embeddings_local = self.rotary_emb_local(hidden_states, position_ids)
+
+        # decoder layers with block swapping
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attns = () if output_attentions else None
+
+        offloader = self._block_swap_offloader
+        blocks = self._blocks_ref
+
+        for block_idx, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
+            # Wait for this block to be ready BEFORE using it
+            offloader.wait_for_block(block_idx)
+
+            layer_outputs = decoder_layer(
+                hidden_states,
+                position_embeddings_global=position_embeddings_global,
+                position_embeddings_local=position_embeddings_local,
+                attention_mask=causal_mask_mapping[decoder_layer.attention_type],
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                **kwargs,
+            )
+
+            hidden_states = layer_outputs[0]
+
+            # Submit swap for next iteration AFTER using block
+            offloader.submit_move_blocks_forward(blocks, block_idx)
+
+            if output_attentions:
+                all_self_attns += (layer_outputs[1],)
+
+        hidden_states = self.norm(hidden_states)
+
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=past_key_values,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attns,
+        )
+
+    # Monkey-patch the forward method
+    gemma_text_model.forward = types.MethodType(block_swap_forward, gemma_text_model)
+
+    print(f"[TextEncoderBlockSwap] Enabled: {blocks_in_memory}/{num_layers} layers in GPU, {blocks_to_swap} swapping")
+    return offloader
+
+
+def offload_all_text_encoder_blocks(text_encoder) -> None:
+    """
+    Offload all text encoder decoder layers to CPU and cleanup the offloader.
+
+    Used to free GPU memory after text encoding is complete.
+
+    Args:
+        text_encoder: Text encoder model with block swapping enabled.
+    """
+    gemma_text_model = text_encoder.model.language_model
+
+    offloader = getattr(gemma_text_model, "_block_swap_offloader", None)
+    if offloader is None:
+        return
+
+    device = offloader.device
+    layers = gemma_text_model.layers
+
+    # Wait for any pending async operations
+    for idx in range(len(layers)):
+        if idx in offloader.futures:
+            offloader._wait_blocks_move(idx)
+
+    # Shutdown the ThreadPoolExecutor
+    offloader.thread_pool.shutdown(wait=True)
+    offloader.futures.clear()
+
+    # Synchronize CUDA before moving blocks
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+    # Move all layers to CPU
+    for layer in layers:
+        weighs_to_device(layer, "cpu")
+
+    # Move non-layer components to CPU too
+    gemma_text_model.embed_tokens.to("cpu")
+    gemma_text_model.rotary_emb.to("cpu")
+    gemma_text_model.rotary_emb_local.to("cpu")
+    gemma_text_model.norm.to("cpu")
+
+    # Move text encoder's non-Gemma components back to CPU
+    if hasattr(text_encoder, "feature_extractor_linear"):
+        text_encoder.feature_extractor_linear.to("cpu")
+    if hasattr(text_encoder, "embeddings_connector"):
+        text_encoder.embeddings_connector.to("cpu")
+    if hasattr(text_encoder, "audio_embeddings_connector"):
+        text_encoder.audio_embeddings_connector.to("cpu")
+
+    # Restore original forward if saved
+    if hasattr(gemma_text_model, "_original_forward"):
+        gemma_text_model.forward = gemma_text_model._original_forward
+        del gemma_text_model._original_forward
+
+    # Restore original _preprocess_text
+    if hasattr(text_encoder, "_original_preprocess_text"):
+        text_encoder._preprocess_text = text_encoder._original_preprocess_text
+        del text_encoder._original_preprocess_text
+
+    # Cleanup attributes
+    if hasattr(gemma_text_model, "_block_swap_offloader"):
+        del gemma_text_model._block_swap_offloader
+    if hasattr(gemma_text_model, "_blocks_to_swap"):
+        del gemma_text_model._blocks_to_swap
+    if hasattr(gemma_text_model, "_blocks_ref"):
+        del gemma_text_model._blocks_ref
+    if hasattr(gemma_text_model, "_block_swap_device"):
+        del gemma_text_model._block_swap_device
+
+    # Synchronize again after moves complete
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+    clean_memory_on_device(device)
+    print("[TextEncoderBlockSwap] All layers offloaded to CPU")

@@ -43,7 +43,12 @@ from ltx_core.text_encoders.gemma import encode_text
 from ltx_core.types import LatentState, VideoPixelShape
 
 from ltx_pipelines.utils import ModelLedger
-from ltx_pipelines.utils.block_swap import enable_block_swap, offload_all_blocks
+from ltx_pipelines.utils.block_swap import (
+    enable_block_swap,
+    offload_all_blocks,
+    enable_text_encoder_block_swap,
+    offload_all_text_encoder_blocks,
+)
 from ltx_pipelines.utils.constants import (
     AUDIO_SAMPLE_RATE,
     DEFAULT_CFG_GUIDANCE_SCALE,
@@ -307,6 +312,13 @@ Examples:
         default=6,
         help="Number of transformer blocks to keep in GPU when block swapping (default: 6).",
     )
+    mem_group.add_argument(
+        "--text-encoder-blocks-in-memory",
+        type=int,
+        default=6,
+        help="Number of text encoder layers to keep in GPU when block swapping (default: 6). "
+             "The Gemma-3-12B text encoder has 48 layers.",
+    )
 
     # ==========================================================================
     # Audio Control
@@ -371,8 +383,10 @@ def apply_loras_chunked_gpu(
     2. Compute LoRA delta on GPU: delta = lora_B @ lora_A * strength
     3. Add delta to weight on GPU
     4. Move result back to CPU
+    5. DELETE the LoRA weights from the state dict to free RAM
 
-    This keeps peak GPU memory low while using GPU for fast computation.
+    This keeps peak GPU memory low while using GPU for fast computation,
+    and progressively frees RAM as LoRA weights are consumed.
 
     Key naming conventions:
     - Model parameter: velocity_model.adaln_single.xxx.weight
@@ -382,10 +396,11 @@ def apply_loras_chunked_gpu(
     from tqdm import tqdm
 
     # Build a map of LoRA weights for quick lookup
+    # We'll delete entries as we use them to free RAM
     lora_maps = []
     for lsd in lora_state_dicts:
         lora_map = {}
-        for key in lsd.sd.keys():
+        for key in list(lsd.sd.keys()):
             if ".lora_A.weight" in key or ".lora_B.weight" in key:
                 lora_map[key] = lsd.sd[key]
         lora_maps.append(lora_map)
@@ -413,7 +428,7 @@ def apply_loras_chunked_gpu(
     for name, param, lora_prefix, key_a, key_b in tqdm(params_to_process, desc="Applying LoRAs"):
         # Collect all LoRA deltas for this weight
         deltas = []
-        for lora_map, strength in zip(lora_maps, lora_strengths):
+        for lora_map, lsd, strength in zip(lora_maps, lora_state_dicts, lora_strengths):
             if key_a in lora_map and key_b in lora_map:
                 lora_a = lora_map[key_a].to(device=gpu_device, dtype=dtype)
                 lora_b = lora_map[key_b].to(device=gpu_device, dtype=dtype)
@@ -421,6 +436,14 @@ def apply_loras_chunked_gpu(
                 deltas.append(delta)
                 # Free GPU memory immediately
                 del lora_a, lora_b
+                # FREE RAM: Delete from BOTH the map and the original state dict
+                del lora_map[key_a]
+                del lora_map[key_b]
+                # Delete from original state dict to actually free the tensor memory
+                if key_a in lsd.sd:
+                    del lsd.sd[key_a]
+                if key_b in lsd.sd:
+                    del lsd.sd[key_b]
 
         if deltas:
             # Move weight to GPU, apply deltas, move back to CPU
@@ -434,6 +457,11 @@ def apply_loras_chunked_gpu(
             # Periodically clean up GPU memory
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+    # Clean up any remaining LoRA state dict references
+    for lsd in lora_state_dicts:
+        lsd.sd.clear()
+    gc.collect()
 
     print(">>> LoRA application complete")
 
@@ -462,12 +490,14 @@ class LTXVideoGeneratorWithOffloading:
         offload: bool = False,
         enable_block_swap: bool = False,
         blocks_in_memory: int = 6,
+        text_encoder_blocks_in_memory: int = 6,
     ):
         self.device = device or get_device()
         self.dtype = torch.bfloat16
         self.offload = offload
         self.enable_block_swap = enable_block_swap
         self.blocks_in_memory = blocks_in_memory
+        self.text_encoder_blocks_in_memory = text_encoder_blocks_in_memory
 
         # Create model ledger for stage 1
         self.stage_1_model_ledger = ModelLedger(
@@ -539,7 +569,23 @@ class LTXVideoGeneratorWithOffloading:
         # Phase 1: Text Encoding
         # =====================================================================
         print(">>> Loading text encoder...")
-        text_encoder = self.stage_1_model_ledger.text_encoder()
+        text_encoder_block_swap = None
+        if self.enable_block_swap:
+            # Load text encoder to CPU first for block swapping
+            original_device = self.stage_1_model_ledger.device
+            self.stage_1_model_ledger.device = torch.device("cpu")
+            text_encoder = self.stage_1_model_ledger.text_encoder()
+            self.stage_1_model_ledger.device = original_device
+
+            # Enable block swap for text encoder
+            print(f">>> Enabling text encoder block swap ({self.text_encoder_blocks_in_memory} layers in GPU)...")
+            text_encoder_block_swap = enable_text_encoder_block_swap(
+                text_encoder,
+                blocks_in_memory=self.text_encoder_blocks_in_memory,
+                device=self.device,
+            )
+        else:
+            text_encoder = self.stage_1_model_ledger.text_encoder()
 
         if enhance_prompt:
             print(">>> Enhancing prompt with Gemma...")
@@ -553,9 +599,13 @@ class LTXVideoGeneratorWithOffloading:
         v_context_p, a_context_p = context_p
         v_context_n, a_context_n = context_n
 
-        # Offload text encoder - must explicitly move to CPU first to free VRAM
+        # Offload text encoder
         print(">>> Releasing text encoder from GPU...")
-        text_encoder.to("cpu")
+        if text_encoder_block_swap:
+            offload_all_text_encoder_blocks(text_encoder)
+            text_encoder_block_swap = None
+        else:
+            text_encoder.to("cpu")
         del text_encoder
         synchronize_and_cleanup()
 
@@ -989,6 +1039,7 @@ def main():
         offload=args.offload,
         enable_block_swap=args.enable_block_swap,
         blocks_in_memory=args.blocks_in_memory,
+        text_encoder_blocks_in_memory=args.text_encoder_blocks_in_memory,
     )
 
     # Set up tiling config for VAE

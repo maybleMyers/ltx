@@ -191,6 +191,7 @@ def generate_ltx_video(
     enable_fp8: bool,
     enable_block_swap: bool,
     blocks_in_memory: int,
+    text_encoder_blocks_in_memory: int,
     # LoRA
     lora_folder: str,
     user_lora: str,
@@ -296,6 +297,7 @@ def generate_ltx_video(
         if enable_block_swap:
             command.append("--enable-block-swap")
             command.extend(["--blocks-in-memory", str(int(blocks_in_memory))])
+            command.extend(["--text-encoder-blocks-in-memory", str(int(text_encoder_blocks_in_memory))])
 
         # Print command for debugging
         print("\n" + "=" * 80)
@@ -397,6 +399,7 @@ def generate_ltx_video(
                     "enable_fp8": enable_fp8,
                     "enable_block_swap": enable_block_swap,
                     "blocks_in_memory": int(blocks_in_memory) if enable_block_swap else None,
+                    "text_encoder_blocks_in_memory": int(text_encoder_blocks_in_memory) if enable_block_swap else None,
                     "distilled_lora_strength": float(distilled_lora_strength),
                     "user_lora": user_lora if user_lora != "None" else None,
                     "user_lora_strength": float(user_lora_strength) if user_lora != "None" else None,
@@ -578,7 +581,9 @@ def create_interface():
                                 enable_fp8 = gr.Checkbox(label="FP8 Mode", value=False, info="Reduce memory with FP8 transformer")
                             with gr.Row():
                                 enable_block_swap = gr.Checkbox(label="Block Swapping", value=True)
-                                blocks_in_memory = gr.Slider(minimum=1, maximum=47, value=22, step=1, label="Blocks in GPU", visible=False)
+                                blocks_in_memory = gr.Slider(minimum=1, maximum=47, value=22, step=1, label="Transformer Blocks in GPU", visible=False)
+                            with gr.Row():
+                                text_encoder_blocks_in_memory = gr.Slider(minimum=1, maximum=47, value=6, step=1, label="Text Encoder Blocks in GPU", visible=False, info="Gemma-3-12B has 48 layers")
 
                         # User LoRA
                         with gr.Accordion("User LoRA (Optional)", open=False):
@@ -667,9 +672,9 @@ def create_interface():
 
         # Block swap visibility toggle
         enable_block_swap.change(
-            fn=lambda x: gr.update(visible=x),
+            fn=lambda x: (gr.update(visible=x), gr.update(visible=x)),
             inputs=[enable_block_swap],
-            outputs=[blocks_in_memory]
+            outputs=[blocks_in_memory, text_encoder_blocks_in_memory]
         )
 
         # Mode change - show/hide I2V section
@@ -697,6 +702,7 @@ def create_interface():
                 input_image, image_frame_idx, image_strength,
                 disable_audio, enhance_prompt,
                 offload, enable_fp8, enable_block_swap, blocks_in_memory,
+                text_encoder_blocks_in_memory,
                 lora_folder, user_lora, user_lora_strength,
                 save_path, batch_size
             ],
