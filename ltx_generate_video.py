@@ -514,11 +514,15 @@ class LTXVideoGeneratorWithOffloading:
                 transformer.velocity_model.audio_scale_shift_table = torch.nn.Parameter(
                     transformer.velocity_model.audio_scale_shift_table.to(self.device)
                 )
-            # Preprocessors (includes RoPE embeddings)
-            if hasattr(transformer.velocity_model, "video_args_preprocessor"):
-                transformer.velocity_model.video_args_preprocessor.to(self.device)
-            if hasattr(transformer.velocity_model, "audio_args_preprocessor"):
-                transformer.velocity_model.audio_args_preprocessor.to(self.device)
+            # Cross-attention adaln components
+            if hasattr(transformer.velocity_model, "av_ca_video_scale_shift_adaln_single"):
+                transformer.velocity_model.av_ca_video_scale_shift_adaln_single.to(self.device)
+            if hasattr(transformer.velocity_model, "av_ca_audio_scale_shift_adaln_single"):
+                transformer.velocity_model.av_ca_audio_scale_shift_adaln_single.to(self.device)
+            if hasattr(transformer.velocity_model, "av_ca_a2v_gate_adaln_single"):
+                transformer.velocity_model.av_ca_a2v_gate_adaln_single.to(self.device)
+            if hasattr(transformer.velocity_model, "av_ca_v2a_gate_adaln_single"):
+                transformer.velocity_model.av_ca_v2a_gate_adaln_single.to(self.device)
 
             block_swap_manager = enable_block_swap(
                 transformer,
@@ -654,10 +658,15 @@ class LTXVideoGeneratorWithOffloading:
                 transformer.velocity_model.audio_scale_shift_table = torch.nn.Parameter(
                     transformer.velocity_model.audio_scale_shift_table.to(self.device)
                 )
-            if hasattr(transformer.velocity_model, "video_args_preprocessor"):
-                transformer.velocity_model.video_args_preprocessor.to(self.device)
-            if hasattr(transformer.velocity_model, "audio_args_preprocessor"):
-                transformer.velocity_model.audio_args_preprocessor.to(self.device)
+            # Cross-attention adaln components
+            if hasattr(transformer.velocity_model, "av_ca_video_scale_shift_adaln_single"):
+                transformer.velocity_model.av_ca_video_scale_shift_adaln_single.to(self.device)
+            if hasattr(transformer.velocity_model, "av_ca_audio_scale_shift_adaln_single"):
+                transformer.velocity_model.av_ca_audio_scale_shift_adaln_single.to(self.device)
+            if hasattr(transformer.velocity_model, "av_ca_a2v_gate_adaln_single"):
+                transformer.velocity_model.av_ca_a2v_gate_adaln_single.to(self.device)
+            if hasattr(transformer.velocity_model, "av_ca_v2a_gate_adaln_single"):
+                transformer.velocity_model.av_ca_v2a_gate_adaln_single.to(self.device)
 
             block_swap_manager = enable_block_swap(
                 transformer,
