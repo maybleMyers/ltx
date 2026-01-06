@@ -43,7 +43,7 @@ from ltx_core.text_encoders.gemma import encode_text
 from ltx_core.types import LatentState, VideoPixelShape
 
 from ltx_pipelines.utils import ModelLedger
-from ltx_pipelines.utils.block_swap import enable_block_swap, get_block_swap_manager
+from ltx_pipelines.utils.block_swap import enable_block_swap, offload_all_blocks
 from ltx_pipelines.utils.constants import (
     AUDIO_SAMPLE_RATE,
     DEFAULT_CFG_GUIDANCE_SCALE,
@@ -595,7 +595,7 @@ class LTXVideoGeneratorWithOffloading:
 
         # Cleanup stage 1 transformer
         if block_swap_manager:
-            block_swap_manager.offload_all()
+            offload_all_blocks(transformer)
         if self.offload:
             print(">>> Offloading stage 1 transformer to CPU...")
         del transformer
@@ -735,7 +735,7 @@ class LTXVideoGeneratorWithOffloading:
 
         # Cleanup stage 2 models
         if block_swap_manager:
-            block_swap_manager.offload_all()
+            offload_all_blocks(transformer)
         torch.cuda.synchronize()
         del transformer
         del block_swap_manager
