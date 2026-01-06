@@ -631,8 +631,12 @@ class LTXVideoGeneratorWithOffloading:
         )
         print(">>> DEBUG: upsample_video returned", flush=True)
 
+        print(">>> DEBUG: About to cuda.synchronize...", flush=True)
         torch.cuda.synchronize()
+        print(">>> DEBUG: cuda.synchronize done", flush=True)
+        print(">>> DEBUG: About to cleanup_memory...", flush=True)
         cleanup_memory()
+        print(">>> DEBUG: cleanup_memory done", flush=True)
         print(f">>> Upsampling completed in {time.time() - upsample_start:.1f}s")
 
         # =====================================================================
