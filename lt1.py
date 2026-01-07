@@ -443,6 +443,10 @@ def generate_ltx_video(
     # End image conditioning
     end_image: str,
     end_image_strength: float,
+    # Anchor image conditioning
+    anchor_image: str,
+    anchor_interval: int,
+    anchor_strength: float,
     # Video input (for V2V / refine)
     input_video: str,
     refine_strength: float,
@@ -583,6 +587,13 @@ def generate_ltx_video(
         if end_image:
             last_frame_idx = int(num_frames) - 1
             command.extend(["--image", str(end_image), str(last_frame_idx), str(float(end_image_strength))])
+
+        # Anchor image conditioning (periodic guidance)
+        if anchor_interval and int(anchor_interval) > 0:
+            if anchor_image:
+                command.extend(["--anchor-image", str(anchor_image)])
+            command.extend(["--anchor-interval", str(int(anchor_interval))])
+            command.extend(["--anchor-strength", str(float(anchor_strength))])
 
         # User LoRA
         if user_lora and user_lora != "None" and lora_folder:
@@ -818,6 +829,23 @@ def create_interface():
                             with gr.Row():
                                 image_frame_idx = gr.Number(label="Frame Index", value=0, minimum=0, info="Which frame to condition (0 = first)")
                                 image_strength = gr.Slider(minimum=0.0, maximum=1.0, value=0.9, step=0.05, label="Strength")
+
+                            with gr.Accordion("Anchor Image (periodic guidance)", open=False):
+                                gr.Markdown("Inject the anchor image at regular intervals to guide the video generation.")
+                                anchor_image = gr.Image(label="Anchor Image (optional, uses Start Image if empty)", type="filepath")
+                                with gr.Row():
+                                    anchor_interval = gr.Number(
+                                        label="Anchor Interval",
+                                        value=0,
+                                        minimum=0,
+                                        step=8,
+                                        info="Frame interval (e.g., 60). Set to 0 to disable."
+                                    )
+                                    anchor_strength = gr.Slider(
+                                        minimum=0.0, maximum=1.0, value=0.8, step=0.05,
+                                        label="Anchor Strength",
+                                        info="How strongly to guide toward anchor"
+                                    )
 
                             with gr.Accordion("End Image (optional)", open=False):
                                 end_image = gr.Image(label="End Image (for start-to-end video)", type="filepath")
@@ -1110,6 +1138,7 @@ def create_interface():
                 cfg_guidance_scale, num_inference_steps, seed,
                 input_image, image_frame_idx, image_strength,
                 end_image, end_image_strength,
+                anchor_image, anchor_interval, anchor_strength,
                 input_video, refine_strength, refine_steps,
                 disable_audio, enhance_prompt,
                 offload, enable_fp8,

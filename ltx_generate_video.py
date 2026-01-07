@@ -69,6 +69,7 @@ from ltx_pipelines.utils.helpers import (
     generate_enhanced_prompt,
     get_device,
     guider_denoising_func,
+    image_conditionings_by_adding_guiding_latent,
     image_conditionings_by_replacing_latent,
     simple_denoising_func,
 )
@@ -86,6 +87,46 @@ DEFAULT_GEMMA_ROOT = "./gemma-3-12b-it-qat-q4_0-unquantized"
 DEFAULT_CHECKPOINT_PATH = "./weights/ltx-2-19b-dev.safetensors"
 DEFAULT_SPATIAL_UPSAMPLER_PATH = "./weights/ltx-2-spatial-upscaler-x2-1.0.safetensors"
 DEFAULT_DISTILLED_LORA_PATH = "./weights/ltx-2-19b-distilled-lora-384.safetensors"
+
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
+
+def build_anchor_image_tuples(
+    anchor_image: str | None,
+    anchor_interval: int | None,
+    anchor_strength: float,
+    num_frames: int,
+    images: list[tuple[str, int, float]],
+) -> list[tuple[str, int, float]]:
+    """
+    Build anchor conditioning tuples for guiding latent injection.
+
+    Args:
+        anchor_image: Explicit anchor image path, or None to use first --image
+        anchor_interval: Frame interval for anchor injection
+        anchor_strength: Conditioning strength for anchors
+        num_frames: Total number of frames in the video
+        images: Existing image conditionings (to extract first image if needed)
+
+    Returns:
+        List of (image_path, frame_idx, strength) tuples for anchor conditioning
+    """
+    if anchor_interval is None:
+        return []
+
+    # Determine anchor path
+    if anchor_image is not None:
+        anchor_path = anchor_image
+    elif images:
+        anchor_path = images[0][0]  # Use first i2v image
+    else:
+        raise ValueError("--anchor-interval requires --anchor-image or at least one --image")
+
+    # Generate frames: [interval, 2*interval, ...] (skip 0, that's handled by i2v)
+    anchor_frames = list(range(anchor_interval, num_frames, anchor_interval))
+    return [(anchor_path, frame_idx, anchor_strength) for frame_idx in anchor_frames]
 
 
 # =============================================================================
@@ -280,6 +321,29 @@ Examples:
         metavar=("PATH", "FRAME_IDX", "STRENGTH"),
         default=[],
         help="Image conditioning: path, frame index, strength. Can be repeated.",
+    )
+
+    # ==========================================================================
+    # Anchor Image Conditioning
+    # ==========================================================================
+    anchor_group = parser.add_argument_group("Anchor Image Conditioning")
+    anchor_group.add_argument(
+        "--anchor-image",
+        type=resolve_path,
+        default=None,
+        help="Anchor image path for periodic guidance. If not provided but --anchor-interval is set, uses first --image.",
+    )
+    anchor_group.add_argument(
+        "--anchor-interval",
+        type=int,
+        default=None,
+        help="Frame interval for anchor injection (e.g., 60). Anchors injected at [interval, 2*interval, ...].",
+    )
+    anchor_group.add_argument(
+        "--anchor-strength",
+        type=float,
+        default=0.8,
+        help="Conditioning strength for anchor images (default: 0.8).",
     )
 
     # ==========================================================================
@@ -765,6 +829,9 @@ class LTXVideoGeneratorWithOffloading:
         input_video: str | None = None,
         refine_strength: float = 0.3,
         refine_steps: int = 10,
+        anchor_image: str | None = None,
+        anchor_interval: int | None = None,
+        anchor_strength: float = 0.8,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor | None]:
         """
         Generate video with optional audio.
@@ -1068,7 +1135,7 @@ class LTXVideoGeneratorWithOffloading:
                     fps=frame_rate,
                 )
 
-            # Image conditioning for stage 1
+            # Image conditioning for stage 1 (i2v - replaces latent at frame 0)
             stage_1_conditionings = image_conditionings_by_replacing_latent(
                 images=images,
                 height=stage_1_output_shape.height,
@@ -1077,6 +1144,27 @@ class LTXVideoGeneratorWithOffloading:
                 dtype=dtype,
                 device=self.device,
             )
+
+            # Anchor image conditioning for stage 1 (guiding latent - appends tokens)
+            if anchor_interval is not None:
+                anchor_tuples = build_anchor_image_tuples(
+                    anchor_image=anchor_image,
+                    anchor_interval=anchor_interval,
+                    anchor_strength=anchor_strength,
+                    num_frames=num_frames,
+                    images=images,
+                )
+                if anchor_tuples:
+                    anchor_conditionings = image_conditionings_by_adding_guiding_latent(
+                        images=anchor_tuples,
+                        height=stage_1_output_shape.height,
+                        width=stage_1_output_shape.width,
+                        video_encoder=video_encoder,
+                        dtype=dtype,
+                        device=self.device,
+                    )
+                    stage_1_conditionings = stage_1_conditionings + anchor_conditionings
+                    print(f">>> Added {len(anchor_conditionings)} anchor points at frames {[t[1] for t in anchor_tuples]}")
 
             stage_label = "One-stage" if self.one_stage else "Stage 1"
             print(f">>> {stage_label}: Generating at {stage_1_output_shape.width}x{stage_1_output_shape.height}...")
@@ -1320,7 +1408,7 @@ class LTXVideoGeneratorWithOffloading:
             fps=frame_rate,
         )
 
-        # Image conditioning for stage 2 (full resolution)
+        # Image conditioning for stage 2 (i2v - replaces latent at frame 0)
         stage_2_conditionings = image_conditionings_by_replacing_latent(
             images=images,
             height=stage_2_output_shape.height,
@@ -1329,6 +1417,26 @@ class LTXVideoGeneratorWithOffloading:
             dtype=dtype,
             device=self.device,
         )
+
+        # Anchor image conditioning for stage 2 (guiding latent - appends tokens)
+        if anchor_interval is not None:
+            anchor_tuples = build_anchor_image_tuples(
+                anchor_image=anchor_image,
+                anchor_interval=anchor_interval,
+                anchor_strength=anchor_strength,
+                num_frames=num_frames,
+                images=images,
+            )
+            if anchor_tuples:
+                anchor_conditionings = image_conditionings_by_adding_guiding_latent(
+                    images=anchor_tuples,
+                    height=stage_2_output_shape.height,
+                    width=stage_2_output_shape.width,
+                    video_encoder=video_encoder,
+                    dtype=dtype,
+                    device=self.device,
+                )
+                stage_2_conditionings = stage_2_conditionings + anchor_conditionings
 
         print(f">>> Stage 2: Refining at {stage_2_output_shape.width}x{stage_2_output_shape.height}...")
         # For refine-only mode, use audio_latent from input video encoding
@@ -1466,6 +1574,10 @@ def main():
     print(f"FP8: {args.enable_fp8}")
     if args.images:
         print(f"Image conditioning: {len(args.images)} image(s)")
+    if args.anchor_interval:
+        anchor_src = args.anchor_image if args.anchor_image else "first --image"
+        num_anchors = len(range(args.anchor_interval, args.num_frames, args.anchor_interval))
+        print(f"Anchor conditioning: {num_anchors} anchor(s) every {args.anchor_interval} frames (source: {anchor_src}, strength: {args.anchor_strength})")
     print("=" * 60)
     print(f"Prompt: {args.prompt}")
     print("=" * 60)
@@ -1512,6 +1624,9 @@ def main():
         input_video=args.input_video,
         refine_strength=args.refine_strength,
         refine_steps=args.refine_steps,
+        anchor_image=args.anchor_image,
+        anchor_interval=args.anchor_interval,
+        anchor_strength=args.anchor_strength,
     )
 
     # Encode and save video
@@ -1559,6 +1674,9 @@ def main():
         "input_video": args.input_video,
         "refine_strength": args.refine_strength if args.input_video else None,
         "refine_steps": args.refine_steps if args.input_video else None,
+        "anchor_image": args.anchor_image,
+        "anchor_interval": args.anchor_interval,
+        "anchor_strength": args.anchor_strength if args.anchor_interval else None,
         "disable_audio": args.disable_audio,
         "enhance_prompt": args.enhance_prompt,
     }
