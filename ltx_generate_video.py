@@ -21,7 +21,7 @@ import logging
 import os
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import replace
 from pathlib import Path
 
@@ -838,6 +838,12 @@ Examples:
         default=200,
         help="Maximum height of preview images in pixels (default: 200).",
     )
+    preview_group.add_argument(
+        "--preview-suffix",
+        type=str,
+        default="",
+        help="Unique suffix for preview filenames (for multi-instance support).",
+    )
 
     # ==========================================================================
     # Video Continuation (Enhanced)
@@ -1341,6 +1347,9 @@ class LTXVideoGeneratorWithOffloading:
         # SVI Pro parameters
         _motion_latent: torch.Tensor | None = None,
         _num_motion_latent: int = 0,
+        # Preview callback
+        preview_callback: Callable | None = None,
+        preview_callback_interval: int = 1,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor | None]:
         """
         Generate video with optional audio.
@@ -1608,6 +1617,8 @@ class LTXVideoGeneratorWithOffloading:
                             transformer=transformer,
                         ),
                         anchor_decay=effective_anchor_decay,
+                        callback=preview_callback,
+                        callback_interval=preview_callback_interval,
                     )
             else:
                 # No CFG guidance, single forward pass
@@ -1628,6 +1639,8 @@ class LTXVideoGeneratorWithOffloading:
                             transformer=transformer,
                         ),
                         anchor_decay=effective_anchor_decay,
+                        callback=preview_callback,
+                        callback_interval=preview_callback_interval,
                     )
 
             # Stage 1 output shape (half resolution for two-stage, full for one-stage)
@@ -1955,6 +1968,8 @@ class LTXVideoGeneratorWithOffloading:
                     transformer=transformer,
                 ),
                 anchor_decay=effective_anchor_decay,
+                callback=preview_callback,
+                callback_interval=preview_callback_interval,
             )
 
         # Stage 2 output shape (full resolution)
@@ -2220,6 +2235,17 @@ def generate_svi_multi_clip(
             # Frame 0: current input image (motion frame from prev clip, or initial)
             clip_images = [(current_input_image, 0, 0.95)]
 
+            # Create preview callback if enabled
+            preview_callback = None
+            if args.preview_dir:
+                preview_callback = create_preview_callback(
+                    preview_dir=args.preview_dir,
+                    preview_interval=args.preview_interval,
+                    max_height=args.preview_max_height,
+                    stage_name=f"svi_clip{clip_idx + 1}",
+                    preview_suffix=args.preview_suffix,
+                )
+
             # Generate this clip
             video_iterator, audio = generator.generate(
                 prompt=clip_prompt,
@@ -2243,6 +2269,8 @@ def generate_svi_multi_clip(
                 # SVI-specific parameters
                 _motion_latent=prev_motion_latent if clip_idx > 0 else None,
                 _num_motion_latent=num_motion_latent if clip_idx > 0 else 0,
+                preview_callback=preview_callback,
+                preview_callback_interval=args.preview_interval,
             )
 
             # Collect video frames from iterator
@@ -2642,6 +2670,7 @@ def create_preview_callback(
     preview_interval: int = 1,
     max_height: int = 200,
     stage_name: str = "stage1",
+    preview_suffix: str = "",
 ):
     """
     Create a callback function for preview generation during denoising.
@@ -2651,11 +2680,19 @@ def create_preview_callback(
         preview_interval: Save every N steps
         max_height: Maximum preview height
         stage_name: Prefix for filenames (e.g., "stage1", "stage2")
+        preview_suffix: Unique suffix for MP4 preview filename
 
     Returns:
         Callback function compatible with euler_denoising_loop
     """
     os.makedirs(preview_dir, exist_ok=True)
+
+    # Track collected frames for video preview
+    collected_frames = []
+
+    # Determine MP4 output path
+    suffix = f"_{preview_suffix}" if preview_suffix else ""
+    mp4_path = os.path.join(preview_dir, f"latent_preview{suffix}.mp4")
 
     def callback(step_idx: int, video_state, sigmas: torch.Tensor):
         if step_idx % preview_interval != 0:
@@ -2668,13 +2705,30 @@ def create_preview_callback(
         )
 
         if preview is not None:
+            # Save individual frame (optional, useful for debugging)
             sigma = sigmas[step_idx].item() if step_idx < len(sigmas) else 0.0
             preview_path = os.path.join(
                 preview_dir,
                 f"{stage_name}_step_{step_idx:03d}_sigma_{sigma:.4f}.jpg",
             )
             preview.save(preview_path, quality=85)
-            print(f">>> Preview saved: {preview_path}")
+
+            # Also save/update MP4 preview video (for UI monitoring)
+            try:
+                import numpy as np
+                frame_array = np.array(preview)
+                collected_frames.append(frame_array)
+
+                # Write MP4 with all collected frames
+                if len(collected_frames) > 0:
+                    import imageio
+                    # Use imageio to write MP4 (overwrites each time with all frames)
+                    imageio.mimwrite(mp4_path, collected_frames, fps=2, quality=7)
+                    print(f">>> Preview video updated: {mp4_path} ({len(collected_frames)} frames)")
+            except ImportError:
+                print(f">>> Preview saved: {preview_path} (imageio not available for MP4)")
+            except Exception as e:
+                print(f">>> Preview saved: {preview_path} (MP4 write error: {e})")
 
     return callback
 
@@ -2917,6 +2971,17 @@ def sliding_window_generate(
 
         print(f">>> Window {window_idx + 1}: frames {start_frame}-{end_frame}, {window_frames} frames, seed {window_seed}")
 
+        # Create preview callback if enabled
+        preview_callback = None
+        if args.preview_dir:
+            preview_callback = create_preview_callback(
+                preview_dir=args.preview_dir,
+                preview_interval=args.preview_interval,
+                max_height=args.preview_max_height,
+                stage_name=f"window{window_idx + 1}",
+                preview_suffix=args.preview_suffix,
+            )
+
         # Generate this window
         video_iterator, audio = generator.generate(
             prompt=args.prompt,
@@ -2937,6 +3002,8 @@ def sliding_window_generate(
             anchor_interval=args.anchor_interval,
             anchor_strength=args.anchor_strength,
             anchor_decay=args.anchor_decay,
+            preview_callback=preview_callback,
+            preview_callback_interval=args.preview_interval,
         )
 
         # Collect video frames from iterator
@@ -3235,6 +3302,18 @@ def main():
     else:
         # Regular single-clip generation
         video_chunks_number = get_video_chunks_number(args.num_frames, tiling_config)
+
+        # Create preview callback if enabled
+        preview_callback = None
+        if args.preview_dir:
+            preview_callback = create_preview_callback(
+                preview_dir=args.preview_dir,
+                preview_interval=args.preview_interval,
+                max_height=args.preview_max_height,
+                stage_name="stage1",
+                preview_suffix=args.preview_suffix,
+            )
+
         video, audio = generator.generate(
             prompt=args.prompt,
             negative_prompt=args.negative_prompt,
@@ -3257,6 +3336,8 @@ def main():
             anchor_interval=args.anchor_interval,
             anchor_strength=args.anchor_strength,
             anchor_decay=args.anchor_decay,
+            preview_callback=preview_callback,
+            preview_callback_interval=args.preview_interval,
         )
 
     # Encode and save video

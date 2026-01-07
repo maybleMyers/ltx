@@ -501,6 +501,17 @@ def generate_ltx_video(
     # Output
     save_path: str,
     batch_size: int,
+    # Preview Generation
+    enable_preview: bool,
+    preview_interval: int,
+    # Video Continuation (Frame Freezing)
+    freeze_frames: int,
+    freeze_transition: int,
+    # Sliding Window (Long Video)
+    sliding_window_size: int,
+    sliding_window_overlap: int,
+    sliding_window_overlap_noise: float,
+    sliding_window_color_correction: float,
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     """
     Generate video using LTX-2 pipeline.
@@ -661,6 +672,30 @@ def generate_ltx_video(
             command.append("--enable-refiner-block-swap")
             command.extend(["--refiner-blocks-in-memory", str(int(refiner_blocks_in_memory))])
 
+        # Preview generation
+        unique_preview_suffix = f"ltx_{run_id}"
+        preview_mp4_path = None
+        if enable_preview and preview_interval > 0:
+            preview_base_dir = os.path.join(save_path, "previews")
+            command.extend(["--preview-dir", preview_base_dir])
+            command.extend(["--preview-interval", str(int(preview_interval))])
+            command.extend(["--preview-suffix", unique_preview_suffix])
+            preview_mp4_path = os.path.join(preview_base_dir, f"latent_preview_{unique_preview_suffix}.mp4")
+
+        # Frame freezing (video continuation)
+        if freeze_frames and int(freeze_frames) > 0:
+            command.extend(["--freeze-frames", str(int(freeze_frames))])
+            command.extend(["--freeze-transition", str(int(freeze_transition))])
+
+        # Sliding window (long video)
+        if sliding_window_size and int(sliding_window_size) > 0:
+            command.extend(["--sliding-window-size", str(int(sliding_window_size))])
+            command.extend(["--sliding-window-overlap", str(int(sliding_window_overlap))])
+            if sliding_window_overlap_noise and float(sliding_window_overlap_noise) > 0:
+                command.extend(["--sliding-window-overlap-noise", str(float(sliding_window_overlap_noise))])
+            if sliding_window_color_correction and float(sliding_window_color_correction) > 0:
+                command.extend(["--sliding-window-color-correction", str(float(sliding_window_color_correction))])
+
         # Print command for debugging
         print("\n" + "=" * 80)
         print(f"LAUNCHING COMMAND (Batch {i+1}/{batch_size}):")
@@ -680,6 +715,8 @@ def generate_ltx_video(
 
             current_process = process
             last_progress = ""
+            current_preview_list = []
+            last_preview_mtime = 0
 
             while True:
                 if stop_event.is_set():
@@ -689,7 +726,7 @@ def generate_ltx_video(
                     except subprocess.TimeoutExpired:
                         process.kill()
                     current_process = None
-                    yield all_generated_videos, None, "Generation stopped by user.", ""
+                    yield all_generated_videos, [], "Generation stopped by user.", ""
                     return
 
                 # Read output line by line
@@ -702,7 +739,15 @@ def generate_ltx_video(
                         if parsed:
                             last_progress = parsed
 
-                yield all_generated_videos.copy(), None, status_text, last_progress
+                # Check for preview updates
+                if enable_preview and preview_mp4_path:
+                    if os.path.exists(preview_mp4_path):
+                        current_mtime = os.path.getmtime(preview_mp4_path)
+                        if current_mtime > last_preview_mtime:
+                            current_preview_list = [preview_mp4_path]
+                            last_preview_mtime = current_mtime
+
+                yield all_generated_videos.copy(), current_preview_list, status_text, last_progress
 
                 if process.poll() is not None:
                     # Read remaining output
@@ -727,18 +772,18 @@ def generate_ltx_video(
                 all_generated_videos.append((output_filename, label))
 
                 status_text = f"Completed {i+1}/{batch_size}"
-                yield all_generated_videos.copy(), None, status_text, f"Video saved: {os.path.basename(output_filename)}"
+                yield all_generated_videos.copy(), current_preview_list, status_text, f"Video saved: {os.path.basename(output_filename)}"
             else:
                 error_msg = f"Generation failed (return code: {return_code})"
-                yield all_generated_videos.copy(), None, error_msg, "Check logs for details"
+                yield all_generated_videos.copy(), current_preview_list, error_msg, "Check logs for details"
 
         except Exception as e:
             current_process = None
-            yield all_generated_videos, None, f"Error: {str(e)}", ""
+            yield all_generated_videos, [], f"Error: {str(e)}", ""
             return
 
     final_status = f"Completed {batch_size} video(s)" if batch_size > 1 else "Generation complete!"
-    yield all_generated_videos, None, final_status, "Done!"
+    yield all_generated_videos, [], final_status, "Done!"
 
 
 def stop_generation():
@@ -853,6 +898,9 @@ def generate_svi_ltx_video(
     disable_audio: bool,
     output_path: str,
     batch_size: int,
+    # Preview Generation
+    enable_preview: bool,
+    preview_interval: int,
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     """
     Generate multi-clip SVI video using LTX-2 pipeline.
@@ -1006,6 +1054,16 @@ def generate_svi_ltx_video(
         if disable_audio:
             command.append("--disable-audio")
 
+        # Preview generation
+        unique_preview_suffix = f"svi_{run_id}"
+        preview_mp4_path = None
+        if enable_preview and preview_interval > 0:
+            preview_base_dir = os.path.join(output_path, "previews")
+            command.extend(["--preview-dir", preview_base_dir])
+            command.extend(["--preview-interval", str(int(preview_interval))])
+            command.extend(["--preview-suffix", unique_preview_suffix])
+            preview_mp4_path = os.path.join(preview_base_dir, f"latent_preview_{unique_preview_suffix}.mp4")
+
         # Print command for debugging
         print("\n" + "=" * 80)
         print(f"LAUNCHING SVI COMMAND (Batch {batch_idx+1}/{batch_size}):")
@@ -1030,6 +1088,8 @@ def generate_svi_ltx_video(
 
             current_process = process
             last_progress = ""
+            current_preview_list = []
+            last_preview_mtime = 0
 
             while True:
                 if stop_event.is_set():
@@ -1039,7 +1099,7 @@ def generate_svi_ltx_video(
                     except subprocess.TimeoutExpired:
                         process.kill()
                     current_process = None
-                    yield all_generated_videos, None, "Generation stopped by user.", ""
+                    yield all_generated_videos, [], "Generation stopped by user.", ""
                     return
 
                 # Read output line by line
@@ -1051,6 +1111,14 @@ def generate_svi_ltx_video(
                         progress_info = parse_ltx_progress_line(line)
                         if progress_info:
                             last_progress = progress_info
+
+                # Check for preview updates
+                if enable_preview and preview_mp4_path:
+                    if os.path.exists(preview_mp4_path):
+                        current_mtime = os.path.getmtime(preview_mp4_path)
+                        if current_mtime > last_preview_mtime:
+                            current_preview_list = [preview_mp4_path]
+                            last_preview_mtime = current_mtime
 
                 exit_code = process.poll()
 
@@ -1068,20 +1136,20 @@ def generate_svi_ltx_video(
                         elapsed = time.perf_counter() - start_time
                         label = f"SVI {num_clips} clips ({elapsed:.1f}s)"
                         all_generated_videos.append((output_filename, label))
-                        yield all_generated_videos.copy(), None, f"Completed batch {batch_idx+1}/{batch_size}", "Done!"
+                        yield all_generated_videos.copy(), current_preview_list, f"Completed batch {batch_idx+1}/{batch_size}", "Done!"
                     else:
                         error_msg = f"Error in batch {batch_idx+1} (exit code {exit_code})"
-                        yield all_generated_videos, None, error_msg, ""
+                        yield all_generated_videos, current_preview_list, error_msg, ""
                     break
 
-                yield all_generated_videos.copy(), None, status_text, last_progress
+                yield all_generated_videos.copy(), current_preview_list, status_text, last_progress
 
         except Exception as e:
-            yield all_generated_videos, None, f"Error: {str(e)}", ""
+            yield all_generated_videos, [], f"Error: {str(e)}", ""
             continue
 
     final_status = f"Completed {batch_size} SVI video(s)" if batch_size > 1 else "SVI generation complete!"
-    yield all_generated_videos, None, final_status, "Done!"
+    yield all_generated_videos, [], final_status, "Done!"
 
 
 # =============================================================================
@@ -1134,7 +1202,7 @@ def create_interface():
                             label="Prompt",
                             placeholder="Describe the video you want to generate...",
                             lines=4,
-                            value="A serene mountain lake at sunrise, with mist rising from the water and birds flying overhead."
+                            value="A giant brown capybara wearing white wireless earbuds stands upright on a Miami beach, mouth wide open revealing large front teeth, swaying its round body rhythmically side to side. Beside it, a gray tabby cat with green eyes wears a pink knit beanie with pom-pom, black bow tie, light blue t-shirt with small animal graphic, and blue jeans, pumping two bright green glow sticks overhead in time with pulsing electronic beats. The duo bounces and grooves together on golden sand scattered with seashells, their movements becoming more energetic as synthesizer drops hit. Palm trees sway in the warm breeze behind them, with Miami high-rise buildings visible in the distance. The sky transitions dramatically from warm orange and pink sunset hues to deep purple twilight, as a bright full moon rises over the turquoise ocean waves. Colorful beach umbrellas in red and white dot the background. The camera circles slowly around the dancing pair in a smooth 360-degree arc, capturing their joyful expressions. Lens flares catch the fading sunlight, then neon glow stick trails create light streaks as darkness falls. The scene pulses with energy as city lights begin twinkling along the coastline, waves crashing rhythmically in the moonlit background."
                         )
                         negative_prompt = gr.Textbox(
                             label="Negative Prompt",
@@ -1251,6 +1319,47 @@ def create_interface():
                                     info="Number of refinement denoising steps"
                                 )
 
+                        # Video Continuation (Frame Freezing)
+                        with gr.Accordion("Video Continuation (Frame Freezing)", open=False):
+                            gr.Markdown("Freeze first N frames from input video during denoising for smooth continuation.")
+                            with gr.Row():
+                                freeze_frames = gr.Slider(
+                                    minimum=0, maximum=32, value=0, step=1,
+                                    label="Freeze Frames",
+                                    info="Number of frames to freeze from input video (0 = disabled)"
+                                )
+                                freeze_transition = gr.Slider(
+                                    minimum=1, maximum=16, value=4, step=1,
+                                    label="Transition Frames",
+                                    info="Frames for gradual blend from frozen to generated"
+                                )
+
+                        # Sliding Window (Long Video)
+                        with gr.Accordion("Sliding Window (Long Video)", open=False):
+                            gr.Markdown("Generate videos longer than the model's context window by overlapping windows.")
+                            with gr.Row():
+                                sliding_window_size = gr.Slider(
+                                    minimum=0, maximum=257, value=0, step=8,
+                                    label="Window Size",
+                                    info="Frames per window (8n+1). 0 = auto-detect from num_frames"
+                                )
+                                sliding_window_overlap = gr.Slider(
+                                    minimum=1, maximum=33, value=9, step=8,
+                                    label="Overlap Frames",
+                                    info="Overlapping frames between windows (8n+1)"
+                                )
+                            with gr.Row():
+                                sliding_window_overlap_noise = gr.Slider(
+                                    minimum=0.0, maximum=100.0, value=0.0, step=5.0,
+                                    label="Overlap Noise %",
+                                    info="Noise level for overlap blending (0 = no noise)"
+                                )
+                                sliding_window_color_correction = gr.Slider(
+                                    minimum=0.0, maximum=1.0, value=0.0, step=0.1,
+                                    label="Color Correction",
+                                    info="LAB color correction strength between windows"
+                                )
+
 
                     # Right column - Output
                     with gr.Column():
@@ -1262,6 +1371,22 @@ def create_interface():
                             allow_preview=True,
                             preview=True
                         )
+                        # Latent Preview (During Generation)
+                        with gr.Accordion("Latent Preview (During Generation)", open=True):
+                            enable_preview = gr.Checkbox(label="Enable Latent Preview", value=True)
+                            preview_interval = gr.Slider(
+                                minimum=1, maximum=50, step=1, value=5,
+                                label="Preview Every N Steps"
+                            )
+                            preview_gallery = gr.Gallery(
+                                label="Latent Previews",
+                                columns=4, rows=2,
+                                object_fit="contain",
+                                height=300,
+                                allow_preview=True,
+                                preview=True,
+                                show_label=True
+                            )
                         # User LoRA
                         with gr.Accordion("User LoRA (Optional)", open=False):
                             lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
@@ -1569,6 +1694,14 @@ def create_interface():
                         )
                         svi_disable_audio = gr.Checkbox(label="Disable Audio", value=False, info="Skip audio generation")
 
+                    # Preview Generation (SVI)
+                    with gr.Accordion("Latent Preview (During Generation)", open=True):
+                        svi_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=True)
+                        svi_preview_interval = gr.Slider(
+                            minimum=1, maximum=50, step=1, value=5,
+                            label="Preview Every N Steps"
+                        )
+
                 with gr.Row():
                     svi_save_defaults_btn = gr.Button("💾 Save Defaults")
                     svi_load_defaults_btn = gr.Button("📂 Load Defaults")
@@ -1739,9 +1872,16 @@ def create_interface():
                 enable_text_encoder_block_swap, text_encoder_blocks_in_memory,
                 enable_refiner_block_swap, refiner_blocks_in_memory,
                 lora_folder, user_lora, user_lora_strength,
-                save_path, batch_size
+                save_path, batch_size,
+                # Preview Generation
+                enable_preview, preview_interval,
+                # Video Continuation (Frame Freezing)
+                freeze_frames, freeze_transition,
+                # Sliding Window (Long Video)
+                sliding_window_size, sliding_window_overlap,
+                sliding_window_overlap_noise, sliding_window_color_correction,
             ],
-            outputs=[output_gallery, gr.State(), status_text, progress_text]
+            outputs=[output_gallery, preview_gallery, status_text, progress_text]
         )
 
         # =================================================================
@@ -1888,7 +2028,9 @@ def create_interface():
                 # LoRA
                 svi_lora_folder, svi_lora_dropdown, svi_lora_strength,
                 # Output
-                svi_disable_audio, svi_output_path, svi_batch_size
+                svi_disable_audio, svi_output_path, svi_batch_size,
+                # Preview Generation
+                svi_enable_preview, svi_preview_interval,
             ],
             outputs=[svi_output_gallery, svi_preview_gallery, svi_batch_progress, svi_progress_text]
         )
