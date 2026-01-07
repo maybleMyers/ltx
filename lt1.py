@@ -670,14 +670,9 @@ def generate_ltx_video(
         try:
             start_time = time.perf_counter()
 
-            # Write subprocess output to log file
-            os.makedirs(os.path.join(save_path, "logs"), exist_ok=True)
-            log_file_path = os.path.join(save_path, "logs", f"gen_{run_id}.log")
-            log_file = open(log_file_path, "w", encoding="utf-8")
-
             process = subprocess.Popen(
                 command,
-                stdout=log_file,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1
@@ -685,7 +680,6 @@ def generate_ltx_video(
 
             current_process = process
             last_progress = ""
-            last_log_position = 0
 
             while True:
                 if stop_event.is_set():
@@ -695,45 +689,30 @@ def generate_ltx_video(
                     except subprocess.TimeoutExpired:
                         process.kill()
                     current_process = None
-                    log_file.close()
                     yield all_generated_videos, None, "Generation stopped by user.", ""
                     return
 
-                # Read new lines from log file
-                try:
-                    with open(log_file_path, "r", encoding="utf-8") as f:
-                        f.seek(last_log_position)
-                        new_lines = f.readlines()
-                        last_log_position = f.tell()
-                        for line in new_lines:
-                            line = line.strip()
-                            if line:
-                                print(line)
-                                parsed = parse_ltx_progress_line(line)
-                                if parsed:
-                                    last_progress = parsed
-                except:
-                    pass
+                # Read output line by line
+                line = process.stdout.readline()
+                if line:
+                    line = line.strip()
+                    if line:
+                        print(line)
+                        parsed = parse_ltx_progress_line(line)
+                        if parsed:
+                            last_progress = parsed
 
                 yield all_generated_videos.copy(), None, status_text, last_progress
 
-                time.sleep(0.5)
-
                 if process.poll() is not None:
-                    # Read remaining log content
-                    try:
-                        with open(log_file_path, "r", encoding="utf-8") as f:
-                            f.seek(last_log_position)
-                            for line in f.readlines():
-                                line = line.strip()
-                                if line:
-                                    print(line)
-                                    parsed = parse_ltx_progress_line(line)
-                                    if parsed:
-                                        last_progress = parsed
-                    except:
-                        pass
-                    log_file.close()
+                    # Read remaining output
+                    for line in process.stdout:
+                        line = line.strip()
+                        if line:
+                            print(line)
+                            parsed = parse_ltx_progress_line(line)
+                            if parsed:
+                                last_progress = parsed
                     break
 
             current_process = None
@@ -921,9 +900,10 @@ def generate_svi_ltx_video(
         elif int(batch_size) > 1:
             current_seed = seed + batch_idx * 1000
 
-        # Combine prompts (use first non-empty prompt as main)
-        prompts = [p for p in [prompt1, prompt2, prompt3, prompt4, prompt5, prompt6, prompt7, prompt8] if p and p.strip()]
-        main_prompt = prompts[0] if prompts else "A beautiful video"
+        # Collect per-clip prompts (non-empty only)
+        all_prompts = [prompt1, prompt2, prompt3, prompt4, prompt5, prompt6, prompt7, prompt8]
+        clip_prompts = [p.strip() for p in all_prompts if p and p.strip()]
+        main_prompt = clip_prompts[0] if clip_prompts else "A beautiful video"
 
         status_text = f"Processing SVI {batch_idx+1}/{batch_size} ({num_clips} clips, Seed: {current_seed})"
         yield all_generated_videos.copy(), None, status_text, "Starting SVI generation..."
@@ -974,6 +954,11 @@ def generate_svi_ltx_video(
             "--seed-multiplier", str(int(seed_multiplier)),
             "--overlap-frames", str(int(overlap_frames)),
         ])
+
+        # Per-clip prompts (if more than one provided)
+        if len(clip_prompts) > 1:
+            command.append("--prompt-list")
+            command.extend(clip_prompts)
 
         # Anchor settings
         if anchor_image:
@@ -1030,19 +1015,13 @@ def generate_svi_ltx_video(
         try:
             start_time = time.perf_counter()
 
-            # Write subprocess output to log file
-            os.makedirs(os.path.join(output_path, "logs"), exist_ok=True)
-            log_file_path = os.path.join(output_path, "logs", f"svi_{run_id}.log")
-            log_file = open(log_file_path, "w", encoding="utf-8")
-
             # Get script directory to ensure ltx_generate_video.py is found
             script_dir = os.path.dirname(os.path.abspath(__file__))
             print(f">>> Running from: {script_dir}")
-            print(f">>> Log file: {log_file_path}")
 
             process = subprocess.Popen(
                 command,
-                stdout=log_file,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
@@ -1051,7 +1030,6 @@ def generate_svi_ltx_video(
 
             current_process = process
             last_progress = ""
-            last_log_position = 0
 
             while True:
                 if stop_event.is_set():
@@ -1060,54 +1038,43 @@ def generate_svi_ltx_video(
                         process.wait(timeout=5)
                     except subprocess.TimeoutExpired:
                         process.kill()
-                    log_file.close()
                     current_process = None
                     yield all_generated_videos, None, "Generation stopped by user.", ""
                     return
 
+                # Read output line by line
+                line = process.stdout.readline()
+                if line:
+                    line = line.strip()
+                    if line:
+                        print(line)
+                        progress_info = parse_ltx_progress_line(line)
+                        if progress_info:
+                            last_progress = progress_info
+
                 exit_code = process.poll()
 
-                # Read new log content
-                log_file.flush()
-                try:
-                    with open(log_file_path, "r", encoding="utf-8") as f:
-                        f.seek(last_log_position)
-                        new_content = f.read()
-                        last_log_position = f.tell()
-
-                    if new_content:
-                        for line in new_content.strip().split("\n"):
+                if exit_code is not None:
+                    # Read remaining output
+                    for line in process.stdout:
+                        line = line.strip()
+                        if line:
+                            print(line)
                             progress_info = parse_ltx_progress_line(line)
                             if progress_info:
                                 last_progress = progress_info
-                except Exception:
-                    pass
 
-                if exit_code is not None:
-                    log_file.close()
                     if exit_code == 0 and os.path.exists(output_filename):
                         elapsed = time.perf_counter() - start_time
                         label = f"SVI {num_clips} clips ({elapsed:.1f}s)"
                         all_generated_videos.append((output_filename, label))
                         yield all_generated_videos.copy(), None, f"Completed batch {batch_idx+1}/{batch_size}", "Done!"
                     else:
-                        # Read last lines of log for error message
                         error_msg = f"Error in batch {batch_idx+1} (exit code {exit_code})"
-                        try:
-                            with open(log_file_path, "r", encoding="utf-8") as f:
-                                log_content = f.read()
-                                # Get last 500 chars of log for error context
-                                if log_content:
-                                    error_detail = log_content[-500:].strip()
-                                    error_msg = f"Exit code {exit_code}. Log tail:\n{error_detail}"
-                                    print(f">>> SVI ERROR LOG:\n{log_content}")
-                        except Exception:
-                            pass
                         yield all_generated_videos, None, error_msg, ""
                     break
 
                 yield all_generated_videos.copy(), None, status_text, last_progress
-                time.sleep(1.0)
 
         except Exception as e:
             yield all_generated_videos, None, f"Error: {str(e)}", ""

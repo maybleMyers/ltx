@@ -655,6 +655,13 @@ Examples:
         default=True,
         help="Prepend original video frames when extending (default: True).",
     )
+    svi_group.add_argument(
+        "--prompt-list",
+        type=str,
+        nargs="*",
+        default=None,
+        help="List of prompts for multi-clip generation. One prompt per clip. If fewer prompts than clips, last prompt is repeated.",
+    )
 
     # ==========================================================================
     # Advanced Options
@@ -2000,6 +2007,7 @@ def generate_svi_multi_clip(
                 clip_prompt = prompts[-1]  # Use last prompt
             else:
                 clip_prompt = args.prompt
+            print(f">>> Clip {clip_idx + 1} prompt: {clip_prompt[:80]}..." if len(clip_prompt) > 80 else f">>> Clip {clip_idx + 1} prompt: {clip_prompt}")
 
             # Build image conditionings for this clip
             # Frame 0: current input image (motion frame from prev clip, or initial)
@@ -2430,6 +2438,16 @@ def main():
     # Branch between SVI Pro mode and regular mode
     if args.svi_mode or args.extend_video:
         # SVI Pro mode: multi-clip or video extension
+        # Parse prompt list if provided
+        prompts = None
+        if getattr(args, 'prompt_list', None) is not None and len(args.prompt_list) > 0:
+            prompts = args.prompt_list
+            print(f">>> Using {len(prompts)} prompts for multi-clip generation")
+            for i, p in enumerate(prompts):
+                print(f">>>   Clip {i+1}: {p[:50]}..." if len(p) > 50 else f">>>   Clip {i+1}: {p}")
+        else:
+            print(f">>> Using single prompt for all clips: {args.prompt}")
+
         if args.extend_video:
             # Video extension mode
             if not args.images:
@@ -2446,6 +2464,7 @@ def main():
                 overlap_frames=args.overlap_frames,
                 anchor_image_path=args.anchor_image,
                 prepend_original=args.prepend_original,
+                prompts=prompts,
             )
         else:
             # Multi-clip generation mode
@@ -2461,6 +2480,7 @@ def main():
                 num_motion_frame=args.num_motion_frame,
                 seed_multiplier=args.seed_multiplier,
                 overlap_frames=args.overlap_frames,
+                prompts=prompts,
             )
 
         # SVI returns a decoded tensor [F, H, W, C], convert to iterator format for encode_video
