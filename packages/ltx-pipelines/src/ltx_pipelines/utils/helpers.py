@@ -1,5 +1,6 @@
 import gc
 import logging
+import math
 from dataclasses import replace
 
 import torch
@@ -91,12 +92,43 @@ def image_conditionings_by_adding_guiding_latent(
     return conditionings
 
 
+def anchor_strength_decay(
+    step_idx: int,
+    total_steps: int,
+    decay_type: str = "cosine",
+) -> float:
+    """
+    Compute decay factor for anchor strength.
+
+    Returns a value from 0.0 (keep original anchor constraint) to 1.0 (full freedom).
+    This allows anchor constraints to be strong early in denoising (structure formation)
+    and weak later (motion freedom).
+
+    Args:
+        step_idx: Current step index (0-based)
+        total_steps: Total number of denoising steps
+        decay_type: Decay curve type - "linear", "cosine", or "sigmoid"
+
+    Returns:
+        Decay factor in [0, 1] where 0=keep constraint, 1=release to full freedom
+    """
+    progress = step_idx / max(total_steps - 1, 1)
+    if decay_type == "linear":
+        return progress
+    elif decay_type == "cosine":
+        return (1 - math.cos(math.pi * progress)) / 2
+    elif decay_type == "sigmoid":
+        return 1 / (1 + math.exp(-10 * (progress - 0.5)))
+    return progress  # Default to linear
+
+
 def euler_denoising_loop(
     sigmas: torch.Tensor,
     video_state: LatentState,
     audio_state: LatentState,
     stepper: DiffusionStepProtocol,
     denoise_fn: DenoisingFunc,
+    anchor_decay: str | None = None,
 ) -> tuple[LatentState, LatentState]:
     """
     Perform the joint audio-video denoising loop over a diffusion schedule.
@@ -124,12 +156,31 @@ def euler_denoising_loop(
         ``denoise_fn(video_state, audio_state, sigmas, step_index)`` and must
         return a tuple ``(denoised_video, denoised_audio)``, where each element
         is a tensor with the same shape as the corresponding latent.
+    anchor_decay:
+        Optional decay schedule for anchor constraints. If provided, anchor tokens
+        (those with denoise_mask < 1.0) will have their constraints gradually
+        released over the denoising process. Options: "linear", "cosine", "sigmoid".
+        This allows anchors to guide structure early but permit motion later.
     ### Returns
     tuple[LatentState, LatentState]
         A pair ``(video_state, audio_state)`` containing the final video and
         audio latent states after completing the denoising loop.
     """
+    total_steps = len(sigmas) - 1
+
+    # Store original masks for anchor decay computation
+    if anchor_decay:
+        original_video_mask = video_state.denoise_mask.clone()
+
     for step_idx, _ in enumerate(tqdm(sigmas[:-1])):
+        # Apply anchor decay: gradually release anchor constraints over time
+        if anchor_decay:
+            decay = anchor_strength_decay(step_idx, total_steps, anchor_decay)
+            # Adjust mask: move toward 1.0 (full denoising freedom) based on decay
+            # effective_mask = original_mask + (1.0 - original_mask) * decay
+            adjusted_video_mask = original_video_mask + (1.0 - original_video_mask) * decay
+            video_state = replace(video_state, denoise_mask=adjusted_video_mask)
+
         denoised_video, denoised_audio = denoise_fn(video_state, audio_state, sigmas, step_idx)
 
         denoised_video = post_process_latent(denoised_video, video_state.denoise_mask, video_state.clean_latent)
@@ -148,6 +199,7 @@ def gradient_estimating_euler_denoising_loop(
     stepper: DiffusionStepProtocol,
     denoise_fn: DenoisingFunc,
     ge_gamma: float = 2.0,
+    anchor_decay: str | None = None,
 ) -> tuple[LatentState, LatentState]:
     """
     Perform the joint audio-video denoising loop using gradient-estimation sampling.
@@ -161,10 +213,17 @@ def gradient_estimating_euler_denoising_loop(
         Default is 2.0. Paper: https://openreview.net/pdf?id=o2ND9v0CeK
     sigmas, video_state, audio_state, stepper, denoise_fn:
         See :func:`euler_denoising_loop` for parameter descriptions.
+    anchor_decay:
+        Optional decay schedule for anchor constraints. See :func:`euler_denoising_loop`.
     ### Returns
     tuple[LatentState, LatentState]
         See :func:`euler_denoising_loop` for return value description.
     """
+    total_steps = len(sigmas) - 1
+
+    # Store original masks for anchor decay computation
+    if anchor_decay:
+        original_video_mask = video_state.denoise_mask.clone()
 
     previous_audio_velocity = None
     previous_video_velocity = None
@@ -180,6 +239,12 @@ def gradient_estimating_euler_denoising_loop(
         return current_velocity, denoised_sample
 
     for step_idx, _ in enumerate(tqdm(sigmas[:-1])):
+        # Apply anchor decay: gradually release anchor constraints over time
+        if anchor_decay:
+            decay = anchor_strength_decay(step_idx, total_steps, anchor_decay)
+            adjusted_video_mask = original_video_mask + (1.0 - original_video_mask) * decay
+            video_state = replace(video_state, denoise_mask=adjusted_video_mask)
+
         denoised_video, denoised_audio = denoise_fn(video_state, audio_state, sigmas, step_idx)
 
         denoised_video = post_process_latent(denoised_video, video_state.denoise_mask, video_state.clean_latent)

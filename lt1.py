@@ -460,6 +460,7 @@ def generate_ltx_video(
     frame_rate: float,
     cfg_guidance_scale: float,
     num_inference_steps: int,
+    stage2_steps: int,
     seed: int,
     # Image conditioning (for I2V)
     input_image: str,
@@ -472,6 +473,7 @@ def generate_ltx_video(
     anchor_image: str,
     anchor_interval: int,
     anchor_strength: float,
+    anchor_decay: str,
     # Video input (for V2V / refine)
     input_video: str,
     refine_strength: float,
@@ -579,6 +581,7 @@ def generate_ltx_video(
             "--height", str(int(height)),
             "--cfg-guidance-scale", str(float(cfg_guidance_scale)),
             "--num-inference-steps", str(int(num_inference_steps)),
+            "--stage2-steps", str(int(stage2_steps)),
             "--seed", str(current_seed),
             "--output-path", output_filename,
         ]
@@ -623,6 +626,8 @@ def generate_ltx_video(
                 command.extend(["--anchor-image", str(anchor_image)])
             command.extend(["--anchor-interval", str(int(anchor_interval))])
             command.extend(["--anchor-strength", str(float(anchor_strength))])
+            if anchor_decay and anchor_decay != "none":
+                command.extend(["--anchor-decay", str(anchor_decay)])
 
         # User LoRA
         if user_lora and user_lora != "None" and lora_folder:
@@ -871,9 +876,15 @@ def create_interface():
                                         info="Frame interval (e.g., 60). Set to 0 to disable."
                                     )
                                     anchor_strength = gr.Slider(
-                                        minimum=0.0, maximum=1.0, value=0.8, step=0.05,
+                                        minimum=0.0, maximum=1.0, value=0.1, step=0.01,
                                         label="Anchor Strength",
                                         info="How strongly to guide toward anchor"
+                                    )
+                                    anchor_decay = gr.Dropdown(
+                                        label="Anchor Decay",
+                                        choices=["none", "linear", "cosine", "sigmoid"],
+                                        value="cosine",
+                                        info="Decay schedule: strong early, weak later for motion"
                                     )
 
                             with gr.Accordion("End Image (optional)", open=False):
@@ -898,6 +909,7 @@ def create_interface():
                             with gr.Row():
                                 cfg_guidance_scale = gr.Slider(minimum=1.0, maximum=15.0, value=4.0, step=0.5, label="CFG Scale")
                                 num_inference_steps = gr.Slider(minimum=1, maximum=60, value=40, step=1, label="Inference Steps")
+                                stage2_steps = gr.Slider(minimum=1, maximum=60, value=3, step=1, label="Stage 2 Steps")
 
                         # Video Input (V2V / Refine)
                         with gr.Accordion("Video Input (V2V / Refine)", open=False) as v2v_section:
@@ -1176,10 +1188,10 @@ def create_interface():
                 checkpoint_path, distilled_checkpoint, stage2_checkpoint, gemma_root, spatial_upsampler_path,
                 distilled_lora_path, distilled_lora_strength,
                 mode, pipeline, width, height, num_frames, frame_rate,
-                cfg_guidance_scale, num_inference_steps, seed,
+                cfg_guidance_scale, num_inference_steps, stage2_steps, seed,
                 input_image, image_frame_idx, image_strength,
                 end_image, end_image_strength,
-                anchor_image, anchor_interval, anchor_strength,
+                anchor_image, anchor_interval, anchor_strength, anchor_decay,
                 input_video, refine_strength, refine_steps,
                 disable_audio, enhance_prompt,
                 offload, enable_fp8,
@@ -1204,7 +1216,7 @@ def create_interface():
         def send_to_generation_handler(metadata, first_frame):
             """Send loaded metadata to generation tab parameters and switch to Generation tab."""
             if not metadata:
-                return [gr.update()] * 35 + ["No metadata loaded - upload a video first"]
+                return [gr.update()] * 37 + ["No metadata loaded - upload a video first"]
 
             # Handle legacy metadata that used single enable_block_swap
             legacy_block_swap = metadata.get("enable_block_swap", True)
@@ -1240,6 +1252,7 @@ def create_interface():
                 gr.update(value=metadata.get("frame_rate", 24)),  # frame_rate
                 gr.update(value=metadata.get("cfg_guidance_scale", 4.0)),  # cfg_guidance_scale
                 gr.update(value=metadata.get("num_inference_steps", 40)),  # num_inference_steps
+                gr.update(value=metadata.get("stage2_steps", 3)),  # stage2_steps
                 gr.update(value=metadata.get("seed", -1)),  # seed
                 # Image conditioning
                 gr.update(value=first_frame),  # input_image - use extracted first frame
@@ -1249,6 +1262,7 @@ def create_interface():
                 # Anchor conditioning
                 gr.update(value=metadata.get("anchor_interval", 0) or 0),  # anchor_interval
                 gr.update(value=metadata.get("anchor_strength", 0.8)),  # anchor_strength
+                gr.update(value=metadata.get("anchor_decay", "cosine") or "cosine"),  # anchor_decay
                 # Refine settings
                 gr.update(value=metadata.get("refine_strength", 0.3)),  # refine_strength
                 gr.update(value=metadata.get("refine_steps", 10)),  # refine_steps
@@ -1278,11 +1292,11 @@ def create_interface():
                 tabs,  # Switch tab
                 prompt, negative_prompt, mode, pipeline,
                 width, height, num_frames, frame_rate,
-                cfg_guidance_scale, num_inference_steps, seed,
+                cfg_guidance_scale, num_inference_steps, stage2_steps, seed,
                 # Image conditioning
                 input_image, image_frame_idx, image_strength, end_image_strength,
                 # Anchor conditioning
-                anchor_interval, anchor_strength,
+                anchor_interval, anchor_strength, anchor_decay,
                 # Refine settings
                 refine_strength, refine_steps,
                 # Audio and prompt

@@ -360,6 +360,16 @@ Examples:
         default=0.8,
         help="Conditioning strength for anchor images (default: 0.8).",
     )
+    anchor_group.add_argument(
+        "--anchor-decay",
+        type=str,
+        choices=["none", "linear", "cosine", "sigmoid"],
+        default="none",
+        help="Decay schedule for anchor constraints. 'none' = constant strength, "
+             "'cosine' = smooth decay (recommended), 'linear' = steady decay, "
+             "'sigmoid' = late-stage release. Decay allows anchors to guide structure "
+             "early but permit motion later. (default: none)",
+    )
 
     # ==========================================================================
     # LoRA Support
@@ -665,7 +675,7 @@ def apply_loras_chunked_gpu(
 
     print(f">>> Applying LoRAs to {len(params_to_process)} layers using GPU...")
 
-    for name, param, lora_prefix, key_a, key_b in tqdm(params_to_process, desc="Applying LoRAs"):
+    for name, param, lora_prefix, key_a, key_b in tqdm(params_to_process, desc="Applying LoRAs", miniters=100):
         # Collect all LoRA deltas for this weight
         deltas = []
         for lora_map, lsd, strength in zip(lora_maps, lora_state_dicts, lora_strengths):
@@ -944,6 +954,7 @@ class LTXVideoGeneratorWithOffloading:
         anchor_image: str | None = None,
         anchor_interval: int | None = None,
         anchor_strength: float = 0.8,
+        anchor_decay: str | None = None,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor | None]:
         """
         Generate video with optional audio.
@@ -1187,6 +1198,8 @@ class LTXVideoGeneratorWithOffloading:
             # Define denoising function for stage 1
             # Use CFG guidance if scale > 1 and we have negative context, otherwise simple denoising
             use_cfg = cfg_guidance_scale > 1.0 and v_context_n is not None
+            # Convert anchor_decay "none" to None for the denoising loop
+            effective_anchor_decay = anchor_decay if anchor_decay and anchor_decay != "none" else None
             if use_cfg:
                 # CFG guidance with positive/negative prompts
                 def first_stage_denoising_loop(
@@ -1208,6 +1221,7 @@ class LTXVideoGeneratorWithOffloading:
                             a_context_n,
                             transformer=transformer,
                         ),
+                        anchor_decay=effective_anchor_decay,
                     )
             else:
                 # No CFG guidance, single forward pass
@@ -1227,6 +1241,7 @@ class LTXVideoGeneratorWithOffloading:
                             audio_context=a_context_p,
                             transformer=transformer,
                         ),
+                        anchor_decay=effective_anchor_decay,
                     )
 
             # Stage 1 output shape (half resolution for two-stage, full for one-stage)
@@ -1497,6 +1512,8 @@ class LTXVideoGeneratorWithOffloading:
             print(f">>> Stage 2 using {stage2_steps} denoising steps")
 
         # Define denoising function for stage 2 (no CFG, just positive)
+        # Convert anchor_decay "none" to None for the denoising loop (if not already done in stage 1)
+        effective_anchor_decay = anchor_decay if anchor_decay and anchor_decay != "none" else None
         def second_stage_denoising_loop(
             sigmas: torch.Tensor,
             video_state: LatentState,
@@ -1513,6 +1530,7 @@ class LTXVideoGeneratorWithOffloading:
                     audio_context=a_context_p,
                     transformer=transformer,
                 ),
+                anchor_decay=effective_anchor_decay,
             )
 
         # Stage 2 output shape (full resolution)
@@ -1755,7 +1773,8 @@ def main():
     if args.anchor_interval:
         anchor_src = args.anchor_image if args.anchor_image else "first --image"
         num_anchors = len(range(args.anchor_interval, args.num_frames, args.anchor_interval))
-        print(f"Anchor conditioning: {num_anchors} anchor(s) every {args.anchor_interval} frames (source: {anchor_src}, strength: {args.anchor_strength})")
+        decay_info = f", decay: {args.anchor_decay}" if args.anchor_decay != "none" else ""
+        print(f"Anchor conditioning: {num_anchors} anchor(s) every {args.anchor_interval} frames (source: {anchor_src}, strength: {args.anchor_strength}{decay_info})")
     print("=" * 60)
     print(f"Prompt: {args.prompt}")
     print("=" * 60)
@@ -1807,6 +1826,7 @@ def main():
         anchor_image=args.anchor_image,
         anchor_interval=args.anchor_interval,
         anchor_strength=args.anchor_strength,
+        anchor_decay=args.anchor_decay,
     )
 
     # Encode and save video
@@ -1859,6 +1879,7 @@ def main():
         "anchor_image": args.anchor_image,
         "anchor_interval": args.anchor_interval,
         "anchor_strength": args.anchor_strength if args.anchor_interval else None,
+        "anchor_decay": args.anchor_decay if args.anchor_interval and args.anchor_decay != "none" else None,
         "disable_audio": args.disable_audio,
         "enhance_prompt": args.enhance_prompt,
     }
