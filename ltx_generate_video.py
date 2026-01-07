@@ -130,6 +130,123 @@ def build_anchor_image_tuples(
     return [(anchor_path, frame_idx, anchor_strength) for frame_idx in anchor_frames]
 
 
+class VideoConditionByMotionLatent:
+    """
+    SVI Pro motion conditioning using keyframe-style token appending.
+
+    Adapts H1111's motion latent conditioning to LTX's keyframe system.
+    Instead of concatenating motion latents directly to the latent tensor,
+    this creates VideoConditionByKeyframeIndex items that append tokens
+    with appropriate temporal position offsets.
+
+    Motion latents guide temporal consistency by appearing at the END
+    of the frame sequence, providing "future motion context" to the denoiser.
+    """
+
+    def __init__(
+        self,
+        motion_latent: torch.Tensor,  # Shape: [1, C, num_motion_latent, H, W]
+        strength: float = 0.7,
+        frame_offset: int = 0,
+    ):
+        """
+        Args:
+            motion_latent: Latent tensor from previous clip [1, C, N, H, W]
+            strength: Conditioning strength (0=ignore, 1=fully condition)
+            frame_offset: Additional offset for frame positioning
+        """
+        self.motion_latent = motion_latent
+        self.strength = strength
+        self.frame_offset = frame_offset
+
+    def to_keyframe_conditionings(
+        self,
+        num_frames: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> list:
+        """
+        Convert motion latent to list of VideoConditionByKeyframeIndex items.
+
+        Each latent frame becomes a separate keyframe conditioning at the
+        appropriate temporal position (at END of sequence for motion context).
+
+        Args:
+            num_frames: Total pixel frames in the video
+            dtype: Target dtype for conditioning tensors
+            device: Target device
+
+        Returns:
+            List of VideoConditionByKeyframeIndex items
+        """
+        from ltx_core.conditioning.types.keyframe_cond import VideoConditionByKeyframeIndex
+
+        conditionings = []
+        motion_latent = self.motion_latent.to(device=device, dtype=dtype)
+        num_motion_frames = motion_latent.shape[2]
+
+        # Position motion frames at the END of the temporal sequence
+        # This provides "where we're going" context for motion continuity
+        for i in range(num_motion_frames):
+            # Extract single latent frame: [1, C, 1, H, W]
+            frame_latent = motion_latent[:, :, i:i+1, :, :]
+
+            # Frame index at end: num_frames - num_motion_frames + i
+            # Convert to pixel frame index for VideoConditionByKeyframeIndex
+            frame_idx = num_frames - num_motion_frames + i + self.frame_offset
+
+            conditionings.append(
+                VideoConditionByKeyframeIndex(
+                    keyframes=frame_latent,
+                    frame_idx=frame_idx,
+                    strength=self.strength,
+                )
+            )
+
+        return conditionings
+
+
+def _encode_frames_to_latent(
+    frames: torch.Tensor,
+    video_encoder,
+    device: torch.device,
+    dtype: torch.dtype,
+    target_latent_frames: int,
+) -> torch.Tensor:
+    """
+    Encode pixel frames to latent representation for motion conditioning.
+
+    Args:
+        frames: Video frames [F, H, W, C] in 0-255 uint8 or [0,1] float
+        video_encoder: LTX video encoder instance
+        device: Target device
+        dtype: Target dtype
+        target_latent_frames: Number of latent frames to return
+
+    Returns:
+        Latent tensor [1, C, target_latent_frames, H, W]
+    """
+    # Handle different input formats
+    if frames.dtype == torch.uint8:
+        frames = frames.float() / 255.0
+    elif frames.max() > 1.0:
+        frames = frames / 255.0
+
+    # Convert from [F, H, W, C] to [1, C, F, H, W]
+    frames = frames.permute(3, 0, 1, 2).unsqueeze(0)  # [1, C, F, H, W]
+    frames = frames.to(device=device, dtype=dtype)
+
+    # Normalize to [-1, 1] for VAE
+    frames = frames * 2.0 - 1.0
+
+    # Encode
+    with torch.no_grad():
+        latent = video_encoder(frames)  # [1, latent_C, lat_F, lat_H, lat_W]
+
+    # Return last N latent frames
+    return latent[:, :, -target_latent_frames:, :, :]
+
+
 # =============================================================================
 # Argument Parser
 # =============================================================================
@@ -485,6 +602,58 @@ Examples:
         type=int,
         default=10,
         help="Number of refinement steps for refine-only mode. Default: 10",
+    )
+
+    # ==========================================================================
+    # SVI Pro (Multi-Clip) Mode
+    # ==========================================================================
+    svi_group = parser.add_argument_group("SVI Pro (Multi-Clip) Mode")
+    svi_group.add_argument(
+        "--svi-mode",
+        action="store_true",
+        help="Enable SVI Pro mode for multi-clip generation with motion continuity.",
+    )
+    svi_group.add_argument(
+        "--num-clips",
+        type=int,
+        default=2,
+        help="Number of clips to generate in SVI mode (default: 2).",
+    )
+    svi_group.add_argument(
+        "--num-motion-latent",
+        type=int,
+        default=2,
+        help="Number of latent frames from previous clip to use for motion conditioning (default: 2).",
+    )
+    svi_group.add_argument(
+        "--num-motion-frame",
+        type=int,
+        default=1,
+        help="Frame offset from end of clip for next input image (1=last, 4=4th from last). Default: 1.",
+    )
+    svi_group.add_argument(
+        "--seed-multiplier",
+        type=int,
+        default=42,
+        help="Per-clip seed variation: seed = base_seed + clip_idx * multiplier (default: 42).",
+    )
+    svi_group.add_argument(
+        "--overlap-frames",
+        type=int,
+        default=1,
+        help="Number of overlapping frames between clips for smooth transitions (default: 1).",
+    )
+    svi_group.add_argument(
+        "--extend-video",
+        type=resolve_path,
+        default=None,
+        help="Input video path to extend using SVI Pro. Enables video extension mode.",
+    )
+    svi_group.add_argument(
+        "--prepend-original",
+        action="store_true",
+        default=True,
+        help="Prepend original video frames when extending (default: True).",
     )
 
     # ==========================================================================
@@ -955,6 +1124,9 @@ class LTXVideoGeneratorWithOffloading:
         anchor_interval: int | None = None,
         anchor_strength: float = 0.8,
         anchor_decay: str | None = None,
+        # SVI Pro parameters
+        _motion_latent: torch.Tensor | None = None,
+        _num_motion_latent: int = 0,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor | None]:
         """
         Generate video with optional audio.
@@ -1293,6 +1465,21 @@ class LTXVideoGeneratorWithOffloading:
                     stage_1_conditionings = stage_1_conditionings + anchor_conditionings
                     print(f">>> Added {len(anchor_conditionings)} anchor points at frames {[t[1] for t in anchor_tuples]}")
 
+            # SVI Pro: Add motion latent conditionings
+            if _motion_latent is not None and _num_motion_latent > 0:
+                motion_cond = VideoConditionByMotionLatent(
+                    motion_latent=_motion_latent,
+                    strength=0.7,
+                    frame_offset=0,
+                )
+                motion_conditionings = motion_cond.to_keyframe_conditionings(
+                    num_frames=num_frames,
+                    dtype=dtype,
+                    device=self.device,
+                )
+                stage_1_conditionings = stage_1_conditionings + motion_conditionings
+                print(f">>> SVI Pro: Added {len(motion_conditionings)} motion keyframe conditionings")
+
             stage_label = "One-stage" if self.one_stage else "Stage 1"
             print(f">>> {stage_label}: Generating at {stage_1_output_shape.width}x{stage_1_output_shape.height}...")
             video_state, audio_state = denoise_audio_video(
@@ -1595,6 +1782,20 @@ class LTXVideoGeneratorWithOffloading:
                 )
                 stage_2_conditionings = stage_2_conditionings + anchor_conditionings
 
+        # SVI Pro: Add motion latent conditionings for stage 2
+        if _motion_latent is not None and _num_motion_latent > 0:
+            motion_cond = VideoConditionByMotionLatent(
+                motion_latent=_motion_latent,
+                strength=0.7,
+                frame_offset=0,
+            )
+            motion_conditionings = motion_cond.to_keyframe_conditionings(
+                num_frames=num_frames,
+                dtype=dtype,
+                device=self.device,
+            )
+            stage_2_conditionings = stage_2_conditionings + motion_conditionings
+
         print(f">>> Stage 2: Refining at {stage_2_output_shape.width}x{stage_2_output_shape.height}...")
         # For refine-only mode, use audio_latent from input video encoding
         # For normal two-stage, use audio_state.latent from stage 1
@@ -1717,6 +1918,396 @@ class LTXVideoGeneratorWithOffloading:
 
 
 # =============================================================================
+# SVI Pro Multi-Clip Functions
+# =============================================================================
+
+def generate_svi_multi_clip(
+    generator: "LTXVideoGeneratorWithOffloading",
+    args,
+    initial_image_path: str,
+    num_clips: int,
+    num_motion_latent: int = 2,
+    num_motion_frame: int = 1,
+    seed_multiplier: int = 42,
+    overlap_frames: int = 1,
+    prompts: list[str] | None = None,
+    initial_motion_latent: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """
+    Generate multi-clip streaming video using SVI Pro approach.
+
+    This implements the SVI Pro algorithm adapted for LTX:
+    1. Generate first clip from initial image (with anchor at frame 0)
+    2. For each subsequent clip:
+       - Extract motion frame from previous clip as new input image
+       - Extract last N latent frames as motion_latent
+       - Use original image as anchor for style consistency
+       - Add motion_latent as keyframe conditionings at END of sequence
+       - Vary seed per clip for different motion dynamics
+
+    Args:
+        generator: LTXVideoGeneratorWithOffloading instance
+        args: Command line arguments containing generation parameters
+        initial_image_path: Path to the starting image (becomes anchor)
+        num_clips: Number of clips to generate
+        num_motion_latent: Latent frames from previous clip for motion context
+        num_motion_frame: Pixel frame offset from end for next input image
+        seed_multiplier: Per-clip seed variation
+        overlap_frames: Overlapping frames between clips
+        prompts: Optional list of per-clip prompts
+        initial_motion_latent: Optional motion latent for video extension
+
+    Returns:
+        Tuple of (concatenated_video_tensor [F,H,W,C], combined_audio_tensor or None)
+    """
+    import tempfile
+    import shutil
+    import cv2
+    from PIL import Image
+
+    device = generator.device
+    dtype = generator.dtype
+    base_seed = args.seed
+
+    # Storage for clips
+    all_video_chunks = []
+    all_audio_chunks = []
+
+    # SVI anchor: the original image for style consistency
+    anchor_image_path = initial_image_path
+    current_input_image = initial_image_path
+
+    # Motion latent from previous clip (for clip 2+)
+    prev_motion_latent = initial_motion_latent
+
+    # Temp directory for intermediate frames
+    temp_dir = tempfile.mkdtemp()
+
+    try:
+        for clip_idx in range(num_clips):
+            print("=" * 60)
+            print(f"SVI Pro: Generating clip {clip_idx + 1}/{num_clips}")
+            print("=" * 60)
+
+            # Calculate seed for this clip
+            clip_seed = base_seed + clip_idx * seed_multiplier
+            print(f">>> Clip {clip_idx + 1} seed: {clip_seed}")
+
+            # Select prompt for this clip
+            if prompts and clip_idx < len(prompts):
+                clip_prompt = prompts[clip_idx]
+            elif prompts:
+                clip_prompt = prompts[-1]  # Use last prompt
+            else:
+                clip_prompt = args.prompt
+
+            # Build image conditionings for this clip
+            # Frame 0: current input image (motion frame from prev clip, or initial)
+            clip_images = [(current_input_image, 0, 0.95)]
+
+            # Generate this clip
+            video_iterator, audio = generator.generate(
+                prompt=clip_prompt,
+                negative_prompt=args.negative_prompt,
+                seed=clip_seed,
+                height=args.height,
+                width=args.width,
+                num_frames=args.num_frames,
+                frame_rate=args.frame_rate,
+                num_inference_steps=args.num_inference_steps,
+                cfg_guidance_scale=args.cfg_guidance_scale,
+                images=clip_images,
+                tiling_config=TilingConfig.default(),
+                enhance_prompt=False,
+                disable_audio=args.disable_audio,
+                stage2_steps=args.stage2_steps,
+                anchor_image=anchor_image_path if clip_idx > 0 else None,
+                anchor_interval=args.anchor_interval if clip_idx > 0 else None,
+                anchor_strength=args.anchor_strength,
+                anchor_decay=args.anchor_decay,
+                # SVI-specific parameters
+                _motion_latent=prev_motion_latent if clip_idx > 0 else None,
+                _num_motion_latent=num_motion_latent if clip_idx > 0 else 0,
+            )
+
+            # Collect video frames from iterator
+            video_frames = []
+            for chunk in video_iterator:
+                video_frames.append(chunk)
+            video_tensor = torch.cat(video_frames, dim=0)  # [F, H, W, C]
+            print(f">>> Clip {clip_idx + 1} generated: {video_tensor.shape}")
+
+            # Extract motion latent for next clip
+            if clip_idx < num_clips - 1 and num_motion_latent > 0:
+                # We need frames for latent encoding
+                # LTX temporal compression is 8x, so num_motion_latent * 8 pixel frames ≈ num_motion_latent latent frames
+                frames_needed = num_motion_latent * 8 + 1  # Extra frame for VAE boundary
+                frames_for_latent = video_tensor[-frames_needed:, :, :, :]
+
+                # Load video encoder for latent extraction
+                video_encoder = generator.stage_1_model_ledger.video_encoder()
+                prev_motion_latent = _encode_frames_to_latent(
+                    frames_for_latent,
+                    video_encoder,
+                    device,
+                    dtype,
+                    num_motion_latent,
+                )
+                print(f">>> Extracted motion latent: {prev_motion_latent.shape}")
+
+                # Cleanup encoder
+                video_encoder.to("cpu")
+                del video_encoder
+                synchronize_and_cleanup()
+
+                # Extract motion frame for next clip input
+                frame_idx = -min(num_motion_frame, video_tensor.shape[0])
+                motion_frame = video_tensor[frame_idx].cpu().numpy().astype("uint8")  # [H, W, C]
+
+                temp_image_path = os.path.join(temp_dir, f"clip_{clip_idx}_motion.png")
+                Image.fromarray(motion_frame).save(temp_image_path)
+                current_input_image = temp_image_path
+                print(f">>> Saved motion frame to: {temp_image_path}")
+
+            # Store clip (skip overlap frames for non-first clips)
+            if clip_idx == 0:
+                all_video_chunks.append(video_tensor)
+            else:
+                all_video_chunks.append(video_tensor[overlap_frames:])
+
+            if audio is not None:
+                # Calculate corresponding audio samples to skip
+                # audio is at AUDIO_SAMPLE_RATE, video at args.frame_rate
+                if clip_idx == 0:
+                    all_audio_chunks.append(audio)
+                else:
+                    samples_per_frame = int(24000 / args.frame_rate)  # AUDIO_SAMPLE_RATE
+                    samples_to_skip = overlap_frames * samples_per_frame
+                    all_audio_chunks.append(audio[samples_to_skip:])
+
+        # Concatenate all clips
+        print("=" * 60)
+        print("SVI Pro: Concatenating clips...")
+        print("=" * 60)
+        final_video = torch.cat(all_video_chunks, dim=0)
+        final_audio = torch.cat(all_audio_chunks, dim=0) if all_audio_chunks else None
+
+        print(f">>> Final video shape: {final_video.shape}")
+        if final_audio is not None:
+            print(f">>> Final audio shape: {final_audio.shape}")
+
+        return final_video, final_audio
+
+    finally:
+        # Cleanup temp directory
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+
+
+def generate_svi_video_extension(
+    generator: "LTXVideoGeneratorWithOffloading",
+    args,
+    input_video_path: str,
+    num_clips: int,
+    num_motion_latent: int = 2,
+    num_motion_frame: int = 1,
+    seed_multiplier: int = 42,
+    overlap_frames: int = 1,
+    anchor_image_path: str | None = None,
+    prepend_original: bool = True,
+    prompts: list[str] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """
+    Extend an existing video using SVI Pro approach.
+
+    1. Load input video and extract transition frame (for next clip input)
+    2. Extract and encode last N frames as initial motion latent
+    3. Optionally extract first frame as anchor (or use provided)
+    4. Call generate_svi_multi_clip with initial_motion_latent
+    5. Concatenate original video with extension
+
+    Args:
+        generator: LTXVideoGeneratorWithOffloading instance
+        args: Command line arguments
+        input_video_path: Path to video to extend
+        num_clips: Number of extension clips
+        num_motion_latent: Motion latent frames
+        num_motion_frame: Frame offset for input image
+        seed_multiplier: Per-clip seed variation
+        overlap_frames: Overlap for blending
+        anchor_image_path: Optional explicit anchor image
+        prepend_original: Whether to include original video
+        prompts: Optional per-clip prompts
+
+    Returns:
+        Tuple of (extended_video, audio)
+    """
+    import tempfile
+    import shutil
+    import cv2
+    from PIL import Image
+
+    device = generator.device
+    dtype = generator.dtype
+
+    temp_dir = tempfile.mkdtemp()
+
+    try:
+        print("=" * 60)
+        print("SVI Pro Video Extension Mode")
+        print("=" * 60)
+
+        # Load input video info
+        cap = cv2.VideoCapture(input_video_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"Failed to open video: {input_video_path}")
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        video_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        video_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        print(f">>> Input video: {total_frames} frames at {fps:.1f} fps, {video_width}x{video_height}")
+
+        # Extract transition frame (last frame for continuation)
+        transition_frame_idx = total_frames - 1
+        cap.set(cv2.CAP_PROP_POS_FRAMES, transition_frame_idx)
+        ret, transition_frame = cap.read()
+        if not ret:
+            raise RuntimeError(f"Failed to read frame {transition_frame_idx}")
+
+        # Convert BGR to RGB
+        transition_frame = cv2.cvtColor(transition_frame, cv2.COLOR_BGR2RGB)
+        start_image_path = os.path.join(temp_dir, "transition_frame.png")
+        Image.fromarray(transition_frame).save(start_image_path)
+        print(f">>> Extracted transition frame to: {start_image_path}")
+
+        # Extract anchor frame (first frame or provided)
+        if anchor_image_path and os.path.exists(anchor_image_path):
+            anchor_path = anchor_image_path
+            print(f">>> Using provided anchor image: {anchor_path}")
+        else:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, first_frame = cap.read()
+            if ret:
+                first_frame = cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)
+                anchor_path = os.path.join(temp_dir, "anchor_frame.png")
+                Image.fromarray(first_frame).save(anchor_path)
+                print(f">>> Extracted anchor frame to: {anchor_path}")
+            else:
+                anchor_path = start_image_path
+
+        # Load original video frames for prepending
+        original_video = None
+        if prepend_original:
+            print(">>> Loading original video frames...")
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            original_frames = []
+            for i in range(total_frames):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                # Resize to match target resolution
+                if frame.shape[1] != args.width or frame.shape[0] != args.height:
+                    frame = cv2.resize(frame, (args.width, args.height), interpolation=cv2.INTER_LANCZOS4)
+                original_frames.append(torch.from_numpy(frame))
+            original_video = torch.stack(original_frames, dim=0)  # [F, H, W, C]
+            print(f">>> Loaded original video: {original_video.shape}")
+
+        cap.release()
+
+        # Encode last N frames for initial motion latent
+        initial_motion_latent = None
+        if num_motion_latent > 0 and original_video is not None:
+            print(">>> Encoding initial motion latent from video end...")
+            frames_needed = num_motion_latent * 8 + 1
+            frames_for_latent = original_video[-frames_needed:, :, :, :].float()
+
+            # Need to resize to stage 1 dimensions if using two-stage
+            if not generator.one_stage:
+                # Resize frames for stage 1
+                stage_1_h = args.height // 2
+                stage_1_w = args.width // 2
+                frames_for_latent_resized = []
+                for i in range(frames_for_latent.shape[0]):
+                    frame = frames_for_latent[i].numpy().astype("uint8")
+                    frame_resized = cv2.resize(frame, (stage_1_w, stage_1_h), interpolation=cv2.INTER_LANCZOS4)
+                    frames_for_latent_resized.append(torch.from_numpy(frame_resized).float())
+                frames_for_latent = torch.stack(frames_for_latent_resized, dim=0)
+
+            video_encoder = generator.stage_1_model_ledger.video_encoder()
+            initial_motion_latent = _encode_frames_to_latent(
+                frames_for_latent,
+                video_encoder,
+                device,
+                dtype,
+                num_motion_latent,
+            )
+            print(f">>> Extracted initial motion latent: {initial_motion_latent.shape}")
+
+            video_encoder.to("cpu")
+            del video_encoder
+            synchronize_and_cleanup()
+
+        # Update anchor path in args for generate
+        original_anchor = getattr(args, 'anchor_image', None)
+        args.anchor_image = anchor_path
+
+        # Generate extension clips
+        extension_video, extension_audio = generate_svi_multi_clip(
+            generator=generator,
+            args=args,
+            initial_image_path=start_image_path,
+            num_clips=num_clips,
+            num_motion_latent=num_motion_latent,
+            num_motion_frame=num_motion_frame,
+            seed_multiplier=seed_multiplier,
+            overlap_frames=overlap_frames,
+            prompts=prompts,
+            initial_motion_latent=initial_motion_latent,
+        )
+
+        # Restore args
+        args.anchor_image = original_anchor
+
+        # Concatenate with original if prepending
+        if prepend_original and original_video is not None:
+            print(">>> Concatenating original video with extension...")
+            # Blend overlap region for smooth transition
+            if overlap_frames > 0 and extension_video.shape[0] > overlap_frames:
+                # Create linear crossfade weights
+                weights = torch.linspace(1.0, 0.0, overlap_frames, device=original_video.device)
+                weights = weights.view(-1, 1, 1, 1)
+
+                # Get overlap regions
+                overlap_orig = original_video[-overlap_frames:].float()
+                overlap_ext = extension_video[:overlap_frames].float()
+
+                # Blend: original fades out, extension fades in
+                blended = (overlap_orig * weights + overlap_ext * (1 - weights)).to(original_video.dtype)
+
+                # Concatenate: orig[:-overlap] + blended + ext[overlap:]
+                final_video = torch.cat([
+                    original_video[:-overlap_frames],
+                    blended,
+                    extension_video[overlap_frames:],
+                ], dim=0)
+            else:
+                final_video = torch.cat([original_video, extension_video], dim=0)
+
+            print(f">>> Final extended video: {final_video.shape}")
+        else:
+            final_video = extension_video
+
+        return final_video, extension_audio
+
+    finally:
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+
+
+# =============================================================================
 # Main Entry Point
 # =============================================================================
 
@@ -1798,6 +2389,16 @@ def main():
         num_anchors = len(range(args.anchor_interval, args.num_frames, args.anchor_interval))
         decay_info = f", decay: {args.anchor_decay}" if args.anchor_decay != "none" else ""
         print(f"Anchor conditioning: {num_anchors} anchor(s) every {args.anchor_interval} frames (source: {anchor_src}, strength: {args.anchor_strength}{decay_info})")
+    # SVI Pro mode info
+    if args.svi_mode or args.extend_video:
+        svi_mode_type = "Video Extension" if args.extend_video else "Multi-Clip Generation"
+        print(f"SVI Pro Mode: {svi_mode_type}")
+        print(f"  Clips: {args.num_clips}")
+        print(f"  Motion Latent Frames: {args.num_motion_latent}")
+        print(f"  Seed Multiplier: {args.seed_multiplier}")
+        if args.extend_video:
+            print(f"  Input Video: {args.extend_video}")
+            print(f"  Prepend Original: {args.prepend_original}")
     print("=" * 60)
     print(f"Prompt: {args.prompt}")
     print("=" * 60)
@@ -1825,32 +2426,78 @@ def main():
 
     # Set up tiling config for VAE
     tiling_config = TilingConfig.default()
-    video_chunks_number = get_video_chunks_number(args.num_frames, tiling_config)
 
-    # Generate video
-    video, audio = generator.generate(
-        prompt=args.prompt,
-        negative_prompt=args.negative_prompt,
-        seed=args.seed,
-        height=args.height,
-        width=args.width,
-        num_frames=args.num_frames,
-        frame_rate=args.frame_rate,
-        num_inference_steps=args.num_inference_steps,
-        cfg_guidance_scale=args.cfg_guidance_scale,
-        images=args.images,
-        tiling_config=tiling_config,
-        enhance_prompt=args.enhance_prompt,
-        disable_audio=args.disable_audio,
-        input_video=args.input_video,
-        refine_strength=args.refine_strength,
-        refine_steps=args.refine_steps,
-        stage2_steps=args.stage2_steps,
-        anchor_image=args.anchor_image,
-        anchor_interval=args.anchor_interval,
-        anchor_strength=args.anchor_strength,
-        anchor_decay=args.anchor_decay,
-    )
+    # Branch between SVI Pro mode and regular mode
+    if args.svi_mode or args.extend_video:
+        # SVI Pro mode: multi-clip or video extension
+        if args.extend_video:
+            # Video extension mode
+            if not args.images:
+                # No explicit image provided, will use frames from video
+                args.images = []
+            video_tensor, audio = generate_svi_video_extension(
+                generator=generator,
+                args=args,
+                input_video_path=args.extend_video,
+                num_clips=args.num_clips,
+                num_motion_latent=args.num_motion_latent,
+                num_motion_frame=args.num_motion_frame,
+                seed_multiplier=args.seed_multiplier,
+                overlap_frames=args.overlap_frames,
+                anchor_image_path=args.anchor_image,
+                prepend_original=args.prepend_original,
+            )
+        else:
+            # Multi-clip generation mode
+            if not args.images:
+                raise ValueError("SVI mode requires at least one --image for the initial frame")
+            initial_image = args.images[0][0]
+            video_tensor, audio = generate_svi_multi_clip(
+                generator=generator,
+                args=args,
+                initial_image_path=initial_image,
+                num_clips=args.num_clips,
+                num_motion_latent=args.num_motion_latent,
+                num_motion_frame=args.num_motion_frame,
+                seed_multiplier=args.seed_multiplier,
+                overlap_frames=args.overlap_frames,
+            )
+
+        # SVI returns a decoded tensor [F, H, W, C], convert to iterator format for encode_video
+        def tensor_to_iterator(tensor):
+            """Convert tensor to chunk iterator for encode_video compatibility."""
+            yield tensor
+
+        video = tensor_to_iterator(video_tensor)
+        # Calculate total frames for proper video chunk handling
+        total_frames = video_tensor.shape[0]
+        video_chunks_number = get_video_chunks_number(total_frames, tiling_config)
+    else:
+        # Regular single-clip generation
+        video_chunks_number = get_video_chunks_number(args.num_frames, tiling_config)
+        video, audio = generator.generate(
+            prompt=args.prompt,
+            negative_prompt=args.negative_prompt,
+            seed=args.seed,
+            height=args.height,
+            width=args.width,
+            num_frames=args.num_frames,
+            frame_rate=args.frame_rate,
+            num_inference_steps=args.num_inference_steps,
+            cfg_guidance_scale=args.cfg_guidance_scale,
+            images=args.images,
+            tiling_config=tiling_config,
+            enhance_prompt=args.enhance_prompt,
+            disable_audio=args.disable_audio,
+            input_video=args.input_video,
+            refine_strength=args.refine_strength,
+            refine_steps=args.refine_steps,
+            stage2_steps=args.stage2_steps,
+            anchor_image=args.anchor_image,
+            anchor_interval=args.anchor_interval,
+            anchor_strength=args.anchor_strength,
+            anchor_decay=args.anchor_decay,
+        )
 
     # Encode and save video
     print(f">>> Encoding video to {args.output_path}...")
@@ -1905,6 +2552,15 @@ def main():
         "anchor_decay": args.anchor_decay if args.anchor_interval and args.anchor_decay != "none" else None,
         "disable_audio": args.disable_audio,
         "enhance_prompt": args.enhance_prompt,
+        # SVI Pro metadata
+        "svi_mode": args.svi_mode,
+        "svi_num_clips": args.num_clips if (args.svi_mode or args.extend_video) else None,
+        "svi_num_motion_latent": args.num_motion_latent if (args.svi_mode or args.extend_video) else None,
+        "svi_num_motion_frame": args.num_motion_frame if (args.svi_mode or args.extend_video) else None,
+        "svi_seed_multiplier": args.seed_multiplier if (args.svi_mode or args.extend_video) else None,
+        "svi_overlap_frames": args.overlap_frames if (args.svi_mode or args.extend_video) else None,
+        "svi_extend_video": args.extend_video,
+        "svi_prepend_original": args.prepend_original if args.extend_video else None,
     }
 
     print(">>> Adding metadata to video...")
