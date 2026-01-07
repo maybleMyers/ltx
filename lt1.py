@@ -421,6 +421,7 @@ def generate_ltx_video(
     negative_prompt: str,
     # Model paths
     checkpoint_path: str,
+    distilled_checkpoint: bool,
     gemma_root: str,
     spatial_upsampler_path: str,
     distilled_lora_path: str,
@@ -596,6 +597,8 @@ def generate_ltx_video(
             command.append("--offload")
         if enable_fp8:
             command.append("--enable-fp8")
+        if distilled_checkpoint:
+            command.append("--distilled-checkpoint")
         # Block swap controls (separate for DiT, text encoder, and refiner)
         if enable_dit_block_swap:
             command.append("--enable-dit-block-swap")
@@ -902,11 +905,19 @@ def create_interface():
                             with gr.Row():
                                 disable_audio = gr.Checkbox(label="Disable Audio", value=False, info="Generate video only (no audio)")
                                 enhance_prompt = gr.Checkbox(label="Enhance Prompt", value=False, info="Use Gemma to improve prompt")
-                            checkpoint_path = gr.Textbox(
-                                label="LTX Checkpoint Path",
-                                value="./weights/ltx-2-19b-dev.safetensors",
-                                info="Path to LTX-2 model checkpoint"
-                            )
+                            with gr.Row():
+                                checkpoint_path = gr.Textbox(
+                                    label="LTX Checkpoint Path",
+                                    value="./weights/ltx-2-19b-dev.safetensors",
+                                    info="Path to LTX-2 model checkpoint",
+                                    scale=4
+                                )
+                                distilled_checkpoint = gr.Checkbox(
+                                    label="Distilled",
+                                    value=False,
+                                    info="No CFG, 8-step schedule",
+                                    scale=1
+                                )
                             gemma_root = gr.Textbox(
                                 label="Gemma Root Path",
                                 value="./gemma-3-12b-it-qat-q4_0-unquantized",
@@ -1091,7 +1102,7 @@ def create_interface():
             fn=generate_ltx_video,
             inputs=[
                 prompt, negative_prompt,
-                checkpoint_path, gemma_root, spatial_upsampler_path,
+                checkpoint_path, distilled_checkpoint, gemma_root, spatial_upsampler_path,
                 distilled_lora_path, distilled_lora_strength,
                 mode, pipeline, width, height, num_frames, frame_rate,
                 cfg_guidance_scale, num_inference_steps, seed,

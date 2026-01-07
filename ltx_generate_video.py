@@ -58,6 +58,7 @@ from ltx_pipelines.utils.constants import (
     DEFAULT_NUM_FRAMES,
     DEFAULT_NUM_INFERENCE_STEPS,
     DEFAULT_SEED,
+    DISTILLED_SIGMA_VALUES,
     STAGE_2_DISTILLED_SIGMA_VALUES,
 )
 from ltx_pipelines.utils.helpers import (
@@ -192,6 +193,14 @@ Examples:
         metavar=("PATH", "STRENGTH"),
         default=None,
         help=f"Distilled LoRA for stage 2 (default: {DEFAULT_DISTILLED_LORA_PATH} 1.0).",
+    )
+    model_group.add_argument(
+        "--distilled-checkpoint",
+        dest="distilled_checkpoint",
+        action="store_true",
+        default=False,
+        help="Use distilled model settings: no CFG guidance, 8-step fixed schedule for stage 1. "
+             "Use this when the main checkpoint is a distilled model (not requiring CFG).",
     )
 
     # ==========================================================================
@@ -690,6 +699,7 @@ class LTXVideoGeneratorWithOffloading:
         refiner_blocks_in_memory: int = 22,
         one_stage: bool = False,
         refine_only: bool = False,
+        distilled_checkpoint: bool = False,
     ):
         self.device = device or get_device()
         self.dtype = torch.bfloat16
@@ -703,6 +713,7 @@ class LTXVideoGeneratorWithOffloading:
         self.refiner_blocks_in_memory = refiner_blocks_in_memory
         self.one_stage = one_stage
         self.refine_only = refine_only
+        self.distilled_checkpoint = distilled_checkpoint
 
         # Create model ledger for stage 1
         self.stage_1_model_ledger = ModelLedger(
@@ -803,9 +814,16 @@ class LTXVideoGeneratorWithOffloading:
             print(f">>> Enhanced prompt: {prompt}")
 
         print(">>> Encoding prompts...")
-        context_p, context_n = encode_text(text_encoder, prompts=[prompt, negative_prompt])
-        v_context_p, a_context_p = context_p
-        v_context_n, a_context_n = context_n
+        if self.distilled_checkpoint:
+            # Distilled checkpoint: only encode positive prompt (no CFG needed)
+            context_p = encode_text(text_encoder, prompts=[prompt])[0]
+            v_context_p, a_context_p = context_p
+            v_context_n, a_context_n = None, None  # Not used for distilled
+        else:
+            # Standard checkpoint: encode both positive and negative prompts for CFG
+            context_p, context_n = encode_text(text_encoder, prompts=[prompt, negative_prompt])
+            v_context_p, a_context_p = context_p
+            v_context_n, a_context_n = context_n
 
         # Offload text encoder
         print(">>> Releasing text encoder from GPU...")
@@ -979,31 +997,58 @@ class LTXVideoGeneratorWithOffloading:
                 transformer = self.stage_1_model_ledger.transformer()
 
             # Create diffusion schedule
-            sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(
-                dtype=torch.float32, device=self.device
-            )
-
-            # Define denoising function for stage 1 (with CFG)
-            def first_stage_denoising_loop(
-                sigmas: torch.Tensor,
-                video_state: LatentState,
-                audio_state: LatentState,
-                stepper: DiffusionStepProtocol,
-            ) -> tuple[LatentState, LatentState]:
-                return euler_denoising_loop(
-                    sigmas=sigmas,
-                    video_state=video_state,
-                    audio_state=audio_state,
-                    stepper=stepper,
-                    denoise_fn=guider_denoising_func(
-                        cfg_guider,
-                        v_context_p,
-                        v_context_n,
-                        a_context_p,
-                        a_context_n,
-                        transformer=transformer,
-                    ),
+            if self.distilled_checkpoint:
+                # Distilled checkpoint: use fixed 8-step schedule
+                sigmas = torch.tensor(DISTILLED_SIGMA_VALUES, dtype=torch.float32, device=self.device)
+                print(f">>> Using distilled sigma schedule (8 steps)")
+            else:
+                # Standard checkpoint: use configurable LTX2Scheduler
+                sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(
+                    dtype=torch.float32, device=self.device
                 )
+
+            # Define denoising function for stage 1
+            if self.distilled_checkpoint:
+                # Distilled checkpoint: no CFG guidance, single forward pass
+                def first_stage_denoising_loop(
+                    sigmas: torch.Tensor,
+                    video_state: LatentState,
+                    audio_state: LatentState,
+                    stepper: DiffusionStepProtocol,
+                ) -> tuple[LatentState, LatentState]:
+                    return euler_denoising_loop(
+                        sigmas=sigmas,
+                        video_state=video_state,
+                        audio_state=audio_state,
+                        stepper=stepper,
+                        denoise_fn=simple_denoising_func(
+                            video_context=v_context_p,
+                            audio_context=a_context_p,
+                            transformer=transformer,
+                        ),
+                    )
+            else:
+                # Standard checkpoint: CFG guidance with positive/negative prompts
+                def first_stage_denoising_loop(
+                    sigmas: torch.Tensor,
+                    video_state: LatentState,
+                    audio_state: LatentState,
+                    stepper: DiffusionStepProtocol,
+                ) -> tuple[LatentState, LatentState]:
+                    return euler_denoising_loop(
+                        sigmas=sigmas,
+                        video_state=video_state,
+                        audio_state=audio_state,
+                        stepper=stepper,
+                        denoise_fn=guider_denoising_func(
+                            cfg_guider,
+                            v_context_p,
+                            v_context_n,
+                            a_context_p,
+                            a_context_n,
+                            transformer=transformer,
+                        ),
+                    )
 
             # Stage 1 output shape (half resolution for two-stage, full for one-stage)
             if self.one_stage:
@@ -1396,18 +1441,22 @@ def main():
     logging.basicConfig(level=log_level, format="%(message)s")
 
     # Handle default distilled LoRA
-    if args.distilled_lora is None:
+    # For distilled checkpoints, we don't need the distilled LoRA since the checkpoint itself is distilled
+    if args.distilled_lora is None and not args.distilled_checkpoint:
         args.distilled_lora = [LoraPathStrengthAndSDOps(
             resolve_path(DEFAULT_DISTILLED_LORA_PATH),
             DEFAULT_LORA_STRENGTH,
             LTXV_LORA_COMFY_RENAMING_MAP
         )]
+    elif args.distilled_lora is None:
+        args.distilled_lora = []  # Empty list for distilled checkpoints
 
     pipeline_type = "refine-only" if args.refine_only else ("one-stage" if args.one_stage else "two-stage")
+    checkpoint_type = "distilled" if args.distilled_checkpoint else "standard"
     print("=" * 60)
     print("LTX-2 Video Generation")
     print("=" * 60)
-    print(f"Pipeline: {pipeline_type}")
+    print(f"Pipeline: {pipeline_type} ({checkpoint_type} checkpoint)")
     print(f"Checkpoint: {args.checkpoint_path}")
     print(f"Output: {args.output_path}")
     print(f"Resolution: {args.width}x{args.height}")
@@ -1438,6 +1487,7 @@ def main():
         refiner_blocks_in_memory=args.refiner_blocks_in_memory,
         one_stage=args.one_stage,
         refine_only=args.refine_only,
+        distilled_checkpoint=args.distilled_checkpoint,
     )
 
     # Set up tiling config for VAE
@@ -1483,15 +1533,16 @@ def main():
     metadata = {
         "model_type": "LTX-2",
         "pipeline": "refine-only" if args.refine_only else ("one-stage" if args.one_stage else "two-stage"),
+        "distilled_checkpoint": args.distilled_checkpoint,
         "checkpoint_path": args.checkpoint_path,
         "prompt": args.prompt,
-        "negative_prompt": args.negative_prompt,
+        "negative_prompt": args.negative_prompt if not args.distilled_checkpoint else None,
         "width": args.width,
         "height": args.height,
         "num_frames": args.num_frames,
         "frame_rate": args.frame_rate,
-        "cfg_guidance_scale": args.cfg_guidance_scale,
-        "num_inference_steps": args.num_inference_steps,
+        "cfg_guidance_scale": args.cfg_guidance_scale if not args.distilled_checkpoint else None,
+        "num_inference_steps": args.num_inference_steps if not args.distilled_checkpoint else 8,
         "seed": args.seed,
         "offload": args.offload,
         "enable_fp8": args.enable_fp8,
