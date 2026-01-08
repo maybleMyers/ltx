@@ -1212,27 +1212,46 @@ def encode_video_chunked(
         # Calculate latent position from the chunk's start frame
         latent_pos = start // 8
         chunk_len = latent.shape[2]
+        my_end_pos = min(latent_pos + chunk_len, total_latent_frames)
 
-        # Create weight mask
+        # Calculate actual overlap with previous chunk (may differ from latent_overlap due to frame alignment)
+        if i > 0:
+            prev_start = chunks_info[i - 1][0]
+            prev_chunk_len = latent_chunks[i - 1].shape[2]
+            prev_end_pos = min((prev_start // 8) + prev_chunk_len, total_latent_frames)
+            actual_overlap_prev = max(0, prev_end_pos - latent_pos)
+        else:
+            actual_overlap_prev = 0
+
+        # Calculate actual overlap with next chunk
+        if i < len(chunks_info) - 1:
+            next_start = chunks_info[i + 1][0]
+            next_pos = next_start // 8
+            actual_overlap_next = max(0, my_end_pos - next_pos)
+        else:
+            actual_overlap_next = 0
+
+        # Create weight mask with proper blending over actual overlap regions
         weight = torch.ones(chunk_len, device=latent.device)
 
-        # Fade in for non-first chunks
-        if i > 0 and latent_overlap > 0:
-            fade_in = torch.linspace(0, 1, latent_overlap + 1, device=latent.device)[1:]
-            weight[:latent_overlap] = fade_in
+        # Fade in for non-first chunks over the actual overlap region
+        if actual_overlap_prev > 0:
+            fade_len = min(actual_overlap_prev, chunk_len)
+            fade_in = torch.linspace(0, 1, fade_len + 1, device=latent.device)[1:]
+            weight[:fade_len] = fade_in
 
-        # Fade out for non-last chunks
-        if i < len(latent_chunks) - 1 and latent_overlap > 0:
-            fade_out = torch.linspace(1, 0, latent_overlap + 1, device=latent.device)[1:]
-            weight[-latent_overlap:] = fade_out
+        # Fade out for non-last chunks over the actual overlap region
+        if actual_overlap_next > 0:
+            fade_len = min(actual_overlap_next, chunk_len)
+            fade_out = torch.linspace(1, 0, fade_len + 1, device=latent.device)[1:]
+            weight[-fade_len:] = fade_out
 
         # Add weighted latent to result
-        end_pos = min(latent_pos + chunk_len, total_latent_frames)
-        actual_len = end_pos - latent_pos
+        actual_len = my_end_pos - latent_pos
 
         weight_expanded = weight[:actual_len].view(1, 1, actual_len, 1, 1)
-        result[:, :, latent_pos:end_pos, :, :] += latent[:, :, :actual_len, :, :] * weight_expanded
-        weight_sum[latent_pos:end_pos] += weight[:actual_len]
+        result[:, :, latent_pos:my_end_pos, :, :] += latent[:, :, :actual_len, :, :] * weight_expanded
+        weight_sum[latent_pos:my_end_pos] += weight[:actual_len]
 
     # Normalize by weight sum
     weight_sum = weight_sum.clamp(min=1e-8).view(1, 1, -1, 1, 1)
