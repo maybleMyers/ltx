@@ -458,6 +458,7 @@ def generate_ltx_video(
     # Generation parameters
     mode: str,
     pipeline: str,
+    enable_sliding_window: bool,
     width: int,
     height: int,
     num_frames: int,
@@ -501,6 +502,17 @@ def generate_ltx_video(
     # Output
     save_path: str,
     batch_size: int,
+    # Preview Generation
+    enable_preview: bool,
+    preview_interval: int,
+    # Video Continuation (Frame Freezing)
+    freeze_frames: int,
+    freeze_transition: int,
+    # Sliding Window (Long Video)
+    sliding_window_size: int,
+    sliding_window_overlap: int,
+    sliding_window_overlap_noise: float,
+    sliding_window_color_correction: float,
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     """
     Generate video using LTX-2 pipeline.
@@ -661,6 +673,32 @@ def generate_ltx_video(
             command.append("--enable-refiner-block-swap")
             command.extend(["--refiner-blocks-in-memory", str(int(refiner_blocks_in_memory))])
 
+        # Preview generation
+        unique_preview_suffix = f"ltx_{run_id}"
+        preview_mp4_path = None
+        if enable_preview and preview_interval > 0:
+            preview_base_dir = os.path.join(save_path, "previews")
+            command.extend(["--preview-dir", preview_base_dir])
+            command.extend(["--preview-interval", str(int(preview_interval))])
+            command.extend(["--preview-suffix", unique_preview_suffix])
+            preview_mp4_path = os.path.join(preview_base_dir, f"latent_preview_{unique_preview_suffix}.mp4")
+
+        # Frame freezing (video continuation)
+        if freeze_frames and int(freeze_frames) > 0:
+            command.extend(["--freeze-frames", str(int(freeze_frames))])
+            command.extend(["--freeze-transition", str(int(freeze_transition))])
+
+        # Sliding window (long video) - requires explicit enable flag
+        if enable_sliding_window:
+            command.append("--enable-sliding-window")
+            if sliding_window_size and int(sliding_window_size) > 0:
+                command.extend(["--sliding-window-size", str(int(sliding_window_size))])
+            command.extend(["--sliding-window-overlap", str(int(sliding_window_overlap))])
+            if sliding_window_overlap_noise and float(sliding_window_overlap_noise) > 0:
+                command.extend(["--sliding-window-overlap-noise", str(float(sliding_window_overlap_noise))])
+            if sliding_window_color_correction and float(sliding_window_color_correction) > 0:
+                command.extend(["--sliding-window-color-correction", str(float(sliding_window_color_correction))])
+
         # Print command for debugging
         print("\n" + "=" * 80)
         print(f"LAUNCHING COMMAND (Batch {i+1}/{batch_size}):")
@@ -670,14 +708,9 @@ def generate_ltx_video(
         try:
             start_time = time.perf_counter()
 
-            # Write subprocess output to log file
-            os.makedirs(os.path.join(save_path, "logs"), exist_ok=True)
-            log_file_path = os.path.join(save_path, "logs", f"gen_{run_id}.log")
-            log_file = open(log_file_path, "w", encoding="utf-8")
-
             process = subprocess.Popen(
                 command,
-                stdout=log_file,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1
@@ -685,7 +718,8 @@ def generate_ltx_video(
 
             current_process = process
             last_progress = ""
-            last_log_position = 0
+            current_preview_list = []
+            last_preview_mtime = 0
 
             while True:
                 if stop_event.is_set():
@@ -695,45 +729,38 @@ def generate_ltx_video(
                     except subprocess.TimeoutExpired:
                         process.kill()
                     current_process = None
-                    log_file.close()
-                    yield all_generated_videos, None, "Generation stopped by user.", ""
+                    yield all_generated_videos, [], "Generation stopped by user.", ""
                     return
 
-                # Read new lines from log file
-                try:
-                    with open(log_file_path, "r", encoding="utf-8") as f:
-                        f.seek(last_log_position)
-                        new_lines = f.readlines()
-                        last_log_position = f.tell()
-                        for line in new_lines:
-                            line = line.strip()
-                            if line:
-                                print(line)
-                                parsed = parse_ltx_progress_line(line)
-                                if parsed:
-                                    last_progress = parsed
-                except:
-                    pass
+                # Read output line by line
+                line = process.stdout.readline()
+                if line:
+                    line = line.strip()
+                    if line:
+                        print(line)
+                        parsed = parse_ltx_progress_line(line)
+                        if parsed:
+                            last_progress = parsed
 
-                yield all_generated_videos.copy(), None, status_text, last_progress
+                # Check for preview updates
+                if enable_preview and preview_mp4_path:
+                    if os.path.exists(preview_mp4_path):
+                        current_mtime = os.path.getmtime(preview_mp4_path)
+                        if current_mtime > last_preview_mtime:
+                            current_preview_list = [preview_mp4_path]
+                            last_preview_mtime = current_mtime
 
-                time.sleep(0.5)
+                yield all_generated_videos.copy(), current_preview_list, status_text, last_progress
 
                 if process.poll() is not None:
-                    # Read remaining log content
-                    try:
-                        with open(log_file_path, "r", encoding="utf-8") as f:
-                            f.seek(last_log_position)
-                            for line in f.readlines():
-                                line = line.strip()
-                                if line:
-                                    print(line)
-                                    parsed = parse_ltx_progress_line(line)
-                                    if parsed:
-                                        last_progress = parsed
-                    except:
-                        pass
-                    log_file.close()
+                    # Read remaining output
+                    for line in process.stdout:
+                        line = line.strip()
+                        if line:
+                            print(line)
+                            parsed = parse_ltx_progress_line(line)
+                            if parsed:
+                                last_progress = parsed
                     break
 
             current_process = None
@@ -748,18 +775,18 @@ def generate_ltx_video(
                 all_generated_videos.append((output_filename, label))
 
                 status_text = f"Completed {i+1}/{batch_size}"
-                yield all_generated_videos.copy(), None, status_text, f"Video saved: {os.path.basename(output_filename)}"
+                yield all_generated_videos.copy(), current_preview_list, status_text, f"Video saved: {os.path.basename(output_filename)}"
             else:
                 error_msg = f"Generation failed (return code: {return_code})"
-                yield all_generated_videos.copy(), None, error_msg, "Check logs for details"
+                yield all_generated_videos.copy(), current_preview_list, error_msg, "Check logs for details"
 
         except Exception as e:
             current_process = None
-            yield all_generated_videos, None, f"Error: {str(e)}", ""
+            yield all_generated_videos, [], f"Error: {str(e)}", ""
             return
 
     final_status = f"Completed {batch_size} video(s)" if batch_size > 1 else "Generation complete!"
-    yield all_generated_videos, None, final_status, "Done!"
+    yield all_generated_videos, [], final_status, "Done!"
 
 
 def stop_generation():
@@ -767,6 +794,365 @@ def stop_generation():
     global stop_event
     stop_event.set()
     return "Stopping generation..."
+
+
+# =============================================================================
+# SVI-LTX Frame Checking Functions
+# =============================================================================
+
+def variance_of_laplacian(image):
+    """Calculate image sharpness using Laplacian variance."""
+    import cv2
+    return cv2.Laplacian(image, cv2.CV_64F).var()
+
+
+def extract_best_transition_frame(video_path: str, frames_to_check: int = 30) -> int:
+    """
+    Find the sharpest frame from the last N frames for smooth transition.
+    Uses Laplacian variance as sharpness metric.
+
+    Args:
+        video_path: Path to video file
+        frames_to_check: Number of frames from end to analyze
+
+    Returns:
+        Index of the best (sharpest) frame
+    """
+    import cv2
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return -1
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    start_frame = max(0, total_frames - frames_to_check)
+
+    best_frame_idx = total_frames - 1
+    best_sharpness = -1
+
+    for frame_idx in range(start_frame, total_frames):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        sharpness = variance_of_laplacian(gray)
+        if sharpness > best_sharpness:
+            best_sharpness = sharpness
+            best_frame_idx = frame_idx
+
+    cap.release()
+    return best_frame_idx
+
+
+# =============================================================================
+# SVI-LTX Video Generation Handler
+# =============================================================================
+
+def generate_svi_ltx_video(
+    # Prompts (8 clips)
+    prompt1: str, prompt2: str, prompt3: str, prompt4: str,
+    prompt5: str, prompt6: str, prompt7: str, prompt8: str,
+    negative_prompt: str,
+    # Images
+    input_image: str,
+    anchor_image: str,
+    # Video extension
+    extend_video: str,
+    frames_to_check: int,
+    prepend_original: bool,
+    # SVI settings
+    num_clips: int,
+    overlap_frames: int,
+    num_motion_latent: int,
+    num_motion_frame: int,
+    seed_multiplier: int,
+    # Generation params
+    width: int,
+    height: int,
+    num_frames: int,
+    frame_rate: float,
+    inference_steps: int,
+    cfg_scale: float,
+    seed: int,
+    # Anchor settings
+    anchor_interval: int,
+    anchor_strength: float,
+    anchor_decay: str,
+    # Model settings
+    checkpoint_path: str,
+    gemma_root: str,
+    spatial_upsampler: str,
+    distilled_lora: str,
+    distilled_lora_strength: float,
+    one_stage: bool,
+    enable_fp8: bool,
+    offload: bool,
+    enable_dit_block_swap: bool,
+    dit_blocks_in_memory: int,
+    enable_text_encoder_block_swap: bool,
+    text_encoder_blocks_in_memory: int,
+    enable_refiner_block_swap: bool,
+    refiner_blocks_in_memory: int,
+    # LoRA
+    lora_folder: str,
+    user_lora: str,
+    lora_strength: float,
+    # Output
+    disable_audio: bool,
+    output_path: str,
+    batch_size: int,
+    # Preview Generation
+    enable_preview: bool,
+    preview_interval: int,
+) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
+    """
+    Generate multi-clip SVI video using LTX-2 pipeline.
+
+    Yields: (gallery_items, preview_path, status_text, progress_text)
+    """
+    global stop_event, current_process, current_output_filename
+    stop_event.clear()
+    current_process = None
+    current_output_filename = None
+
+    # Validate inputs
+    if not extend_video and not input_image:
+        yield [], None, "Error: Input image required for SVI multi-clip mode", ""
+        return
+
+    error = validate_num_frames(int(num_frames))
+    if error:
+        yield [], None, error, ""
+        return
+
+    error = validate_resolution(int(width), int(height))
+    if error:
+        yield [], None, error, ""
+        return
+
+    # Round num_frames to valid 8*K+1 format
+    num_frames = int(num_frames)
+    k = max(1, round((num_frames - 1) / 8))
+    num_frames = 8 * k + 1
+
+    os.makedirs(output_path, exist_ok=True)
+    all_generated_videos = []
+
+    for batch_idx in range(int(batch_size)):
+        if stop_event.is_set():
+            current_process = None
+            yield all_generated_videos, None, "Generation stopped by user.", ""
+            return
+
+        # Seed handling
+        current_seed = seed
+        if seed == -1:
+            current_seed = random.randint(0, 2**32 - 1)
+        elif int(batch_size) > 1:
+            current_seed = seed + batch_idx * 1000
+
+        # Collect per-clip prompts (non-empty only)
+        all_prompts = [prompt1, prompt2, prompt3, prompt4, prompt5, prompt6, prompt7, prompt8]
+        clip_prompts = [p.strip() for p in all_prompts if p and p.strip()]
+        main_prompt = clip_prompts[0] if clip_prompts else "A beautiful video"
+
+        status_text = f"Processing SVI {batch_idx+1}/{batch_size} ({num_clips} clips, Seed: {current_seed})"
+        yield all_generated_videos.copy(), None, status_text, "Starting SVI generation..."
+
+        timestamp = int(time.time())
+        run_id = f"{timestamp}_{random.randint(1000, 9999)}"
+        mode_str = "svi_extend" if extend_video else "svi"
+        output_filename = os.path.join(output_path, f"ltx_{mode_str}_{timestamp}_{current_seed}.mp4")
+        current_output_filename = output_filename
+
+        # Frame checking for video extension
+        if extend_video:
+            best_frame = extract_best_transition_frame(extend_video, int(frames_to_check))
+            print(f">>> Best transition frame: {best_frame}")
+
+        # Build command
+        command = [
+            sys.executable, "ltx_generate_video.py",
+            "--checkpoint-path", checkpoint_path,
+            "--gemma-root", gemma_root,
+            "--prompt", str(main_prompt),
+            "--negative-prompt", str(negative_prompt),
+            "--num-frames", str(int(num_frames)),
+            "--frame-rate", str(float(frame_rate)),
+            "--width", str(int(width)),
+            "--height", str(int(height)),
+            "--cfg-guidance-scale", str(float(cfg_scale)),
+            "--num-inference-steps", str(int(inference_steps)),
+            "--seed", str(current_seed),
+            "--output-path", output_filename,
+        ]
+
+        # SVI mode or video extension
+        if extend_video:
+            command.extend(["--extend-video", str(extend_video)])
+            if prepend_original:
+                command.append("--prepend-original")
+        else:
+            command.append("--svi-mode")
+            if input_image:
+                command.extend(["--image", str(input_image), "0", "0.95"])
+
+        # SVI settings
+        command.extend([
+            "--num-clips", str(int(num_clips)),
+            "--num-motion-latent", str(int(num_motion_latent)),
+            "--num-motion-frame", str(int(num_motion_frame)),
+            "--seed-multiplier", str(int(seed_multiplier)),
+            "--overlap-frames", str(int(overlap_frames)),
+        ])
+
+        # Per-clip prompts (if more than one provided)
+        if len(clip_prompts) > 1:
+            command.append("--prompt-list")
+            command.extend(clip_prompts)
+
+        # Anchor settings
+        if anchor_image:
+            command.extend(["--anchor-image", str(anchor_image)])
+        if anchor_interval and int(anchor_interval) > 0:
+            command.extend([
+                "--anchor-interval", str(int(anchor_interval)),
+                "--anchor-strength", str(float(anchor_strength)),
+            ])
+            if anchor_decay and anchor_decay != "none":
+                command.extend(["--anchor-decay", str(anchor_decay)])
+
+        # Model settings
+        if not one_stage:
+            if spatial_upsampler and os.path.exists(spatial_upsampler):
+                command.extend(["--spatial-upsampler-path", spatial_upsampler])
+            if distilled_lora and os.path.exists(distilled_lora):
+                command.extend(["--distilled-lora", distilled_lora, str(distilled_lora_strength)])
+        else:
+            command.append("--one-stage")
+
+        if enable_fp8:
+            command.append("--enable-fp8")
+        if offload:
+            command.append("--offload")
+
+        # Block swap settings
+        if enable_dit_block_swap:
+            command.append("--enable-dit-block-swap")
+            command.extend(["--dit-blocks-in-memory", str(int(dit_blocks_in_memory))])
+        if enable_text_encoder_block_swap:
+            command.append("--enable-text-encoder-block-swap")
+            command.extend(["--text-encoder-blocks-in-memory", str(int(text_encoder_blocks_in_memory))])
+        if enable_refiner_block_swap:
+            command.append("--enable-refiner-block-swap")
+            command.extend(["--refiner-blocks-in-memory", str(int(refiner_blocks_in_memory))])
+
+        # User LoRA
+        if user_lora and user_lora != "None" and lora_folder:
+            lora_path = os.path.join(lora_folder, user_lora)
+            if os.path.exists(lora_path):
+                command.extend(["--lora", lora_path, str(lora_strength)])
+
+        # Audio
+        if disable_audio:
+            command.append("--disable-audio")
+
+        # Preview generation
+        unique_preview_suffix = f"svi_{run_id}"
+        preview_mp4_path = None
+        if enable_preview and preview_interval > 0:
+            preview_base_dir = os.path.join(output_path, "previews")
+            command.extend(["--preview-dir", preview_base_dir])
+            command.extend(["--preview-interval", str(int(preview_interval))])
+            command.extend(["--preview-suffix", unique_preview_suffix])
+            preview_mp4_path = os.path.join(preview_base_dir, f"latent_preview_{unique_preview_suffix}.mp4")
+
+        # Print command for debugging
+        print("\n" + "=" * 80)
+        print(f"LAUNCHING SVI COMMAND (Batch {batch_idx+1}/{batch_size}):")
+        print(" ".join(command))
+        print("=" * 80 + "\n")
+
+        try:
+            start_time = time.perf_counter()
+
+            # Get script directory to ensure ltx_generate_video.py is found
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            print(f">>> Running from: {script_dir}")
+
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                cwd=script_dir  # Run from the script directory
+            )
+
+            current_process = process
+            last_progress = ""
+            current_preview_list = []
+            last_preview_mtime = 0
+
+            while True:
+                if stop_event.is_set():
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                    current_process = None
+                    yield all_generated_videos, [], "Generation stopped by user.", ""
+                    return
+
+                # Read output line by line
+                line = process.stdout.readline()
+                if line:
+                    line = line.strip()
+                    if line:
+                        print(line)
+                        progress_info = parse_ltx_progress_line(line)
+                        if progress_info:
+                            last_progress = progress_info
+
+                # Check for preview updates
+                if enable_preview and preview_mp4_path:
+                    if os.path.exists(preview_mp4_path):
+                        current_mtime = os.path.getmtime(preview_mp4_path)
+                        if current_mtime > last_preview_mtime:
+                            current_preview_list = [preview_mp4_path]
+                            last_preview_mtime = current_mtime
+
+                exit_code = process.poll()
+
+                if exit_code is not None:
+                    # Read remaining output
+                    for line in process.stdout:
+                        line = line.strip()
+                        if line:
+                            print(line)
+                            progress_info = parse_ltx_progress_line(line)
+                            if progress_info:
+                                last_progress = progress_info
+
+                    if exit_code == 0 and os.path.exists(output_filename):
+                        elapsed = time.perf_counter() - start_time
+                        label = f"SVI {num_clips} clips ({elapsed:.1f}s)"
+                        all_generated_videos.append((output_filename, label))
+                        yield all_generated_videos.copy(), current_preview_list, f"Completed batch {batch_idx+1}/{batch_size}", "Done!"
+                    else:
+                        error_msg = f"Error in batch {batch_idx+1} (exit code {exit_code})"
+                        yield all_generated_videos, current_preview_list, error_msg, ""
+                    break
+
+                yield all_generated_videos.copy(), current_preview_list, status_text, last_progress
+
+        except Exception as e:
+            yield all_generated_videos, [], f"Error: {str(e)}", ""
+            continue
+
+    final_status = f"Completed {batch_size} SVI video(s)" if batch_size > 1 else "SVI generation complete!"
+    yield all_generated_videos, [], final_status, "Done!"
 
 
 # =============================================================================
@@ -819,7 +1205,7 @@ def create_interface():
                             label="Prompt",
                             placeholder="Describe the video you want to generate...",
                             lines=4,
-                            value="A serene mountain lake at sunrise, with mist rising from the water and birds flying overhead."
+                            value="A giant brown capybara wearing white wireless earbuds stands upright on a Miami beach, mouth wide open revealing large front teeth, swaying its round body rhythmically side to side. Beside it, a gray tabby cat with green eyes wears a pink knit beanie with pom-pom, black bow tie, light blue t-shirt with small animal graphic, and blue jeans, pumping two bright green glow sticks overhead in time with pulsing electronic beats. The duo bounces and grooves together on golden sand scattered with seashells, their movements becoming more energetic as synthesizer drops hit. Palm trees sway in the warm breeze behind them, with Miami high-rise buildings visible in the distance. The sky transitions dramatically from warm orange and pink sunset hues to deep purple twilight, as a bright full moon rises over the turquoise ocean waves. Colorful beach umbrellas in red and white dot the background. The camera circles slowly around the dancing pair in a smooth 360-degree arc, capturing their joyful expressions. Lens flares catch the fading sunlight, then neon glow stick trails create light streaks as darkness falls. The scene pulses with energy as city lights begin twinkling along the coastline, waves crashing rhythmically in the moonlit background."
                         )
                         negative_prompt = gr.Textbox(
                             label="Negative Prompt",
@@ -858,6 +1244,11 @@ def create_interface():
                                     choices=["two-stage", "one-stage", "refine-only"],
                                     value="two-stage",
                                     info="two-stage = higher quality, one-stage = faster, refine-only = stage 2 only on input video"
+                                )
+                                enable_sliding_window = gr.Checkbox(
+                                    label="Sliding Window",
+                                    value=False,
+                                    info="Enable for long videos (>129 frames)"
                                 )
                             # Hidden state for original image/video dimensions
                             original_dims = gr.State(value="")
@@ -908,7 +1299,7 @@ def create_interface():
                                 calc_width_btn = gr.Button("←", size="sm", min_width=40)
                                 height = gr.Number(label="Height", value=1024, step=64, info="Must be divisible by 64")
                             with gr.Row():
-                                num_frames = gr.Number(label="Num Frames (8*K+1)", value=121, step=8, info="e.g., 121 = 5s @ 24fps")
+                                num_frames = gr.Slider(minimum=9, maximum=2001, step=8, value=121, label="Num Frames (8*K+1)", info="e.g., 121 = 5s @ 24fps")
                                 frame_rate = gr.Slider(minimum=12, maximum=60, value=24, step=1, label="Frame Rate")
                             with gr.Row():
                                 cfg_guidance_scale = gr.Slider(minimum=1.0, maximum=15.0, value=4.0, step=0.5, label="CFG Scale")
@@ -936,6 +1327,47 @@ def create_interface():
                                     info="Number of refinement denoising steps"
                                 )
 
+                        # Video Continuation (Frame Freezing)
+                        with gr.Accordion("Video Continuation (Frame Freezing)", open=False):
+                            gr.Markdown("Freeze first N frames from input video during denoising for smooth continuation.")
+                            with gr.Row():
+                                freeze_frames = gr.Slider(
+                                    minimum=0, maximum=32, value=0, step=1,
+                                    label="Freeze Frames",
+                                    info="Number of frames to freeze from input video (0 = disabled)"
+                                )
+                                freeze_transition = gr.Slider(
+                                    minimum=1, maximum=16, value=4, step=1,
+                                    label="Transition Frames",
+                                    info="Frames for gradual blend from frozen to generated"
+                                )
+
+                        # Sliding Window (Long Video)
+                        with gr.Accordion("Sliding Window (Long Video)", open=False):
+                            gr.Markdown("Generate videos longer than the model's context window by overlapping windows.")
+                            with gr.Row():
+                                sliding_window_size = gr.Slider(
+                                    minimum=0, maximum=257, value=0, step=8,
+                                    label="Window Size",
+                                    info="Frames per window (8n+1). 0 = auto-detect from num_frames"
+                                )
+                                sliding_window_overlap = gr.Slider(
+                                    minimum=1, maximum=33, value=9, step=8,
+                                    label="Overlap Frames",
+                                    info="Overlapping frames between windows (8n+1)"
+                                )
+                            with gr.Row():
+                                sliding_window_overlap_noise = gr.Slider(
+                                    minimum=0.0, maximum=100.0, value=0.0, step=5.0,
+                                    label="Overlap Noise %",
+                                    info="Noise level for overlap blending (0 = no noise)"
+                                )
+                                sliding_window_color_correction = gr.Slider(
+                                    minimum=0.0, maximum=1.0, value=0.0, step=0.1,
+                                    label="Color Correction",
+                                    info="LAB color correction strength between windows"
+                                )
+
 
                     # Right column - Output
                     with gr.Column():
@@ -947,6 +1379,22 @@ def create_interface():
                             allow_preview=True,
                             preview=True
                         )
+                        # Latent Preview (During Generation)
+                        with gr.Accordion("Latent Preview (During Generation)", open=True):
+                            enable_preview = gr.Checkbox(label="Enable Latent Preview", value=True)
+                            preview_interval = gr.Slider(
+                                minimum=1, maximum=50, step=1, value=5,
+                                label="Preview Every N Steps"
+                            )
+                            preview_gallery = gr.Gallery(
+                                label="Latent Previews",
+                                columns=4, rows=2,
+                                object_fit="contain",
+                                height=300,
+                                allow_preview=True,
+                                preview=True,
+                                show_label=True
+                            )
                         # User LoRA
                         with gr.Accordion("User LoRA (Optional)", open=False):
                             lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
@@ -1040,6 +1488,231 @@ def create_interface():
 
                 with gr.Row():
                     info_send_btn = gr.Button("Send to Generation", variant="primary")
+
+            # =================================================================
+            # SVI-LTX Tab
+            # =================================================================
+            with gr.Tab("SVI-LTX", id="svi_ltx_tab"):
+                gr.Markdown("""
+                ## SVI-LTX (Stable-Video-Infinity for LTX)
+                Generate long, consistent videos by chaining multiple clips. Each clip uses motion latents from the previous clip for smooth transitions.
+                **Features:** Multi-clip streaming • Motion latent conditioning • Per-clip prompts • Video extension
+                """)
+
+                # Clip Prompts - Two Column Layout per Accordion
+                with gr.Accordion("Clip Prompts (1-4)", open=True):
+                    with gr.Row():
+                        with gr.Column():
+                            svi_prompt1 = gr.Textbox(
+                                label="Clip 1 Prompt (Required)", lines=2,
+                                value="A fluffy cat and a curious rabbit discover a miniature fat man doll on the living room floor."
+                            )
+                            svi_prompt2 = gr.Textbox(
+                                label="Clip 2 Prompt", lines=2,
+                                value="The cat bats the tiny fat man doll with its paw while the rabbit hops around excitedly."
+                            )
+                        with gr.Column():
+                            svi_prompt3 = gr.Textbox(
+                                label="Clip 3 Prompt", lines=2,
+                                value="The rabbit picks up the miniature fat man doll in its mouth and runs away, the cat chasing after it."
+                            )
+                            svi_prompt4 = gr.Textbox(
+                                label="Clip 4 Prompt", lines=2,
+                                value="The cat and rabbit sit together, both gazing at the tiny fat man doll between them."
+                            )
+
+                with gr.Accordion("Additional Clips (5-8)", open=False):
+                    with gr.Row():
+                        with gr.Column():
+                            svi_prompt5 = gr.Textbox(label="Clip 5 Prompt", lines=2, value="")
+                            svi_prompt6 = gr.Textbox(label="Clip 6 Prompt", lines=2, value="")
+                        with gr.Column():
+                            svi_prompt7 = gr.Textbox(label="Clip 7 Prompt", lines=2, value="")
+                            svi_prompt8 = gr.Textbox(label="Clip 8 Prompt", lines=2, value="")
+
+                with gr.Row():
+                    with gr.Column(scale=4):
+                        svi_negative_prompt = gr.Textbox(
+                            label="Negative Prompt",
+                            value="blurry, low quality, distorted, artifacts, ugly, deformed",
+                            lines=2,
+                        )
+                    with gr.Column(scale=1):
+                        svi_batch_size = gr.Number(label="Batch Count", value=1, minimum=1, step=1)
+                    with gr.Column(scale=2):
+                        svi_batch_progress = gr.Textbox(label="Status", interactive=False, value="")
+                        svi_progress_text = gr.Textbox(label="Progress", interactive=False, value="")
+
+                with gr.Row():
+                    svi_generate_btn = gr.Button("🎬 Generate SVI Video", variant="primary", elem_classes="green-btn")
+                    svi_stop_btn = gr.Button("⏹️ Stop", variant="stop")
+
+                with gr.Row():
+                    with gr.Column():
+                        # Input images for SVI
+                        with gr.Row():
+                            svi_input_image = gr.Image(label="Input Image (Required)", type="filepath")
+                            svi_anchor_image = gr.Image(label="Anchor Image (Optional)", type="filepath")
+                        svi_original_dims = gr.Textbox(label="Original Dimensions", interactive=False, visible=False)
+
+                        # Video Extension Mode
+                        with gr.Accordion("Video Extension (Extend Existing Video)", open=False):
+                            gr.Markdown("Extend an existing video by finding the best transition frame and generating new clips from it.")
+                            svi_extend_video = gr.Video(label="Video to Extend", sources=["upload"])
+                            with gr.Row():
+                                svi_frames_to_check = gr.Slider(
+                                    minimum=1, maximum=100, step=1, value=30,
+                                    label="Frames to Check",
+                                    info="Analyze last N frames to find sharpest transition point (1 = use last frame)"
+                                )
+                                svi_prepend_original = gr.Checkbox(
+                                    label="Prepend Original",
+                                    value=True,
+                                    info="Include original video before extension"
+                                )
+
+                        # SVI-specific settings
+                        gr.Markdown("### SVI Multi-Clip Settings")
+                        with gr.Row():
+                            svi_num_clips = gr.Slider(minimum=1, maximum=8, step=1, label="Number of Clips", value=4,
+                                                     info="How many clips to chain together")
+                            svi_overlap_frames = gr.Slider(minimum=0, maximum=16, step=1, label="Overlap Frames", value=1,
+                                                          info="Overlapping frames between clips")
+                            svi_num_motion_latent = gr.Slider(minimum=0, maximum=4, step=1, label="Motion Latent Frames", value=2,
+                                                              info="Latent frames from previous clip for motion context")
+                        with gr.Row():
+                            svi_num_motion_frame = gr.Slider(minimum=1, maximum=8, step=1, label="Motion Frame Offset", value=1,
+                                                              info="Frame offset from end for next clip input (1=last frame)")
+                            svi_seed_multiplier = gr.Slider(minimum=1, maximum=200, step=1, label="Seed Multiplier", value=42,
+                                                             info="Per-clip seed variation (seed = base + clip * multiplier)")
+
+                        gr.Markdown("### Generation Parameters")
+                        svi_scale_slider = gr.Slider(minimum=1, maximum=200, value=100, step=1, label="Scale %")
+                        with gr.Row():
+                            svi_width = gr.Number(label="Width", value=768, step=64, interactive=True)
+                            svi_calc_height_btn = gr.Button("→")
+                            svi_calc_width_btn = gr.Button("←")
+                            svi_height = gr.Number(label="Height", value=512, step=64, interactive=True)
+                        svi_num_frames = gr.Slider(minimum=9, maximum=241, step=8, label="Frames Per Clip", value=121, info="Frame count for each individual clip (8k+1)")
+                        svi_frame_rate = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=24)
+                        svi_inference_steps = gr.Slider(minimum=4, maximum=100, step=1, label="Sampling Steps", value=40)
+                        svi_cfg_scale = gr.Slider(minimum=1.0, maximum=20.0, step=0.1, label="Guidance Scale", value=4.0)
+                        with gr.Row():
+                            svi_seed = gr.Number(label="Seed (-1 for random)", value=-1)
+                            svi_random_seed_btn = gr.Button("🎲")
+
+                        with gr.Accordion("Anchor Settings", open=False):
+                            gr.Markdown("Inject anchor image at regular intervals to guide video generation.")
+                            svi_anchor_interval = gr.Number(
+                                label="Anchor Interval",
+                                value=0,
+                                minimum=0,
+                                step=8,
+                                info="Frame interval (e.g., 60). Set to 0 to disable."
+                            )
+                            svi_anchor_strength = gr.Slider(
+                                minimum=0.0, maximum=1.0, value=0.1, step=0.01,
+                                label="Anchor Strength",
+                                info="How strongly to guide toward anchor"
+                            )
+                            svi_anchor_decay = gr.Dropdown(
+                                label="Anchor Decay",
+                                choices=["none", "linear", "cosine", "sigmoid"],
+                                value="cosine",
+                                info="Decay schedule for anchor strength"
+                            )
+
+                    with gr.Column():
+                        svi_output_gallery = gr.Gallery(
+                            label="Generated Videos (Click to select)",
+                            columns=[2], rows=[2], object_fit="contain", height="auto",
+                            show_label=True, allow_preview=True, preview=True
+                        )
+                        with gr.Accordion("Preview (During Generation)", open=True):
+                            svi_preview_gallery = gr.Gallery(
+                                label="Clip Previews", columns=4, rows=2, object_fit="contain", height=300,
+                                allow_preview=True, preview=True, show_label=True
+                            )
+                        with gr.Accordion("LoRA", open=True):
+                            with gr.Row():
+                                svi_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
+                                svi_lora_refresh_btn = gr.Button("🔄 LoRA")
+                            svi_lora_dropdown = gr.Dropdown(
+                                label="Select LoRA",
+                                choices=["None"],
+                                value="None",
+                                interactive=True
+                            )
+                            svi_lora_strength = gr.Slider(
+                                minimum=0.0, maximum=2.0, step=0.05,
+                                label="LoRA Strength", value=1.0
+                            )
+
+                # Model Settings
+                with gr.Accordion("Model Settings", open=True):
+                    with gr.Row():
+                        svi_checkpoint_path = gr.Textbox(
+                            label="LTX Checkpoint",
+                            value="./weights/ltx-2-19b-dev.safetensors",
+                            info="Main LTX model checkpoint"
+                        )
+                        svi_gemma_root = gr.Textbox(
+                            label="Gemma Root",
+                            value="./gemma-3-12b-it-qat-q4_0-unquantized",
+                            info="Text encoder directory"
+                        )
+                    with gr.Row():
+                        svi_spatial_upsampler = gr.Textbox(
+                            label="Spatial Upsampler Path",
+                            value="./weights/ltx-2-spatial-upscaler-x2-1.0.safetensors",
+                            info="For 2x upscaling (two-stage)"
+                        )
+                        svi_distilled_lora = gr.Textbox(
+                            label="Distilled LoRA Path",
+                            value="./weights/ltx-2-19b-distilled-lora-384.safetensors",
+                            info="For stage 2 refinement (two-stage)"
+                        )
+                    with gr.Row():
+                        svi_distilled_lora_strength = gr.Slider(
+                            minimum=0.0, maximum=2.0, step=0.05,
+                            label="Distilled LoRA Strength", value=1.0
+                        )
+                    with gr.Row():
+                        svi_one_stage = gr.Checkbox(label="One-Stage Pipeline", value=False, info="Skip two-stage refinement (faster but lower quality)")
+                        svi_enable_fp8 = gr.Checkbox(label="Enable FP8", value=False, info="Use FP8 precision (lower VRAM)")
+                        svi_offload = gr.Checkbox(label="Offload", value=False, info="Offload models to CPU")
+
+                    # Block swap settings
+                    gr.Markdown("### Block Swap Settings")
+                    with gr.Row():
+                        svi_enable_dit_block_swap = gr.Checkbox(label="DiT Block Swap", value=True)
+                        svi_dit_blocks_in_memory = gr.Number(label="DiT Blocks in Memory", value=22, visible=True)
+                    with gr.Row():
+                        svi_enable_text_encoder_block_swap = gr.Checkbox(label="Text Encoder Block Swap", value=True)
+                        svi_text_encoder_blocks_in_memory = gr.Number(label="Text Encoder Blocks in Memory", value=6, visible=True)
+                    with gr.Row():
+                        svi_enable_refiner_block_swap = gr.Checkbox(label="Refiner Block Swap", value=True)
+                        svi_refiner_blocks_in_memory = gr.Number(label="Refiner Blocks in Memory", value=22, visible=True)
+
+                    with gr.Row():
+                        svi_output_path = gr.Textbox(
+                            label="Output Path",
+                            value="outputs",
+                            info="Directory for generated videos"
+                        )
+                        svi_disable_audio = gr.Checkbox(label="Disable Audio", value=False, info="Skip audio generation")
+
+                    # Preview Generation (SVI)
+                    with gr.Accordion("Latent Preview (During Generation)", open=True):
+                        svi_enable_preview = gr.Checkbox(label="Enable Latent Preview", value=True)
+                        svi_preview_interval = gr.Slider(
+                            minimum=1, maximum=50, step=1, value=5,
+                            label="Preview Every N Steps"
+                        )
+
+                with gr.Row():
+                    svi_save_defaults_btn = gr.Button("💾 Save Defaults")
+                    svi_load_defaults_btn = gr.Button("📂 Load Defaults")
 
             # =================================================================
             # Help Tab
@@ -1195,7 +1868,7 @@ def create_interface():
                 prompt, negative_prompt,
                 checkpoint_path, distilled_checkpoint, stage2_checkpoint, gemma_root, spatial_upsampler_path,
                 distilled_lora_path, distilled_lora_strength,
-                mode, pipeline, width, height, num_frames, frame_rate,
+                mode, pipeline, enable_sliding_window, width, height, num_frames, frame_rate,
                 cfg_guidance_scale, num_inference_steps, stage2_steps, seed,
                 input_image, image_frame_idx, image_strength,
                 end_image, end_image_strength,
@@ -1207,9 +1880,16 @@ def create_interface():
                 enable_text_encoder_block_swap, text_encoder_blocks_in_memory,
                 enable_refiner_block_swap, refiner_blocks_in_memory,
                 lora_folder, user_lora, user_lora_strength,
-                save_path, batch_size
+                save_path, batch_size,
+                # Preview Generation
+                enable_preview, preview_interval,
+                # Video Continuation (Frame Freezing)
+                freeze_frames, freeze_transition,
+                # Sliding Window (Long Video)
+                sliding_window_size, sliding_window_overlap,
+                sliding_window_overlap_noise, sliding_window_color_correction,
             ],
-            outputs=[output_gallery, gr.State(), status_text, progress_text]
+            outputs=[output_gallery, preview_gallery, status_text, progress_text]
         )
 
         # =================================================================
@@ -1319,6 +1999,135 @@ def create_interface():
                 distilled_checkpoint,
                 info_status
             ]
+        )
+
+        # =================================================================
+        # SVI-LTX Event Handlers
+        # =================================================================
+
+        # SVI-LTX Generate button
+        svi_generate_btn.click(
+            fn=generate_svi_ltx_video,
+            inputs=[
+                # Prompts (8)
+                svi_prompt1, svi_prompt2, svi_prompt3, svi_prompt4,
+                svi_prompt5, svi_prompt6, svi_prompt7, svi_prompt8,
+                svi_negative_prompt,
+                # Images
+                svi_input_image, svi_anchor_image,
+                # Video extension
+                svi_extend_video, svi_frames_to_check, svi_prepend_original,
+                # SVI settings
+                svi_num_clips, svi_overlap_frames, svi_num_motion_latent,
+                svi_num_motion_frame, svi_seed_multiplier,
+                # Generation params
+                svi_width, svi_height, svi_num_frames, svi_frame_rate,
+                svi_inference_steps, svi_cfg_scale, svi_seed,
+                # Anchor settings
+                svi_anchor_interval, svi_anchor_strength, svi_anchor_decay,
+                # Model settings
+                svi_checkpoint_path, svi_gemma_root, svi_spatial_upsampler,
+                svi_distilled_lora, svi_distilled_lora_strength, svi_one_stage,
+                svi_enable_fp8, svi_offload,
+                # Block swap
+                svi_enable_dit_block_swap, svi_dit_blocks_in_memory,
+                svi_enable_text_encoder_block_swap, svi_text_encoder_blocks_in_memory,
+                svi_enable_refiner_block_swap, svi_refiner_blocks_in_memory,
+                # LoRA
+                svi_lora_folder, svi_lora_dropdown, svi_lora_strength,
+                # Output
+                svi_disable_audio, svi_output_path, svi_batch_size,
+                # Preview Generation
+                svi_enable_preview, svi_preview_interval,
+            ],
+            outputs=[svi_output_gallery, svi_preview_gallery, svi_batch_progress, svi_progress_text]
+        )
+
+        # SVI-LTX Stop button
+        svi_stop_btn.click(
+            fn=stop_generation,
+            outputs=[svi_batch_progress]
+        )
+
+        # SVI-LTX Random seed button
+        svi_random_seed_btn.click(
+            fn=lambda: -1,
+            outputs=[svi_seed]
+        )
+
+        # SVI-LTX LoRA refresh
+        svi_lora_refresh_btn.click(
+            fn=refresh_lora_dropdown,
+            inputs=[svi_lora_folder],
+            outputs=[svi_lora_dropdown]
+        )
+
+        # SVI-LTX Block swap visibility toggles
+        svi_enable_dit_block_swap.change(
+            fn=lambda x: gr.update(visible=x),
+            inputs=[svi_enable_dit_block_swap],
+            outputs=[svi_dit_blocks_in_memory]
+        )
+        svi_enable_text_encoder_block_swap.change(
+            fn=lambda x: gr.update(visible=x),
+            inputs=[svi_enable_text_encoder_block_swap],
+            outputs=[svi_text_encoder_blocks_in_memory]
+        )
+        svi_enable_refiner_block_swap.change(
+            fn=lambda x: gr.update(visible=x),
+            inputs=[svi_enable_refiner_block_swap],
+            outputs=[svi_refiner_blocks_in_memory]
+        )
+
+        # SVI-LTX Image dimension handlers
+        svi_input_image.change(
+            fn=update_image_dimensions,
+            inputs=[svi_input_image],
+            outputs=[svi_original_dims, svi_width, svi_height]
+        )
+
+        svi_scale_slider.change(
+            fn=update_resolution_from_scale,
+            inputs=[svi_scale_slider, svi_original_dims],
+            outputs=[svi_width, svi_height]
+        )
+
+        svi_calc_width_btn.click(
+            fn=calculate_width_from_height,
+            inputs=[svi_height, svi_original_dims],
+            outputs=[svi_width]
+        )
+
+        svi_calc_height_btn.click(
+            fn=calculate_height_from_width,
+            inputs=[svi_width, svi_original_dims],
+            outputs=[svi_height]
+        )
+
+        # SVI-LTX Video extension dimension update
+        def update_svi_video_dimensions(video_path):
+            """Update dimensions when video is uploaded for extension."""
+            if not video_path or not os.path.exists(video_path):
+                return "", gr.update(), gr.update(), gr.update(), gr.update()
+            try:
+                import cv2
+                cap = cv2.VideoCapture(video_path)
+                w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                cap.release()
+                # Round to nearest 64
+                w = round(w / 64) * 64
+                h = round(h / 64) * 64
+                fps = max(1, int(round(fps)))
+                return f"{w}x{h}", gr.update(value=w), gr.update(value=h), gr.update(), gr.update(value=fps)
+            except Exception:
+                return "", gr.update(), gr.update(), gr.update(), gr.update()
+
+        svi_extend_video.change(
+            fn=update_svi_video_dimensions,
+            inputs=[svi_extend_video],
+            outputs=[svi_original_dims, svi_width, svi_height, svi_num_frames, svi_frame_rate]
         )
 
         # =================================================================
@@ -1456,6 +2265,145 @@ def create_interface():
             fn=initial_load_lt1_defaults,
             inputs=None,
             outputs=lt1_ui_default_components_ORDERED_LIST
+        )
+
+        # =================================================================
+        # SVI-LTX Save/Load Defaults
+        # =================================================================
+        SVI_LTX_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "svi_ltx_defaults.json")
+
+        svi_ltx_ui_default_components_ORDERED_LIST = [
+            # Prompts
+            svi_prompt1, svi_prompt2, svi_prompt3, svi_prompt4,
+            svi_prompt5, svi_prompt6, svi_prompt7, svi_prompt8,
+            svi_negative_prompt,
+            # SVI settings
+            svi_num_clips, svi_overlap_frames, svi_num_motion_latent,
+            svi_num_motion_frame, svi_seed_multiplier,
+            # Generation params
+            svi_width, svi_height, svi_num_frames, svi_frame_rate,
+            svi_inference_steps, svi_cfg_scale, svi_seed,
+            # Anchor settings
+            svi_anchor_interval, svi_anchor_strength, svi_anchor_decay,
+            # Model settings
+            svi_checkpoint_path, svi_gemma_root, svi_spatial_upsampler,
+            svi_distilled_lora, svi_distilled_lora_strength, svi_one_stage,
+            svi_enable_fp8, svi_offload,
+            # Block swap
+            svi_enable_dit_block_swap, svi_dit_blocks_in_memory,
+            svi_enable_text_encoder_block_swap, svi_text_encoder_blocks_in_memory,
+            svi_enable_refiner_block_swap, svi_refiner_blocks_in_memory,
+            # LoRA
+            svi_lora_folder, svi_lora_dropdown, svi_lora_strength,
+            # Output
+            svi_disable_audio, svi_output_path, svi_batch_size,
+            # Video extension
+            svi_frames_to_check, svi_prepend_original,
+            # Scale slider
+            svi_scale_slider,
+        ]
+
+        svi_ltx_ui_default_keys = [
+            # Prompts
+            "svi_prompt1", "svi_prompt2", "svi_prompt3", "svi_prompt4",
+            "svi_prompt5", "svi_prompt6", "svi_prompt7", "svi_prompt8",
+            "svi_negative_prompt",
+            # SVI settings
+            "svi_num_clips", "svi_overlap_frames", "svi_num_motion_latent",
+            "svi_num_motion_frame", "svi_seed_multiplier",
+            # Generation params
+            "svi_width", "svi_height", "svi_num_frames", "svi_frame_rate",
+            "svi_inference_steps", "svi_cfg_scale", "svi_seed",
+            # Anchor settings
+            "svi_anchor_interval", "svi_anchor_strength", "svi_anchor_decay",
+            # Model settings
+            "svi_checkpoint_path", "svi_gemma_root", "svi_spatial_upsampler",
+            "svi_distilled_lora", "svi_distilled_lora_strength", "svi_one_stage",
+            "svi_enable_fp8", "svi_offload",
+            # Block swap
+            "svi_enable_dit_block_swap", "svi_dit_blocks_in_memory",
+            "svi_enable_text_encoder_block_swap", "svi_text_encoder_blocks_in_memory",
+            "svi_enable_refiner_block_swap", "svi_refiner_blocks_in_memory",
+            # LoRA
+            "svi_lora_folder", "svi_lora_dropdown", "svi_lora_strength",
+            # Output
+            "svi_disable_audio", "svi_output_path", "svi_batch_size",
+            # Video extension
+            "svi_frames_to_check", "svi_prepend_original",
+            # Scale slider
+            "svi_scale_slider",
+        ]
+
+        def save_svi_ltx_defaults(*values):
+            os.makedirs(UI_CONFIGS_DIR, exist_ok=True)
+            settings_to_save = {}
+            for i, key in enumerate(svi_ltx_ui_default_keys):
+                settings_to_save[key] = values[i]
+            try:
+                with open(SVI_LTX_DEFAULTS_FILE, 'w') as f:
+                    json.dump(settings_to_save, f, indent=2)
+                return "SVI-LTX defaults saved successfully."
+            except Exception as e:
+                return f"Error saving SVI-LTX defaults: {e}"
+
+        def load_svi_ltx_defaults(request: gr.Request = None):
+            lora_folder_val = "lora"
+            lora_choices = get_ltx_lora_options(lora_folder_val)
+
+            if not os.path.exists(SVI_LTX_DEFAULTS_FILE):
+                if request:
+                    return [gr.update()] * len(svi_ltx_ui_default_keys) + ["No SVI-LTX defaults file found."]
+                else:
+                    return [gr.update()] * len(svi_ltx_ui_default_keys) + [""]
+
+            try:
+                with open(SVI_LTX_DEFAULTS_FILE, 'r') as f:
+                    loaded_settings = json.load(f)
+            except Exception as e:
+                return [gr.update()] * len(svi_ltx_ui_default_keys) + [f"Error loading SVI-LTX defaults: {e}"]
+
+            # Update lora folder from settings
+            lora_folder_val = loaded_settings.get("svi_lora_folder", "lora")
+            lora_choices = get_ltx_lora_options(lora_folder_val)
+
+            updates = []
+            for i, key in enumerate(svi_ltx_ui_default_keys):
+                component = svi_ltx_ui_default_components_ORDERED_LIST[i]
+                default_value_from_component = None
+                if hasattr(component, 'value'):
+                    default_value_from_component = component.value
+
+                value_to_set = loaded_settings.get(key, default_value_from_component)
+
+                # Special handling for LoRA dropdown
+                if key == "svi_lora_dropdown":
+                    if value_to_set not in lora_choices:
+                        value_to_set = "None"
+                    updates.append(gr.update(choices=lora_choices, value=value_to_set))
+                else:
+                    updates.append(gr.update(value=value_to_set))
+
+            return updates + ["SVI-LTX defaults loaded successfully."]
+
+        svi_save_defaults_btn.click(
+            fn=save_svi_ltx_defaults,
+            inputs=svi_ltx_ui_default_components_ORDERED_LIST,
+            outputs=[svi_batch_progress]
+        )
+        svi_load_defaults_btn.click(
+            fn=load_svi_ltx_defaults,
+            inputs=None,
+            outputs=svi_ltx_ui_default_components_ORDERED_LIST + [svi_batch_progress]
+        )
+
+        def initial_load_svi_ltx_defaults():
+            results_and_status = load_svi_ltx_defaults(None)
+            return results_and_status[:-1]
+
+        demo.load(
+            fn=initial_load_svi_ltx_defaults,
+            inputs=None,
+            outputs=svi_ltx_ui_default_components_ORDERED_LIST
         )
 
         return demo

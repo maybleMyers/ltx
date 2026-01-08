@@ -278,6 +278,14 @@ def enable_text_encoder_block_swap(
     gemma_text_model.rotary_emb_local.to(device)
     gemma_text_model.norm.to(device)
 
+    # Move multimodal components to GPU (needed for prompt enhancement with images)
+    # Gemma3ForConditionalGeneration has vision_tower and multi_modal_projector
+    gemma_model = text_encoder.model  # Gemma3ForConditionalGeneration
+    if hasattr(gemma_model, "vision_tower") and gemma_model.vision_tower is not None:
+        gemma_model.vision_tower.to(device)
+    if hasattr(gemma_model, "multi_modal_projector") and gemma_model.multi_modal_projector is not None:
+        gemma_model.multi_modal_projector.to(device)
+
     # Move text encoder's non-Gemma components to GPU
     # These are used after hidden states extraction
     if hasattr(text_encoder, "feature_extractor_linear"):
@@ -308,6 +316,47 @@ def enable_text_encoder_block_swap(
         return projected, attention_mask
 
     text_encoder._preprocess_text = device_aware_preprocess_text
+
+    # Also patch _enhance for prompt enhancement with Gemma
+    # The issue is that _enhance uses self.model.device which returns CPU when block swapping is enabled
+    text_encoder._original_enhance = text_encoder._enhance
+
+    def device_aware_enhance(
+        messages: list[dict[str, str]],
+        image: torch.Tensor | None = None,
+        max_new_tokens: int = 512,
+        seed: int = 42,
+    ) -> str:
+        """Patched _enhance that creates tensors on the correct device."""
+        if text_encoder.processor is None:
+            text_encoder._init_image_processor()
+        text = text_encoder.processor.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+        model_inputs = text_encoder.processor(
+            text=text,
+            images=image,
+            return_tensors="pt",
+        ).to(device)  # Use block swap device instead of self.model.device
+        pad_token_id = text_encoder.processor.tokenizer.pad_token_id if text_encoder.processor.tokenizer.pad_token_id is not None else 0
+
+        # Import the padding helper from base_encoder
+        from ltx_core.text_encoders.gemma.encoders.base_encoder import _pad_inputs_for_attention_alignment
+        model_inputs = _pad_inputs_for_attention_alignment(model_inputs, pad_token_id=pad_token_id)
+
+        with torch.inference_mode(), torch.random.fork_rng(devices=[device]):
+            torch.manual_seed(seed)
+            outputs = text_encoder.model.generate(
+                **model_inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=True,
+                temperature=0.7,
+            )
+            generated_ids = outputs[0][len(model_inputs.input_ids[0]) :]
+            enhanced_prompt = text_encoder.processor.tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+        return enhanced_prompt
+
+    text_encoder._enhance = device_aware_enhance
 
     # Store original forward method
     gemma_text_model._original_forward = gemma_text_model.forward
@@ -482,6 +531,13 @@ def offload_all_text_encoder_blocks(text_encoder) -> None:
     gemma_text_model.rotary_emb_local.to("cpu")
     gemma_text_model.norm.to("cpu")
 
+    # Move multimodal components to CPU too
+    gemma_model = text_encoder.model  # Gemma3ForConditionalGeneration
+    if hasattr(gemma_model, "vision_tower") and gemma_model.vision_tower is not None:
+        gemma_model.vision_tower.to("cpu")
+    if hasattr(gemma_model, "multi_modal_projector") and gemma_model.multi_modal_projector is not None:
+        gemma_model.multi_modal_projector.to("cpu")
+
     # Move text encoder's non-Gemma components back to CPU
     if hasattr(text_encoder, "feature_extractor_linear"):
         text_encoder.feature_extractor_linear.to("cpu")
@@ -499,6 +555,11 @@ def offload_all_text_encoder_blocks(text_encoder) -> None:
     if hasattr(text_encoder, "_original_preprocess_text"):
         text_encoder._preprocess_text = text_encoder._original_preprocess_text
         del text_encoder._original_preprocess_text
+
+    # Restore original _enhance
+    if hasattr(text_encoder, "_original_enhance"):
+        text_encoder._enhance = text_encoder._original_enhance
+        del text_encoder._original_enhance
 
     # Cleanup attributes
     if hasattr(gemma_text_model, "_block_swap_offloader"):
