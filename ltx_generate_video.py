@@ -1736,10 +1736,11 @@ class LTXVideoGeneratorWithOffloading:
                     stage_1_conditionings = stage_1_conditionings + anchor_conditionings
                     print(f">>> Added {len(anchor_conditionings)} anchor points at frames {[t[1] for t in anchor_tuples]}")
 
-            # V2V: Add keyframe conditionings from input video
-            # Encodes every 8th frame to avoid OOM on long videos
+            # V2V: Add video conditioning from input video (like ic_lora pipeline)
+            # Uses tiled encoding to handle long videos without OOM
             if input_video and not self.refine_only:
-                print(f">>> V2V: Loading and encoding input video keyframes...")
+                from ltx_core.conditioning import VideoConditionByKeyframeIndex
+                print(f">>> V2V: Loading and encoding input video with tiled encoding...")
                 v2v_start = time.time()
 
                 # Load input video at stage 1 resolution
@@ -1752,41 +1753,50 @@ class LTXVideoGeneratorWithOffloading:
                     device=self.device,
                 )
 
-                # Extract and encode keyframes every 8 frames (like refine-only mode)
-                latent_stride = 8
+                # Tiled encoding parameters (matching decoder's default temporal tiling)
+                # tile_size must be 8k+1 for valid VAE input
+                tile_size = 65  # 65 frames = 8 latent frames + 1
+                tile_overlap = 24  # Overlap in pixel frames (must be divisible by 8)
+                tile_stride = tile_size - tile_overlap  # Non-overlapping portion
+
                 actual_frames = video_tensor.shape[2]
+                num_chunks = 0
+                encoded_chunks = []
 
-                # Get latent indices already covered by --image args (don't duplicate)
-                image_latent_indices = set()
-                if images:
-                    for _, frame_idx, _ in images:
-                        image_latent_indices.add(frame_idx // latent_stride)
+                # Encode video in overlapping tiles
+                frame_idx = 0
+                while frame_idx < actual_frames:
+                    # Calculate chunk bounds
+                    chunk_end = min(frame_idx + tile_size, actual_frames)
+                    chunk_frames = chunk_end - frame_idx
 
-                v2v_conditionings = []
-                for frame_idx in range(0, actual_frames, latent_stride):
-                    latent_idx = frame_idx // latent_stride
+                    # Ensure valid frame count (8k+1) for VAE
+                    valid_frames = ((chunk_frames - 1) // 8) * 8 + 1
+                    if valid_frames < 9:  # Need at least 9 frames for meaningful encoding
+                        break
+                    chunk_end = frame_idx + valid_frames
 
-                    # Skip frames already covered by --image conditionings
-                    if latent_idx in image_latent_indices:
-                        continue
-
-                    # Extract single frame: video_tensor is [1, C, F, H, W]
-                    frame = video_tensor[:, :, frame_idx:frame_idx+1, :, :]
-
-                    # Encode frame to latent
+                    # Extract and encode chunk
+                    chunk = video_tensor[:, :, frame_idx:chunk_end, :, :]
                     with torch.no_grad():
-                        encoded_frame = video_encoder(frame)
+                        encoded_chunk = video_encoder(chunk)
 
-                    v2v_conditionings.append(
-                        VideoConditionByLatentIndex(
-                            latent=encoded_frame,
+                    # Add as keyframe conditioning with frame offset
+                    stage_1_conditionings.append(
+                        VideoConditionByKeyframeIndex(
+                            keyframes=encoded_chunk,
+                            frame_idx=frame_idx,
                             strength=refine_strength,
-                            latent_idx=latent_idx,
                         )
                     )
+                    num_chunks += 1
 
-                stage_1_conditionings = stage_1_conditionings + v2v_conditionings
-                print(f">>> V2V: Added {len(v2v_conditionings)} keyframe conditionings (strength={refine_strength}) in {time.time() - v2v_start:.1f}s")
+                    # Move to next tile (with overlap)
+                    frame_idx += tile_stride
+                    if frame_idx >= actual_frames - 8:  # Don't create tiny final chunks
+                        break
+
+                print(f">>> V2V: Added {num_chunks} video conditioning chunks (strength={refine_strength}) in {time.time() - v2v_start:.1f}s")
 
             # SVI Pro: Add motion latent conditionings
             if _motion_latent is not None and _num_motion_latent > 0:
@@ -2156,10 +2166,11 @@ class LTXVideoGeneratorWithOffloading:
                 )
                 stage_2_conditionings = stage_2_conditionings + anchor_conditionings
 
-        # V2V: Add keyframe conditionings from input video for stage 2 (at full resolution)
-        # Encodes every 8th frame to avoid OOM on long videos
+        # V2V: Add video conditioning from input video for stage 2 (at full resolution)
+        # Uses tiled encoding to handle long videos without OOM
         if input_video and not self.refine_only:
-            print(f">>> V2V Stage 2: Loading and encoding input video keyframes at full resolution...")
+            from ltx_core.conditioning import VideoConditionByKeyframeIndex
+            print(f">>> V2V Stage 2: Loading and encoding input video with tiled encoding at full resolution...")
             v2v_stage2_start = time.time()
 
             # Load video encoder for v2v if needed
@@ -2176,38 +2187,43 @@ class LTXVideoGeneratorWithOffloading:
                 device=self.device,
             )
 
-            # Extract and encode keyframes every 8 frames
-            latent_stride = 8
+            # Tiled encoding parameters (matching decoder's default temporal tiling)
+            tile_size = 65  # 65 frames = 8 latent frames + 1
+            tile_overlap = 24
+            tile_stride = tile_size - tile_overlap
+
             actual_frames = video_tensor_s2.shape[2]
+            num_chunks = 0
 
-            # Get latent indices already covered by --image args
-            image_latent_indices = set()
-            if images:
-                for _, frame_idx, _ in images:
-                    image_latent_indices.add(frame_idx // latent_stride)
+            # Encode video in overlapping tiles
+            frame_idx = 0
+            while frame_idx < actual_frames:
+                chunk_end = min(frame_idx + tile_size, actual_frames)
+                chunk_frames = chunk_end - frame_idx
 
-            v2v_stage2_conditionings = []
-            for frame_idx in range(0, actual_frames, latent_stride):
-                latent_idx = frame_idx // latent_stride
+                valid_frames = ((chunk_frames - 1) // 8) * 8 + 1
+                if valid_frames < 9:
+                    break
+                chunk_end = frame_idx + valid_frames
 
-                if latent_idx in image_latent_indices:
-                    continue
-
-                frame = video_tensor_s2[:, :, frame_idx:frame_idx+1, :, :]
-
+                chunk = video_tensor_s2[:, :, frame_idx:chunk_end, :, :]
                 with torch.no_grad():
-                    encoded_frame = stage_2_video_encoder(frame)
+                    encoded_chunk = stage_2_video_encoder(chunk)
 
-                v2v_stage2_conditionings.append(
-                    VideoConditionByLatentIndex(
-                        latent=encoded_frame,
+                stage_2_conditionings.append(
+                    VideoConditionByKeyframeIndex(
+                        keyframes=encoded_chunk,
+                        frame_idx=frame_idx,
                         strength=refine_strength,
-                        latent_idx=latent_idx,
                     )
                 )
+                num_chunks += 1
 
-            stage_2_conditionings = stage_2_conditionings + v2v_stage2_conditionings
-            print(f">>> V2V Stage 2: Added {len(v2v_stage2_conditionings)} keyframe conditionings in {time.time() - v2v_stage2_start:.1f}s")
+                frame_idx += tile_stride
+                if frame_idx >= actual_frames - 8:
+                    break
+
+            print(f">>> V2V Stage 2: Added {num_chunks} video conditioning chunks in {time.time() - v2v_stage2_start:.1f}s")
 
         # SVI Pro: Add motion latent conditionings for stage 2
         if _motion_latent is not None and _num_motion_latent > 0:
