@@ -2166,64 +2166,8 @@ class LTXVideoGeneratorWithOffloading:
                 )
                 stage_2_conditionings = stage_2_conditionings + anchor_conditionings
 
-        # V2V: Add video conditioning from input video for stage 2 (at full resolution)
-        # Uses tiled encoding to handle long videos without OOM
-        if input_video and not self.refine_only:
-            from ltx_core.conditioning import VideoConditionByKeyframeIndex
-            print(f">>> V2V Stage 2: Loading and encoding input video with tiled encoding at full resolution...")
-            v2v_stage2_start = time.time()
-
-            # Load video encoder for v2v if needed
-            if stage_2_video_encoder is None:
-                stage_2_video_encoder = self.stage_1_model_ledger.video_encoder()
-
-            # Load input video at stage 2 resolution (full res)
-            video_tensor_s2 = load_video_conditioning(
-                video_path=input_video,
-                height=stage_2_output_shape.height,
-                width=stage_2_output_shape.width,
-                frame_cap=num_frames,
-                dtype=dtype,
-                device=self.device,
-            )
-
-            # Tiled encoding parameters (matching decoder's default temporal tiling)
-            tile_size = 65  # 65 frames = 8 latent frames + 1
-            tile_overlap = 24
-            tile_stride = tile_size - tile_overlap
-
-            actual_frames = video_tensor_s2.shape[2]
-            num_chunks = 0
-
-            # Encode video in overlapping tiles
-            frame_idx = 0
-            while frame_idx < actual_frames:
-                chunk_end = min(frame_idx + tile_size, actual_frames)
-                chunk_frames = chunk_end - frame_idx
-
-                valid_frames = ((chunk_frames - 1) // 8) * 8 + 1
-                if valid_frames < 9:
-                    break
-                chunk_end = frame_idx + valid_frames
-
-                chunk = video_tensor_s2[:, :, frame_idx:chunk_end, :, :]
-                with torch.no_grad():
-                    encoded_chunk = stage_2_video_encoder(chunk)
-
-                stage_2_conditionings.append(
-                    VideoConditionByKeyframeIndex(
-                        keyframes=encoded_chunk,
-                        frame_idx=frame_idx,
-                        strength=refine_strength,
-                    )
-                )
-                num_chunks += 1
-
-                frame_idx += tile_stride
-                if frame_idx >= actual_frames - 8:
-                    break
-
-            print(f">>> V2V Stage 2: Added {num_chunks} video conditioning chunks in {time.time() - v2v_stage2_start:.1f}s")
+        # Note: V2V video conditioning is NOT applied to stage 2 (matching ic_lora.py)
+        # Stage 2 only refines the upscaled latent from stage 1 - video guidance already applied there
 
         # SVI Pro: Add motion latent conditionings for stage 2
         if _motion_latent is not None and _num_motion_latent > 0:
