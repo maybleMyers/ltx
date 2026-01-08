@@ -1458,7 +1458,6 @@ class LTXVideoGeneratorWithOffloading:
             # Use keyframe conditioning approach (like Wan2GP) instead of encoding whole video
             # This avoids chunked encoding glitches from the causal VAE encoder
             # Extract every 8th frame and create conditionings with strength=1.0
-            from ltx_core.conditioning.types.latent_cond import VideoConditionByLatentIndex
             latent_stride = 8
             actual_frames = video_tensor.shape[2]
 
@@ -1806,7 +1805,6 @@ class LTXVideoGeneratorWithOffloading:
 
             # Sliding Window: Add overlap latent conditionings at the BEGINNING of the sequence
             if _overlap_latent is not None and _num_overlap_latent > 0:
-                from ltx_core.conditioning.types.latent_cond import VideoConditionByLatentIndex
                 overlap_latent_tensor = _overlap_latent.to(device=self.device, dtype=dtype)
                 num_overlap_frames = overlap_latent_tensor.shape[2]
 
