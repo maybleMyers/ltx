@@ -1118,17 +1118,22 @@ def encode_video_chunked(
     video_tensor: torch.Tensor,
     video_encoder,
     chunk_frames: int = 65,  # 8*8 + 1
-    overlap_frames: int = 8,
+    overlap_frames: int = 8,  # kept for API compatibility, but we use context_frames internally
 ) -> torch.Tensor:
     """
     Encode video in temporal chunks to reduce memory usage.
-    Uses trapezoidal blending for smooth transitions.
+
+    Uses autoregressive chunking to handle the causal VAE encoder properly:
+    - The VAE encoder uses causal convolutions where each frame depends on previous frames
+    - For chunks after the first, we include context frames and discard the corresponding
+      latent tokens (the "warm-up" region where the encoder lacks sufficient context)
+    - This avoids blending artifacts from mismatched latents at chunk boundaries
 
     Args:
         video_tensor: Shape (1, C, F, H, W) normalized video
         video_encoder: VideoEncoder model
         chunk_frames: Frames per chunk (must be 8*k+1)
-        overlap_frames: Overlap between chunks (must be multiple of 8)
+        overlap_frames: Legacy parameter, context_frames is used internally
 
     Returns:
         Encoded latent tensor (1, latent_channels, F', H', W')
@@ -1141,44 +1146,53 @@ def encode_video_chunked(
 
     # Validate
     assert (chunk_frames - 1) % 8 == 0, "chunk_frames must be 8*k+1"
-    assert overlap_frames % 8 == 0, "overlap must be multiple of 8"
 
-    # Calculate latent overlap (temporal compression is 8x)
-    latent_overlap = overlap_frames // 8
+    # Context frames for causal encoder warm-up (must be 8*k for clean latent boundaries)
+    # Using 24 frames (3 latent tokens) provides enough context for the encoder's receptive field
+    context_frames = 24
+    context_latents = context_frames // 8  # 3 latent tokens to discard
 
-    # Collect chunks
-    chunks_info = []  # (start_frame, end_frame, pad_frames)
-    start = 0
-    while start < total_frames:
-        end = min(start + chunk_frames, total_frames)
+    # Calculate how many new frames each chunk contributes (excluding context)
+    new_frames_per_chunk = chunk_frames - context_frames  # e.g., 65 - 24 = 41 frames
+    new_latents_per_chunk = new_frames_per_chunk // 8  # e.g., 41 // 8 = 5 latent tokens
+
+    # Build chunk list: (start_frame, end_frame, is_first)
+    chunks_info = []
+
+    # First chunk: starts at 0, uses all latent tokens
+    first_end = min(chunk_frames, total_frames)
+    chunks_info.append((0, first_end, True))
+
+    # Subsequent chunks: start with context overlap, discard context latents
+    current_frame = first_end - context_frames  # Where the next chunk's "new" content starts
+    while current_frame + context_frames < total_frames:
+        chunk_start = current_frame  # Include context frames
+        chunk_end = min(chunk_start + chunk_frames, total_frames)
+        chunks_info.append((chunk_start, chunk_end, False))
+        current_frame = chunk_end - context_frames
+
+    print(f">>> Encoding {len(chunks_info)} chunk(s) with {context_frames}-frame context...")
+
+    # Encode chunks and collect latent segments
+    latent_segments = []
+
+    for i, (start, end, is_first) in enumerate(chunks_info):
         actual_frames = end - start
 
-        # Pad last chunk if needed to satisfy 8*k+1
+        # Pad if needed to satisfy 8*k+1
         if (actual_frames - 1) % 8 != 0:
-            # Find next valid size
             target = 8 * ((actual_frames - 1) // 8 + 1) + 1
             pad_frames = target - actual_frames
-            chunks_info.append((start, end, pad_frames))
         else:
-            chunks_info.append((start, end, 0))
+            pad_frames = 0
 
-        # Move to next chunk
-        if end >= total_frames:
-            break
-        start = end - overlap_frames
-
-    print(f">>> Encoding {len(chunks_info)} chunk(s) of {chunk_frames} frames each...")
-
-    # Encode each chunk
-    latent_chunks = []
-    for i, (start, end, pad) in enumerate(chunks_info):
         print(f">>> Encoding chunk {i+1}/{len(chunks_info)} (frames {start}-{end})...")
         chunk = video_tensor[:, :, start:end, :, :]
 
         # Pad if necessary
-        if pad > 0:
+        if pad_frames > 0:
             last_frame = chunk[:, :, -1:, :, :]
-            padding = last_frame.expand(-1, -1, pad, -1, -1)
+            padding = last_frame.expand(-1, -1, pad_frames, -1, -1)
             chunk = torch.cat([chunk, padding], dim=2)
 
         # Encode
@@ -1186,76 +1200,41 @@ def encode_video_chunked(
             latent = video_encoder(chunk)
 
         # Remove padded latent tokens if we padded
-        if pad > 0:
-            valid_tokens = (end - start - 1) // 8 + 1
+        if pad_frames > 0:
+            valid_tokens = (actual_frames - 1) // 8 + 1
             latent = latent[:, :, :valid_tokens, :, :]
 
-        latent_chunks.append(latent)
+        # For first chunk: use all latent tokens
+        # For subsequent chunks: discard context latents (warm-up region)
+        if is_first:
+            latent_segments.append(latent)
+        else:
+            # Discard the first context_latents tokens (the warm-up region)
+            if latent.shape[2] > context_latents:
+                latent_segments.append(latent[:, :, context_latents:, :, :])
+            # If chunk is very short, it might be entirely context - skip it
 
         # Free memory
         del chunk
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    # Combine chunks with blending
-    if len(latent_chunks) == 1:
-        return latent_chunks[0]
+    # Concatenate all segments directly (no blending needed with this approach)
+    if len(latent_segments) == 1:
+        result = latent_segments[0]
+    else:
+        result = torch.cat(latent_segments, dim=2)
 
-    # Calculate total latent frames
+    # Trim to exact expected length
     total_latent_frames = (total_frames - 1) // 8 + 1
-    result_shape = list(latent_chunks[0].shape)
-    result_shape[2] = total_latent_frames
-    result = torch.zeros(result_shape, dtype=latent_chunks[0].dtype, device=latent_chunks[0].device)
-    weight_sum = torch.zeros(total_latent_frames, dtype=torch.float32, device=result.device)
-
-    for i, ((start, end, pad), latent) in enumerate(zip(chunks_info, latent_chunks)):
-        # Calculate latent position from the chunk's start frame
-        latent_pos = start // 8
-        chunk_len = latent.shape[2]
-        my_end_pos = min(latent_pos + chunk_len, total_latent_frames)
-
-        # Calculate actual overlap with previous chunk (may differ from latent_overlap due to frame alignment)
-        if i > 0:
-            prev_start = chunks_info[i - 1][0]
-            prev_chunk_len = latent_chunks[i - 1].shape[2]
-            prev_end_pos = min((prev_start // 8) + prev_chunk_len, total_latent_frames)
-            actual_overlap_prev = max(0, prev_end_pos - latent_pos)
-        else:
-            actual_overlap_prev = 0
-
-        # Calculate actual overlap with next chunk
-        if i < len(chunks_info) - 1:
-            next_start = chunks_info[i + 1][0]
-            next_pos = next_start // 8
-            actual_overlap_next = max(0, my_end_pos - next_pos)
-        else:
-            actual_overlap_next = 0
-
-        # Create weight mask with proper blending over actual overlap regions
-        weight = torch.ones(chunk_len, device=latent.device)
-
-        # Fade in for non-first chunks over the actual overlap region
-        if actual_overlap_prev > 0:
-            fade_len = min(actual_overlap_prev, chunk_len)
-            fade_in = torch.linspace(0, 1, fade_len + 1, device=latent.device)[1:]
-            weight[:fade_len] = fade_in
-
-        # Fade out for non-last chunks over the actual overlap region
-        if actual_overlap_next > 0:
-            fade_len = min(actual_overlap_next, chunk_len)
-            fade_out = torch.linspace(1, 0, fade_len + 1, device=latent.device)[1:]
-            weight[-fade_len:] = fade_out
-
-        # Add weighted latent to result
-        actual_len = my_end_pos - latent_pos
-
-        weight_expanded = weight[:actual_len].view(1, 1, actual_len, 1, 1)
-        result[:, :, latent_pos:my_end_pos, :, :] += latent[:, :, :actual_len, :, :] * weight_expanded
-        weight_sum[latent_pos:my_end_pos] += weight[:actual_len]
-
-    # Normalize by weight sum
-    weight_sum = weight_sum.clamp(min=1e-8).view(1, 1, -1, 1, 1)
-    result = result / weight_sum
+    if result.shape[2] > total_latent_frames:
+        result = result[:, :, :total_latent_frames, :, :]
+    elif result.shape[2] < total_latent_frames:
+        # Pad with last token if we're short (shouldn't happen with correct chunking)
+        pad_latents = total_latent_frames - result.shape[2]
+        last_latent = result[:, :, -1:, :, :]
+        padding = last_latent.expand(-1, -1, pad_latents, -1, -1)
+        result = torch.cat([result, padding], dim=2)
 
     return result
 
