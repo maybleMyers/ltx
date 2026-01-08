@@ -1208,8 +1208,9 @@ def encode_video_chunked(
     result = torch.zeros(result_shape, dtype=latent_chunks[0].dtype, device=latent_chunks[0].device)
     weight_sum = torch.zeros(total_latent_frames, dtype=torch.float32, device=result.device)
 
-    latent_pos = 0
-    for i, latent in enumerate(latent_chunks):
+    for i, ((start, end, pad), latent) in enumerate(zip(chunks_info, latent_chunks)):
+        # Calculate latent position from the chunk's start frame
+        latent_pos = start // 8
         chunk_len = latent.shape[2]
 
         # Create weight mask
@@ -1232,10 +1233,6 @@ def encode_video_chunked(
         weight_expanded = weight[:actual_len].view(1, 1, actual_len, 1, 1)
         result[:, :, latent_pos:end_pos, :, :] += latent[:, :, :actual_len, :, :] * weight_expanded
         weight_sum[latent_pos:end_pos] += weight[:actual_len]
-
-        # Move position (accounting for overlap)
-        if i < len(latent_chunks) - 1:
-            latent_pos = latent_pos + chunk_len - latent_overlap
 
     # Normalize by weight sum
     weight_sum = weight_sum.clamp(min=1e-8).view(1, 1, -1, 1, 1)
