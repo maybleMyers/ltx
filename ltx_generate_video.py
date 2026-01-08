@@ -34,7 +34,6 @@ from ltx_core.components.guiders import CFGGuider
 from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.components.schedulers import LTX2Scheduler
-from ltx_core.conditioning import AudioConditionByLatent, VideoConditionByLatentIndex
 from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
 from ltx_core.model.audio_vae import AudioProcessor, decode_audio as vae_decode_audio
 from ltx_core.model.upsampler import upsample_video
@@ -1490,6 +1489,7 @@ class LTXVideoGeneratorWithOffloading:
             if image_latent_indices:
                 print(f">>> Skipping latent indices {sorted(image_latent_indices)} (covered by --image)")
 
+            from ltx_core.conditioning import VideoConditionByLatentIndex
             for frame_idx in range(0, actual_frames, latent_stride):
                 latent_idx = frame_idx // latent_stride
 
@@ -1889,6 +1889,7 @@ class LTXVideoGeneratorWithOffloading:
 
             # Sliding Window: Add overlap latent conditionings at the BEGINNING of the sequence
             if _overlap_latent is not None and _num_overlap_latent > 0:
+                from ltx_core.conditioning import VideoConditionByLatentIndex
                 overlap_latent_tensor = _overlap_latent.to(device=self.device, dtype=dtype)
                 num_overlap_frames = overlap_latent_tensor.shape[2]
 
@@ -1905,6 +1906,7 @@ class LTXVideoGeneratorWithOffloading:
 
             audio_conditionings = []
             if audio is not None:
+                from ltx_core.conditioning import AudioConditionByLatent
                 print(f">>> Loading and encoding audio from {audio}...")
                 waveform = decode_audio_from_file(audio, self.device)
                 if waveform is not None:
