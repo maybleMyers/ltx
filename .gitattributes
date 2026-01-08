@@ -8,3 +8,4 @@ packages/screenshot.png !filter !diff !merge text
 *.jpeg filter=lfs diff=lfs merge=lfs -text
 *.jpg filter=lfs diff=lfs merge=lfs -text
 *.webp filter=lfs diff=lfs merge=lfs -text
+packages/screenshot.jpg !filter !diff !merge -text binary
