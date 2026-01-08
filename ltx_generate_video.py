@@ -1737,6 +1737,36 @@ class LTXVideoGeneratorWithOffloading:
                     stage_1_conditionings = stage_1_conditionings + anchor_conditionings
                     print(f">>> Added {len(anchor_conditionings)} anchor points at frames {[t[1] for t in anchor_tuples]}")
 
+            # V2V: Add video conditioning from input video (like ic_lora pipeline)
+            # Uses VideoConditionByKeyframeIndex to append encoded video tokens
+            if input_video and not self.refine_only:
+                from ltx_core.conditioning import VideoConditionByKeyframeIndex
+                print(f">>> V2V: Loading and encoding input video...")
+                v2v_start = time.time()
+
+                # Load input video at stage 1 resolution
+                video_tensor = load_video_conditioning(
+                    video_path=input_video,
+                    height=stage_1_output_shape.height,
+                    width=stage_1_output_shape.width,
+                    frame_cap=num_frames,
+                    dtype=dtype,
+                    device=self.device,
+                )
+
+                # Encode entire video and append as conditioning (like ic_lora.py)
+                with torch.no_grad():
+                    encoded_video = video_encoder(video_tensor)
+
+                stage_1_conditionings.append(
+                    VideoConditionByKeyframeIndex(
+                        keyframes=encoded_video,
+                        frame_idx=0,
+                        strength=refine_strength,
+                    )
+                )
+                print(f">>> V2V: Added video conditioning (strength={refine_strength}) in {time.time() - v2v_start:.1f}s")
+
             # SVI Pro: Add motion latent conditionings
             if _motion_latent is not None and _num_motion_latent > 0:
                 motion_cond = VideoConditionByMotionLatent(
@@ -2105,6 +2135,40 @@ class LTXVideoGeneratorWithOffloading:
                     device=self.device,
                 )
                 stage_2_conditionings = stage_2_conditionings + anchor_conditionings
+
+        # V2V: Add video conditioning from input video for stage 2 (at full resolution)
+        # Uses VideoConditionByKeyframeIndex to append encoded video tokens (like ic_lora.py)
+        if input_video and not self.refine_only:
+            from ltx_core.conditioning import VideoConditionByKeyframeIndex
+            print(f">>> V2V Stage 2: Loading and encoding input video at full resolution...")
+            v2v_stage2_start = time.time()
+
+            # Load video encoder for v2v if needed
+            if stage_2_video_encoder is None:
+                stage_2_video_encoder = self.stage_1_model_ledger.video_encoder()
+
+            # Load input video at stage 2 resolution (full res)
+            video_tensor_s2 = load_video_conditioning(
+                video_path=input_video,
+                height=stage_2_output_shape.height,
+                width=stage_2_output_shape.width,
+                frame_cap=num_frames,
+                dtype=dtype,
+                device=self.device,
+            )
+
+            # Encode entire video and append as conditioning (like ic_lora.py)
+            with torch.no_grad():
+                encoded_video_s2 = stage_2_video_encoder(video_tensor_s2)
+
+            stage_2_conditionings.append(
+                VideoConditionByKeyframeIndex(
+                    keyframes=encoded_video_s2,
+                    frame_idx=0,
+                    strength=refine_strength,
+                )
+            )
+            print(f">>> V2V Stage 2: Added video conditioning (strength={refine_strength}) in {time.time() - v2v_stage2_start:.1f}s")
 
         # SVI Pro: Add motion latent conditionings for stage 2
         if _motion_latent is not None and _num_motion_latent > 0:
