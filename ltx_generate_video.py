@@ -3081,8 +3081,9 @@ def sliding_window_generate(
         if (window_frames - 1) % 8 != 0:
             window_frames = ((window_frames - 1) // 8 + 1) * 8 + 1
 
-        # Calculate seed for this window
-        window_seed = args.seed + window_idx * 42
+        # Use same seed for all windows to maintain coherence
+        # The overlap latent conditioning handles continuity between windows
+        window_seed = args.seed
 
         # Build conditionings for this window
         window_images = list(args.images) if args.images else []
