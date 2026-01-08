@@ -487,6 +487,8 @@ def generate_ltx_video(
     refine_steps: int,
     # Audio & prompt
     disable_audio: bool,
+    audio_input: str,
+    audio_strength: float,
     enhance_prompt: bool,
     # Memory optimization
     offload: bool,
@@ -653,9 +655,14 @@ def generate_ltx_video(
             if os.path.exists(lora_path):
                 command.extend(["--lora", lora_path, str(user_lora_strength)])
 
-        # Flags
-        if disable_audio:
+        # Audio handling
+        if audio_input and os.path.exists(audio_input):
+            command.extend(["--audio", str(audio_input)])
+            command.extend(["--audio-strength", str(float(audio_strength))])
+        elif disable_audio:
             command.append("--disable-audio")
+
+        # Flags
         if enhance_prompt:
             command.append("--enhance-prompt")
         if offload:
@@ -1327,6 +1334,20 @@ def create_interface():
                                     info="Number of refinement denoising steps"
                                 )
 
+                        # Audio Conditioning
+                        with gr.Accordion("Audio Conditioning", open=False):
+                            gr.Markdown("Condition video generation on an audio file. Audio should match or exceed video duration.")
+                            audio_input = gr.Audio(
+                                label="Audio File",
+                                type="filepath",
+                                sources=["upload"]
+                            )
+                            audio_strength = gr.Slider(
+                                minimum=0.0, maximum=1.0, value=1.0, step=0.05,
+                                label="Audio Strength",
+                                info="1.0 = frozen/exact audio, 0.0 = regenerate audio"
+                            )
+
                         # Video Continuation (Frame Freezing)
                         with gr.Accordion("Video Continuation (Frame Freezing)", open=False):
                             gr.Markdown("Freeze first N frames from input video during denoising for smooth continuation.")
@@ -1874,7 +1895,7 @@ def create_interface():
                 end_image, end_image_strength,
                 anchor_image, anchor_interval, anchor_strength, anchor_decay,
                 input_video, refine_strength, refine_steps,
-                disable_audio, enhance_prompt,
+                disable_audio, audio_input, audio_strength, enhance_prompt,
                 offload, enable_fp8,
                 enable_dit_block_swap, dit_blocks_in_memory,
                 enable_text_encoder_block_swap, text_encoder_blocks_in_memory,
@@ -1904,7 +1925,7 @@ def create_interface():
         def send_to_generation_handler(metadata, first_frame):
             """Send loaded metadata to generation tab parameters and switch to Generation tab."""
             if not metadata:
-                return [gr.update()] * 37 + ["No metadata loaded - upload a video first"]
+                return [gr.update()] * 38 + ["No metadata loaded - upload a video first"]
 
             # Handle legacy metadata that used single enable_block_swap
             legacy_block_swap = metadata.get("enable_block_swap", True)
@@ -1956,6 +1977,7 @@ def create_interface():
                 gr.update(value=metadata.get("refine_steps", 10)),  # refine_steps
                 # Audio and prompt
                 gr.update(value=metadata.get("disable_audio", False)),  # disable_audio
+                gr.update(value=metadata.get("audio_strength", 1.0)),  # audio_strength
                 gr.update(value=metadata.get("enhance_prompt", False)),  # enhance_prompt
                 # Memory optimization
                 gr.update(value=metadata.get("offload", False)),  # offload
@@ -1988,7 +2010,7 @@ def create_interface():
                 # Refine settings
                 refine_strength, refine_steps,
                 # Audio and prompt
-                disable_audio, enhance_prompt,
+                disable_audio, audio_strength, enhance_prompt,
                 # Memory optimization
                 offload, enable_fp8,
                 # Block swap settings
@@ -2150,7 +2172,7 @@ def create_interface():
             # Refine settings
             refine_strength, refine_steps,
             # Audio and prompt
-            disable_audio, enhance_prompt,
+            disable_audio, audio_strength, enhance_prompt,
             # Memory optimization
             offload, enable_fp8,
             enable_dit_block_swap, dit_blocks_in_memory,
@@ -2181,7 +2203,7 @@ def create_interface():
             # Refine settings
             "refine_strength", "refine_steps",
             # Audio and prompt
-            "disable_audio", "enhance_prompt",
+            "disable_audio", "audio_strength", "enhance_prompt",
             # Memory optimization
             "offload", "enable_fp8",
             "enable_dit_block_swap", "dit_blocks_in_memory",
