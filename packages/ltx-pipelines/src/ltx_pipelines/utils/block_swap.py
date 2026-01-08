@@ -8,6 +8,7 @@ and CUDA streams for efficient async transfers.
 Based on the working block swapping implementation from h1111/modules/custom_offloading_utils.py.
 """
 
+import sys
 import types
 
 import torch
@@ -486,8 +487,10 @@ def enable_text_encoder_block_swap(
     # Monkey-patch the forward method
     gemma_text_model.forward = types.MethodType(block_swap_forward, gemma_text_model)
 
-    print(f"[TextEncoderBlockSwap] Enabled: {blocks_in_memory}/{num_layers} layers in GPU, {blocks_to_swap} swapping", flush=True)
-    print("[TextEncoderBlockSwap] Returning offloader...", flush=True)
+    sys.stdout.write(f"[TextEncoderBlockSwap] Enabled: {blocks_in_memory}/{num_layers} layers in GPU, {blocks_to_swap} swapping\n")
+    sys.stdout.flush()
+    sys.stdout.write("[TextEncoderBlockSwap] About to return...\n")
+    sys.stdout.flush()
     return offloader
 
 
