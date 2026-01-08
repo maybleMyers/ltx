@@ -1399,14 +1399,16 @@ class LTXVideoGeneratorWithOffloading:
             self.stage_1_model_ledger.device = torch.device("cpu")
             text_encoder = self.stage_1_model_ledger.text_encoder()
             self.stage_1_model_ledger.device = original_device
+            print(">>> [DEBUG] About to enable text encoder block swap...", flush=True)
 
             # Enable block swap for text encoder
-            print(f">>> Enabling text encoder block swap ({self.text_encoder_blocks_in_memory} layers in GPU)...")
+            print(f">>> Enabling text encoder block swap ({self.text_encoder_blocks_in_memory} layers in GPU)...", flush=True)
             text_encoder_block_swap = enable_text_encoder_block_swap(
                 text_encoder,
                 blocks_in_memory=self.text_encoder_blocks_in_memory,
                 device=self.device,
             )
+            print(">>> [DEBUG] Text encoder block swap enabled", flush=True)
         else:
             text_encoder = self.stage_1_model_ledger.text_encoder()
 
