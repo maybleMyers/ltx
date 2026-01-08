@@ -3216,7 +3216,8 @@ def sliding_window_generate(
                 all_audio_chunks.append(audio)
             else:
                 samples_to_skip = overlap * samples_per_frame
-                all_audio_chunks.append(audio[samples_to_skip:])
+                # Audio is [channels, samples], so slice along dim=1
+                all_audio_chunks.append(audio[:, samples_to_skip:])
 
     # Concatenate all windows
     print("=" * 60)
@@ -3228,7 +3229,8 @@ def sliding_window_generate(
     if final_video.shape[0] > total_frames:
         final_video = final_video[:total_frames]
 
-    final_audio = torch.cat(all_audio_chunks, dim=0) if all_audio_chunks else None
+    # Audio is [channels, samples], concatenate along samples dimension (dim=1)
+    final_audio = torch.cat(all_audio_chunks, dim=1) if all_audio_chunks else None
 
     print(f">>> Final video shape: {final_video.shape}")
     if final_audio is not None:
