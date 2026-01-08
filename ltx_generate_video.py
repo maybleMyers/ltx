@@ -1458,6 +1458,7 @@ class LTXVideoGeneratorWithOffloading:
             # Use keyframe conditioning approach (like Wan2GP) instead of encoding whole video
             # This avoids chunked encoding glitches from the causal VAE encoder
             # Extract every 8th frame and create conditionings with strength=1.0
+            from ltx_core.conditioning.types.latent_cond import VideoConditionByLatentIndex
             latent_stride = 8
             actual_frames = video_tensor.shape[2]
 
