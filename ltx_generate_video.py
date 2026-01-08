@@ -34,6 +34,7 @@ from ltx_core.components.guiders import CFGGuider
 from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.components.schedulers import LTX2Scheduler
+from ltx_core.conditioning import VideoConditionByLatentIndex
 from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
 from ltx_core.model.audio_vae import AudioProcessor, decode_audio as vae_decode_audio
 from ltx_core.model.upsampler import upsample_video
@@ -1435,13 +1436,16 @@ class LTXVideoGeneratorWithOffloading:
         # =====================================================================
         # Refine-only mode: Skip stage 1 and use input video directly
         # =====================================================================
+        # Store keyframe conditionings for refine-only mode (populated below if needed)
+        refine_keyframe_conditionings = []
+
         if self.refine_only and input_video:
-            print(">>> Refine-only mode: Loading and encoding input video...")
+            print(">>> Refine-only mode: Loading input video and creating keyframe conditionings...")
             refine_start = time.time()
 
             video_encoder = self.stage_1_model_ledger.video_encoder()
 
-            # Load and encode input video (using chunked encoding to manage memory)
+            # Load input video
             video_tensor = load_video_conditioning(
                 video_path=input_video,
                 height=height,
@@ -1450,14 +1454,50 @@ class LTXVideoGeneratorWithOffloading:
                 dtype=dtype,
                 device=self.device,
             )
-            upscaled_video_latent = encode_video_chunked(
-                video_tensor=video_tensor,
-                video_encoder=video_encoder,
-                chunk_frames=65,  # 8*8 + 1 frames per chunk
-                overlap_frames=8,  # 1 latent token overlap
-            )
-            # Ensure video latent is in the correct dtype for the pipeline
-            upscaled_video_latent = upscaled_video_latent.to(dtype=dtype)
+
+            # Use keyframe conditioning approach (like Wan2GP) instead of encoding whole video
+            # This avoids chunked encoding glitches from the causal VAE encoder
+            # Extract every 8th frame and create conditionings with strength=1.0
+            latent_stride = 8
+            actual_frames = video_tensor.shape[2]
+
+            # Get latent indices already covered by --image args (don't duplicate conditioning)
+            image_latent_indices = set()
+            if images:
+                for _, frame_idx, _ in images:
+                    image_latent_indices.add(frame_idx // latent_stride)
+
+            print(f">>> Creating keyframe conditionings for {actual_frames} frames (every {latent_stride} frames)...")
+            if image_latent_indices:
+                print(f">>> Skipping latent indices {sorted(image_latent_indices)} (covered by --image)")
+
+            for frame_idx in range(0, actual_frames, latent_stride):
+                latent_idx = frame_idx // latent_stride
+
+                # Skip frames already covered by --image conditionings
+                if latent_idx in image_latent_indices:
+                    continue
+
+                # Extract single frame: video_tensor is [1, C, F, H, W]
+                frame = video_tensor[:, :, frame_idx:frame_idx+1, :, :]  # [1, C, 1, H, W]
+
+                # Encode frame to latent
+                with torch.no_grad():
+                    encoded_frame = video_encoder(frame)
+
+                # Create conditioning with strength=1.0 to preserve frame exactly
+                refine_keyframe_conditionings.append(
+                    VideoConditionByLatentIndex(
+                        latent=encoded_frame,
+                        strength=1.0,
+                        latent_idx=latent_idx,
+                    )
+                )
+
+            print(f">>> Created {len(refine_keyframe_conditionings)} keyframe conditionings")
+
+            # No initial video latent - using keyframe conditionings instead
+            upscaled_video_latent = None
 
             # Extract and encode audio from input video (like stage 1 would)
             audio_latent = None
@@ -2078,6 +2118,13 @@ class LTXVideoGeneratorWithOffloading:
                 device=self.device,
             )
             stage_2_conditionings = stage_2_conditionings + motion_conditionings
+
+        # Refine-only mode: Add keyframe conditionings from input video
+        # This uses every 8th frame as conditioning with strength=1.0
+        # to guide generation while avoiding chunked encoding glitches
+        if refine_keyframe_conditionings:
+            stage_2_conditionings = stage_2_conditionings + refine_keyframe_conditionings
+            print(f">>> Added {len(refine_keyframe_conditionings)} keyframe conditionings from input video")
 
         # Note: Overlap latent conditioning is only applied in stage 1.
         # Stage 2 operates at full resolution while overlap latent is encoded at stage 1 resolution.
