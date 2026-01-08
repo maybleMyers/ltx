@@ -1738,6 +1738,7 @@ class LTXVideoGeneratorWithOffloading:
 
             # V2V: Add video conditioning from input video (like ic_lora pipeline)
             # Uses tiled encoding to handle long videos without OOM
+            v2v_audio_latent = None  # Will be set if input_video has audio
             if input_video and not self.refine_only:
                 from ltx_core.conditioning import VideoConditionByKeyframeIndex
                 print(f">>> V2V: Loading and encoding input video with tiled encoding...")
@@ -1797,6 +1798,50 @@ class LTXVideoGeneratorWithOffloading:
                         break
 
                 print(f">>> V2V: Added {num_chunks} video conditioning chunks (strength={refine_strength}) in {time.time() - v2v_start:.1f}s")
+
+                # Extract and encode audio from input video to preserve it
+                if not disable_audio:
+                    print(">>> V2V: Extracting audio from input video...")
+                    waveform = decode_audio_from_file(input_video, self.device)
+
+                    if waveform is not None:
+                        import av
+                        audio_encoder = self.stage_1_model_ledger.audio_encoder()
+
+                        audio_processor = AudioProcessor(
+                            sample_rate=audio_encoder.sample_rate,
+                            mel_bins=audio_encoder.mel_bins,
+                            mel_hop_length=audio_encoder.mel_hop_length,
+                            n_fft=audio_encoder.n_fft,
+                        ).to(self.device)
+
+                        if waveform.dim() == 3:
+                            num_frames_audio, channels, samples_per_frame = waveform.shape
+                            waveform = waveform.permute(1, 0, 2).reshape(channels, -1).unsqueeze(0)
+                        elif waveform.dim() == 2:
+                            waveform = waveform.unsqueeze(0)
+
+                        container = av.open(input_video)
+                        audio_stream = next(s for s in container.streams if s.type == "audio")
+                        sample_rate = audio_stream.sample_rate
+                        container.close()
+
+                        mel_spectrogram = audio_processor.waveform_to_mel(
+                            waveform.to(dtype=torch.float32),
+                            waveform_sample_rate=sample_rate
+                        )
+
+                        v2v_audio_latent = audio_encoder(mel_spectrogram.to(dtype=torch.float32))
+                        v2v_audio_latent = v2v_audio_latent.to(dtype=dtype)
+
+                        del audio_encoder, audio_processor
+                        cleanup_memory()
+                        print(">>> V2V: Audio extracted and encoded successfully")
+                    else:
+                        v2v_audio_latent = None
+                        print(">>> V2V: Input video has no audio track")
+                else:
+                    v2v_audio_latent = None
 
             # SVI Pro: Add motion latent conditionings
             if _motion_latent is not None and _num_motion_latent > 0:
@@ -2196,8 +2241,15 @@ class LTXVideoGeneratorWithOffloading:
 
         print(f">>> Stage 2: Refining at {stage_2_output_shape.width}x{stage_2_output_shape.height}...")
         # For refine-only mode, use audio_latent from input video encoding
-        # For normal two-stage, use audio_state.latent from stage 1
-        stage_2_initial_audio = audio_latent if (self.refine_only and input_video) else audio_state.latent
+        # For v2v mode, use v2v_audio_latent if available
+        # For normal generation, use audio_state.latent from stage 1
+        if self.refine_only and input_video:
+            stage_2_initial_audio = audio_latent
+        elif v2v_audio_latent is not None:
+            stage_2_initial_audio = v2v_audio_latent
+            print(">>> Using audio from input video")
+        else:
+            stage_2_initial_audio = audio_state.latent
 
         # OOM retry loop - reduces blocks in GPU until denoising succeeds
         current_blocks = self.refiner_blocks_in_memory
