@@ -12,6 +12,8 @@ Gradio-based web interface for LTX-2 video generation with:
 
 import os
 import sys
+import select
+import signal
 
 # Try to use local patched gradio from modules/ if available (allows jobs to continue after browser disconnect)
 _modules_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "modules")
@@ -723,24 +725,23 @@ def generate_ltx_video(
 
             while True:
                 if stop_event.is_set():
-                    process.terminate()
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
+                    process.kill()
+                    process.wait()
                     current_process = None
                     yield all_generated_videos, [], "Generation stopped by user.", ""
                     return
 
-                # Read output line by line
-                line = process.stdout.readline()
-                if line:
-                    line = line.strip()
+                # Non-blocking read with select (0.1s timeout)
+                ready, _, _ = select.select([process.stdout], [], [], 0.1)
+                if ready:
+                    line = process.stdout.readline()
                     if line:
-                        print(line)
-                        parsed = parse_ltx_progress_line(line)
-                        if parsed:
-                            last_progress = parsed
+                        line = line.strip()
+                        if line:
+                            print(line)
+                            parsed = parse_ltx_progress_line(line)
+                            if parsed:
+                                last_progress = parsed
 
                 # Check for preview updates
                 if enable_preview and preview_mp4_path:
@@ -1096,24 +1097,23 @@ def generate_svi_ltx_video(
 
             while True:
                 if stop_event.is_set():
-                    process.terminate()
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
+                    process.kill()
+                    process.wait()
                     current_process = None
                     yield all_generated_videos, [], "Generation stopped by user.", ""
                     return
 
-                # Read output line by line
-                line = process.stdout.readline()
-                if line:
-                    line = line.strip()
+                # Non-blocking read with select (0.1s timeout)
+                ready, _, _ = select.select([process.stdout], [], [], 0.1)
+                if ready:
+                    line = process.stdout.readline()
                     if line:
-                        print(line)
-                        progress_info = parse_ltx_progress_line(line)
-                        if progress_info:
-                            last_progress = progress_info
+                        line = line.strip()
+                        if line:
+                            print(line)
+                            progress_info = parse_ltx_progress_line(line)
+                            if progress_info:
+                                last_progress = progress_info
 
                 # Check for preview updates
                 if enable_preview and preview_mp4_path:
