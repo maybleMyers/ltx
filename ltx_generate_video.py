@@ -1352,6 +1352,10 @@ class LTXVideoGeneratorWithOffloading:
         # SVI Pro parameters
         _motion_latent: torch.Tensor | None = None,
         _num_motion_latent: int = 0,
+        # Sliding window overlap parameters
+        _overlap_latent: torch.Tensor | None = None,
+        _num_overlap_latent: int = 0,
+        _overlap_strength: float = 0.95,
         # Preview callback
         preview_callback: Callable | None = None,
         preview_callback_interval: int = 1,
@@ -1712,6 +1716,23 @@ class LTXVideoGeneratorWithOffloading:
                 stage_1_conditionings = stage_1_conditionings + motion_conditionings
                 print(f">>> SVI Pro: Added {len(motion_conditionings)} motion keyframe conditionings")
 
+            # Sliding Window: Add overlap latent conditionings at the BEGINNING of the sequence
+            if _overlap_latent is not None and _num_overlap_latent > 0:
+                from ltx_core.conditioning.types.latent_cond import VideoConditionByLatentIndex
+                overlap_latent_tensor = _overlap_latent.to(device=self.device, dtype=dtype)
+                num_overlap_frames = overlap_latent_tensor.shape[2]
+
+                for i in range(min(num_overlap_frames, _num_overlap_latent)):
+                    frame_latent = overlap_latent_tensor[:, :, i:i+1, :, :]
+                    stage_1_conditionings.append(
+                        VideoConditionByLatentIndex(
+                            latent=frame_latent,
+                            strength=_overlap_strength,
+                            latent_idx=i,  # Frame 0, 1, 2... at the beginning
+                        )
+                    )
+                print(f">>> Sliding Window: Injected {min(num_overlap_frames, _num_overlap_latent)} overlap latent frames at beginning")
+
             stage_label = "One-stage" if self.one_stage else "Stage 1"
             print(f">>> {stage_label}: Generating at {stage_1_output_shape.width}x{stage_1_output_shape.height}...")
             video_state, audio_state = denoise_audio_video(
@@ -2047,6 +2068,10 @@ class LTXVideoGeneratorWithOffloading:
                 device=self.device,
             )
             stage_2_conditionings = stage_2_conditionings + motion_conditionings
+
+        # Note: Overlap latent conditioning is only applied in stage 1.
+        # Stage 2 operates at full resolution while overlap latent is encoded at stage 1 resolution.
+        # Stage 1 conditioning is sufficient for establishing coherence.
 
         print(f">>> Stage 2: Refining at {stage_2_output_shape.width}x{stage_2_output_shape.height}...")
         # For refine-only mode, use audio_latent from input video encoding
@@ -3063,11 +3088,14 @@ def sliding_window_generate(
         window_images = list(args.images) if args.images else []
 
         # Prepare overlapped latents injection (if not first window)
+        overlap_latent = None
+        num_overlap_latent = 0
         if window_idx > 0 and prev_window_latent is not None:
             # Inject previous window's ending latent as start conditioning
             overlap_latent = prepare_overlap_injection(prev_window_latent, overlap_noise)
-            # Add as conditioning at frame 0 with high strength
-            # This is handled internally by passing to generate()
+            # Calculate number of latent frames from pixel overlap
+            # LTX temporal compression is 8x, so overlap pixels / 8 ≈ latent frames
+            num_overlap_latent = prev_window_latent.shape[2]  # Use actual latent frame count
 
         print(f">>> Window {window_idx + 1}: frames {start_frame}-{end_frame}, {window_frames} frames, seed {window_seed}")
 
@@ -3116,6 +3144,10 @@ def sliding_window_generate(
             anchor_interval=args.anchor_interval,
             anchor_strength=args.anchor_strength,
             anchor_decay=args.anchor_decay,
+            # Sliding window overlap conditioning
+            _overlap_latent=overlap_latent,
+            _num_overlap_latent=num_overlap_latent,
+            _overlap_strength=0.95,
             preview_callback=preview_callback,
             preview_callback_interval=args.preview_interval,
         )
