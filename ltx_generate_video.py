@@ -1398,21 +1398,19 @@ class LTXVideoGeneratorWithOffloading:
             self.stage_1_model_ledger.device = torch.device("cpu")
             text_encoder = self.stage_1_model_ledger.text_encoder()
             self.stage_1_model_ledger.device = original_device
-            print(">>> [DEBUG] About to enable text encoder block swap...", flush=True)
 
             # Enable block swap for text encoder
-            print(f">>> Enabling text encoder block swap ({self.text_encoder_blocks_in_memory} layers in GPU)...", flush=True)
+            print(f">>> Enabling text encoder block swap ({self.text_encoder_blocks_in_memory} layers in GPU)...")
             text_encoder_block_swap = enable_text_encoder_block_swap(
                 text_encoder,
                 blocks_in_memory=self.text_encoder_blocks_in_memory,
                 device=self.device,
             )
-            print(">>> [DEBUG] Text encoder block swap enabled", flush=True)
+            print(">>> Text encoder block swap enabled successfully", flush=True)
         else:
             text_encoder = self.stage_1_model_ledger.text_encoder()
-            print(">>> [DEBUG] Text encoder loaded (no block swap)", flush=True)
+            print(">>> Text encoder loaded (no block swap)", flush=True)
 
-        print(f">>> [DEBUG] enhance_prompt={enhance_prompt}", flush=True)
         if enhance_prompt:
             print(">>> Enhancing prompt with Gemma...")
             prompt = generate_enhanced_prompt(
@@ -1420,8 +1418,7 @@ class LTXVideoGeneratorWithOffloading:
             )
             print(f">>> Enhanced prompt: {prompt}")
 
-        print(">>> [DEBUG] About to encode prompts...", flush=True)
-        print(">>> Encoding prompts...", flush=True)
+        print(">>> Encoding prompts...")
         # Encode both prompts if CFG might be used (cfg_guidance_scale > 1)
         # Otherwise only encode positive prompt to save memory/time
         if cfg_guidance_scale > 1.0:
