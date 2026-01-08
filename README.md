@@ -7,7 +7,7 @@ Use with the official ltxv2 models and full gemma text encoder from the main ltx
   
 # These are working settings to get a 609 frame video with a 24gb gpu
   
-![LTX-2 Video Generator](packages/screenshot.png)  
+![LTX-2 Video Generator](packages/screenshot.jpg)  
   
    
       
