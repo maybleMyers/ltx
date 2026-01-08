@@ -486,7 +486,8 @@ def enable_text_encoder_block_swap(
     # Monkey-patch the forward method
     gemma_text_model.forward = types.MethodType(block_swap_forward, gemma_text_model)
 
-    print(f"[TextEncoderBlockSwap] Enabled: {blocks_in_memory}/{num_layers} layers in GPU, {blocks_to_swap} swapping")
+    print(f"[TextEncoderBlockSwap] Enabled: {blocks_in_memory}/{num_layers} layers in GPU, {blocks_to_swap} swapping", flush=True)
+    print("[TextEncoderBlockSwap] Returning offloader...", flush=True)
     return offloader
 
 
