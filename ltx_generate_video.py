@@ -2026,8 +2026,14 @@ class LTXVideoGeneratorWithOffloading:
         )
 
         # Image conditioning for stage 2 (i2v - replaces latent at frame 0)
+        # In refine-only mode, preserve image-conditioned frames without adding noise
+        # by using strength=1.0 (which sets denoise_mask=0 for those frames)
+        if self.refine_only and input_video and images:
+            images_for_conditioning = [(path, idx, 1.0) for path, idx, _ in images]
+        else:
+            images_for_conditioning = images
         stage_2_conditionings = image_conditionings_by_replacing_latent(
-            images=images,
+            images=images_for_conditioning,
             height=stage_2_output_shape.height,
             width=stage_2_output_shape.width,
             video_encoder=video_encoder,
