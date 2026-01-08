@@ -2029,11 +2029,17 @@ class LTXVideoGeneratorWithOffloading:
             images_for_conditioning = [(path, idx, 1.0) for path, idx, _ in images]
         else:
             images_for_conditioning = images
+
+        # Load video encoder for stage 2 image conditioning if needed
+        stage_2_video_encoder = video_encoder
+        if images_for_conditioning and stage_2_video_encoder is None:
+            stage_2_video_encoder = self.stage_1_model_ledger.video_encoder()
+
         stage_2_conditionings = image_conditionings_by_replacing_latent(
             images=images_for_conditioning,
             height=stage_2_output_shape.height,
             width=stage_2_output_shape.width,
-            video_encoder=video_encoder,
+            video_encoder=stage_2_video_encoder,
             dtype=dtype,
             device=self.device,
         )
@@ -2048,11 +2054,14 @@ class LTXVideoGeneratorWithOffloading:
                 images=images,
             )
             if anchor_tuples:
+                # Load video encoder for anchor conditioning if needed
+                if stage_2_video_encoder is None:
+                    stage_2_video_encoder = self.stage_1_model_ledger.video_encoder()
                 anchor_conditionings = image_conditionings_by_adding_guiding_latent(
                     images=anchor_tuples,
                     height=stage_2_output_shape.height,
                     width=stage_2_output_shape.width,
-                    video_encoder=video_encoder,
+                    video_encoder=stage_2_video_encoder,
                     dtype=dtype,
                     device=self.device,
                 )
