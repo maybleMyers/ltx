@@ -34,7 +34,7 @@ from ltx_core.components.guiders import CFGGuider
 from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.components.schedulers import LTX2Scheduler
-from ltx_core.conditioning import VideoConditionByLatentIndex
+from ltx_core.conditioning import AudioConditionByLatent, VideoConditionByLatentIndex
 from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
 from ltx_core.model.audio_vae import AudioProcessor, decode_audio as vae_decode_audio
 from ltx_core.model.upsampler import upsample_video
@@ -702,6 +702,18 @@ Examples:
         action="store_true",
         help="Disable audio generation (video only output).",
     )
+    audio_group.add_argument(
+        "--audio",
+        type=resolve_path,
+        default=None,
+        help="Path to input audio file (wav, mp3, etc.) for audio-conditioned generation.",
+    )
+    audio_group.add_argument(
+        "--audio-strength",
+        type=float,
+        default=1.0,
+        help="Audio conditioning strength (1.0=frozen/exact, 0.0=regenerate). Default: 1.0.",
+    )
 
     # ==========================================================================
     # Pipeline Selection
@@ -1345,6 +1357,8 @@ class LTXVideoGeneratorWithOffloading:
         anchor_interval: int | None = None,
         anchor_strength: float = 0.8,
         anchor_decay: str | None = None,
+        audio: str | None = None,
+        audio_strength: float = 1.0,
         # SVI Pro parameters
         _motion_latent: torch.Tensor | None = None,
         _num_motion_latent: int = 0,
@@ -1744,25 +1758,25 @@ class LTXVideoGeneratorWithOffloading:
                 print(f">>> V2V: Loading and encoding input video with tiled encoding...")
                 v2v_start = time.time()
 
-                # Load input video at stage 1 resolution
+                # Load input video at stage 1 resolution - keep on CPU to save GPU memory
                 video_tensor = load_video_conditioning(
                     video_path=input_video,
                     height=stage_1_output_shape.height,
                     width=stage_1_output_shape.width,
                     frame_cap=num_frames,
                     dtype=dtype,
-                    device=self.device,
+                    device=torch.device("cpu"),
                 )
 
                 # Tiled encoding parameters (matching decoder's default temporal tiling)
                 # tile_size must be 8k+1 for valid VAE input
-                tile_size = 65  # 65 frames = 8 latent frames + 1
-                tile_overlap = 24  # Overlap in pixel frames (must be divisible by 8)
+                # Use small tiles since transformer is already in GPU memory
+                tile_size = 17  # 2 latent frames + 1 - minimal size for memory safety
+                tile_overlap = 8  # Overlap in pixel frames (divisible by 8)
                 tile_stride = tile_size - tile_overlap  # Non-overlapping portion
 
                 actual_frames = video_tensor.shape[2]
                 num_chunks = 0
-                encoded_chunks = []
 
                 # Encode video in overlapping tiles
                 frame_idx = 0
@@ -1777,15 +1791,22 @@ class LTXVideoGeneratorWithOffloading:
                         break
                     chunk_end = frame_idx + valid_frames
 
-                    # Extract and encode chunk
-                    chunk = video_tensor[:, :, frame_idx:chunk_end, :, :]
+                    # Extract chunk and move to GPU for encoding
+                    chunk = video_tensor[:, :, frame_idx:chunk_end, :, :].to(device=self.device, dtype=dtype)
                     with torch.no_grad():
                         encoded_chunk = video_encoder(chunk)
+                    del chunk
+                    torch.cuda.empty_cache()
+
+                    # Move encoded latent to CPU to free GPU memory
+                    encoded_chunk_cpu = encoded_chunk.cpu()
+                    del encoded_chunk
+                    torch.cuda.empty_cache()
 
                     # Add as keyframe conditioning with frame offset
                     stage_1_conditionings.append(
                         VideoConditionByKeyframeIndex(
-                            keyframes=encoded_chunk,
+                            keyframes=encoded_chunk_cpu,
                             frame_idx=frame_idx,
                             strength=refine_strength,
                         )
@@ -1796,6 +1817,9 @@ class LTXVideoGeneratorWithOffloading:
                     frame_idx += tile_stride
                     if frame_idx >= actual_frames - 8:  # Don't create tiny final chunks
                         break
+
+                # Clean up video tensor
+                del video_tensor
 
                 print(f">>> V2V: Added {num_chunks} video conditioning chunks (strength={refine_strength}) in {time.time() - v2v_start:.1f}s")
 
@@ -1874,6 +1898,46 @@ class LTXVideoGeneratorWithOffloading:
                     )
                 print(f">>> Sliding Window: Injected {min(num_overlap_frames, _num_overlap_latent)} overlap latent frames at beginning")
 
+            audio_conditionings = []
+            if audio is not None:
+                print(f">>> Loading and encoding audio from {audio}...")
+                waveform = decode_audio_from_file(audio, self.device)
+                if waveform is not None:
+                    audio_encoder = self.stage_1_model_ledger.audio_encoder()
+                    audio_processor = AudioProcessor(
+                        sample_rate=audio_encoder.sample_rate,
+                        mel_bins=audio_encoder.mel_bins,
+                        mel_hop_length=audio_encoder.mel_hop_length,
+                        n_fft=audio_encoder.n_fft,
+                    ).to(self.device)
+
+                    if waveform.dim() == 3:
+                        num_frames_audio, channels, samples_per_frame = waveform.shape
+                        waveform = waveform.permute(1, 0, 2).reshape(channels, -1).unsqueeze(0)
+                    elif waveform.dim() == 2:
+                        waveform = waveform.unsqueeze(0)
+
+                    sample_rate = 24000
+                    mel_spectrogram = audio_processor.waveform_to_mel(
+                        waveform.to(dtype=torch.float32),
+                        waveform_sample_rate=sample_rate
+                    )
+                    audio_latent = audio_encoder(mel_spectrogram.to(dtype=torch.float32))
+                    audio_latent = audio_latent.to(dtype=dtype)
+
+                    audio_conditionings.append(
+                        AudioConditionByLatent(
+                            latent=audio_latent,
+                            strength=audio_strength,
+                        )
+                    )
+
+                    del audio_encoder, audio_processor
+                    cleanup_memory()
+                    print(f">>> Audio encoded with strength {audio_strength}")
+                else:
+                    print(">>> Warning: Could not load audio file")
+
             stage_label = "One-stage" if self.one_stage else "Stage 1"
             print(f">>> {stage_label}: Generating at {stage_1_output_shape.width}x{stage_1_output_shape.height}...")
             video_state, audio_state = denoise_audio_video(
@@ -1886,6 +1950,7 @@ class LTXVideoGeneratorWithOffloading:
                 components=self.pipeline_components,
                 dtype=dtype,
                 device=self.device,
+                audio_conditionings=audio_conditionings if audio_conditionings else None,
             )
 
             print(f">>> {stage_label} completed in {time.time() - stage1_start:.1f}s", flush=True)
@@ -2276,6 +2341,7 @@ class LTXVideoGeneratorWithOffloading:
                     noise_scale=distilled_sigmas[0],
                     initial_video_latent=upscaled_video_latent,
                     initial_audio_latent=stage_2_initial_audio,
+                    audio_conditionings=audio_conditionings if audio_conditionings else None,
                 )
                 # Success - break out of retry loop
                 break
@@ -2501,6 +2567,8 @@ def generate_svi_multi_clip(
                 anchor_interval=args.anchor_interval if clip_idx > 0 else None,
                 anchor_strength=args.anchor_strength,
                 anchor_decay=args.anchor_decay,
+                audio=args.audio,
+                audio_strength=args.audio_strength,
                 # SVI-specific parameters
                 _motion_latent=prev_motion_latent if clip_idx > 0 else None,
                 _num_motion_latent=num_motion_latent if clip_idx > 0 else 0,
@@ -3318,6 +3386,8 @@ def sliding_window_generate(
             anchor_interval=args.anchor_interval,
             anchor_strength=args.anchor_strength,
             anchor_decay=args.anchor_decay,
+            audio=args.audio,
+            audio_strength=args.audio_strength,
             # Sliding window overlap conditioning
             _overlap_latent=overlap_latent,
             _num_overlap_latent=num_overlap_latent,
@@ -3673,6 +3743,8 @@ def main():
             anchor_interval=args.anchor_interval,
             anchor_strength=args.anchor_strength,
             anchor_decay=args.anchor_decay,
+            audio=args.audio,
+            audio_strength=args.audio_strength,
             preview_callback=preview_callback,
             preview_callback_interval=args.preview_interval,
         )

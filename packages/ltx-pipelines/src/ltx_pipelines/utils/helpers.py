@@ -532,6 +532,7 @@ def denoise_audio_video(  # noqa: PLR0913
     noise_scale: float = 1.0,
     initial_video_latent: torch.Tensor | None = None,
     initial_audio_latent: torch.Tensor | None = None,
+    audio_conditionings: list[ConditioningItem] | None = None,
 ) -> tuple[LatentState, LatentState]:
     video_state, video_tools = noise_video_state(
         output_shape=output_shape,
@@ -546,7 +547,7 @@ def denoise_audio_video(  # noqa: PLR0913
     audio_state, audio_tools = noise_audio_state(
         output_shape=output_shape,
         noiser=noiser,
-        conditionings=[],
+        conditionings=audio_conditionings if audio_conditionings is not None else [],
         components=components,
         dtype=dtype,
         device=device,
