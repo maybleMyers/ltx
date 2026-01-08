@@ -3,7 +3,7 @@ pip install uv
 uv sync
 uv run python lt1.py
 
-Use with the official ltxv2 models and full gemma text encoder from the main ltx page. This repository is under active development and alot of features are quite broken. If you need some helps to get it going I will try...  
+Use with the official ltxv2 models and full gemma text encoder from the main ltx page. This repository is under active development and alot of features are quite broken but the basics should work well. If you need some helps to get it going I will try...  
   
 # These are working settings to get a 609 frame video with a 24gb gpu
   
