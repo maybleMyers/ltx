@@ -1406,10 +1406,8 @@ class LTXVideoGeneratorWithOffloading:
                 blocks_in_memory=self.text_encoder_blocks_in_memory,
                 device=self.device,
             )
-            print(">>> Text encoder block swap enabled successfully", flush=True)
         else:
             text_encoder = self.stage_1_model_ledger.text_encoder()
-            print(">>> Text encoder loaded (no block swap)", flush=True)
 
         if enhance_prompt:
             print(">>> Enhancing prompt with Gemma...")

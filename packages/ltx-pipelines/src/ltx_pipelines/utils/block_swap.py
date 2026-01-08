@@ -443,15 +443,12 @@ def enable_text_encoder_block_swap(
         offloader = self._block_swap_offloader
         blocks = self._blocks_ref
 
-        print(f"[TextEncoderBlockSwap] Starting forward pass through {self.config.num_hidden_layers} layers", flush=True)
         for block_idx, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            print(f"[TextEncoderBlockSwap] Layer {block_idx}: waiting for block...", flush=True)
             # Wait for this block to be ready BEFORE using it
             offloader.wait_for_block(block_idx)
-            print(f"[TextEncoderBlockSwap] Layer {block_idx}: block ready, running forward...", flush=True)
 
             layer_outputs = decoder_layer(
                 hidden_states,
@@ -467,11 +464,9 @@ def enable_text_encoder_block_swap(
             )
 
             hidden_states = layer_outputs[0]
-            print(f"[TextEncoderBlockSwap] Layer {block_idx}: forward done, submitting swap...", flush=True)
 
             # Submit swap for next iteration AFTER using block
             offloader.submit_move_blocks_forward(blocks, block_idx)
-            print(f"[TextEncoderBlockSwap] Layer {block_idx}: swap submitted", flush=True)
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
