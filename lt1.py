@@ -458,6 +458,7 @@ def generate_ltx_video(
     # Generation parameters
     mode: str,
     pipeline: str,
+    enable_sliding_window: bool,
     width: int,
     height: int,
     num_frames: int,
@@ -687,9 +688,11 @@ def generate_ltx_video(
             command.extend(["--freeze-frames", str(int(freeze_frames))])
             command.extend(["--freeze-transition", str(int(freeze_transition))])
 
-        # Sliding window (long video)
-        if sliding_window_size and int(sliding_window_size) > 0:
-            command.extend(["--sliding-window-size", str(int(sliding_window_size))])
+        # Sliding window (long video) - requires explicit enable flag
+        if enable_sliding_window:
+            command.append("--enable-sliding-window")
+            if sliding_window_size and int(sliding_window_size) > 0:
+                command.extend(["--sliding-window-size", str(int(sliding_window_size))])
             command.extend(["--sliding-window-overlap", str(int(sliding_window_overlap))])
             if sliding_window_overlap_noise and float(sliding_window_overlap_noise) > 0:
                 command.extend(["--sliding-window-overlap-noise", str(float(sliding_window_overlap_noise))])
@@ -1241,6 +1244,11 @@ def create_interface():
                                     choices=["two-stage", "one-stage", "refine-only"],
                                     value="two-stage",
                                     info="two-stage = higher quality, one-stage = faster, refine-only = stage 2 only on input video"
+                                )
+                                enable_sliding_window = gr.Checkbox(
+                                    label="Sliding Window",
+                                    value=False,
+                                    info="Enable for long videos (>129 frames)"
                                 )
                             # Hidden state for original image/video dimensions
                             original_dims = gr.State(value="")
@@ -1860,7 +1868,7 @@ def create_interface():
                 prompt, negative_prompt,
                 checkpoint_path, distilled_checkpoint, stage2_checkpoint, gemma_root, spatial_upsampler_path,
                 distilled_lora_path, distilled_lora_strength,
-                mode, pipeline, width, height, num_frames, frame_rate,
+                mode, pipeline, enable_sliding_window, width, height, num_frames, frame_rate,
                 cfg_guidance_scale, num_inference_steps, stage2_steps, seed,
                 input_image, image_frame_idx, image_strength,
                 end_image, end_image_strength,
