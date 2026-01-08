@@ -1737,11 +1737,10 @@ class LTXVideoGeneratorWithOffloading:
                     stage_1_conditionings = stage_1_conditionings + anchor_conditionings
                     print(f">>> Added {len(anchor_conditionings)} anchor points at frames {[t[1] for t in anchor_tuples]}")
 
-            # V2V: Add video conditioning from input video (like ic_lora pipeline)
-            # Uses VideoConditionByKeyframeIndex to append encoded video tokens
+            # V2V: Add keyframe conditionings from input video
+            # Encodes every 8th frame to avoid OOM on long videos
             if input_video and not self.refine_only:
-                from ltx_core.conditioning import VideoConditionByKeyframeIndex
-                print(f">>> V2V: Loading and encoding input video...")
+                print(f">>> V2V: Loading and encoding input video keyframes...")
                 v2v_start = time.time()
 
                 # Load input video at stage 1 resolution
@@ -1754,18 +1753,41 @@ class LTXVideoGeneratorWithOffloading:
                     device=self.device,
                 )
 
-                # Encode entire video and append as conditioning (like ic_lora.py)
-                with torch.no_grad():
-                    encoded_video = video_encoder(video_tensor)
+                # Extract and encode keyframes every 8 frames (like refine-only mode)
+                latent_stride = 8
+                actual_frames = video_tensor.shape[2]
 
-                stage_1_conditionings.append(
-                    VideoConditionByKeyframeIndex(
-                        keyframes=encoded_video,
-                        frame_idx=0,
-                        strength=refine_strength,
+                # Get latent indices already covered by --image args (don't duplicate)
+                image_latent_indices = set()
+                if images:
+                    for _, frame_idx, _ in images:
+                        image_latent_indices.add(frame_idx // latent_stride)
+
+                v2v_conditionings = []
+                for frame_idx in range(0, actual_frames, latent_stride):
+                    latent_idx = frame_idx // latent_stride
+
+                    # Skip frames already covered by --image conditionings
+                    if latent_idx in image_latent_indices:
+                        continue
+
+                    # Extract single frame: video_tensor is [1, C, F, H, W]
+                    frame = video_tensor[:, :, frame_idx:frame_idx+1, :, :]
+
+                    # Encode frame to latent
+                    with torch.no_grad():
+                        encoded_frame = video_encoder(frame)
+
+                    v2v_conditionings.append(
+                        VideoConditionByLatentIndex(
+                            latent=encoded_frame,
+                            strength=refine_strength,
+                            latent_idx=latent_idx,
+                        )
                     )
-                )
-                print(f">>> V2V: Added video conditioning (strength={refine_strength}) in {time.time() - v2v_start:.1f}s")
+
+                stage_1_conditionings = stage_1_conditionings + v2v_conditionings
+                print(f">>> V2V: Added {len(v2v_conditionings)} keyframe conditionings (strength={refine_strength}) in {time.time() - v2v_start:.1f}s")
 
             # SVI Pro: Add motion latent conditionings
             if _motion_latent is not None and _num_motion_latent > 0:
@@ -2136,11 +2158,10 @@ class LTXVideoGeneratorWithOffloading:
                 )
                 stage_2_conditionings = stage_2_conditionings + anchor_conditionings
 
-        # V2V: Add video conditioning from input video for stage 2 (at full resolution)
-        # Uses VideoConditionByKeyframeIndex to append encoded video tokens (like ic_lora.py)
+        # V2V: Add keyframe conditionings from input video for stage 2 (at full resolution)
+        # Encodes every 8th frame to avoid OOM on long videos
         if input_video and not self.refine_only:
-            from ltx_core.conditioning import VideoConditionByKeyframeIndex
-            print(f">>> V2V Stage 2: Loading and encoding input video at full resolution...")
+            print(f">>> V2V Stage 2: Loading and encoding input video keyframes at full resolution...")
             v2v_stage2_start = time.time()
 
             # Load video encoder for v2v if needed
@@ -2157,18 +2178,38 @@ class LTXVideoGeneratorWithOffloading:
                 device=self.device,
             )
 
-            # Encode entire video and append as conditioning (like ic_lora.py)
-            with torch.no_grad():
-                encoded_video_s2 = stage_2_video_encoder(video_tensor_s2)
+            # Extract and encode keyframes every 8 frames
+            latent_stride = 8
+            actual_frames = video_tensor_s2.shape[2]
 
-            stage_2_conditionings.append(
-                VideoConditionByKeyframeIndex(
-                    keyframes=encoded_video_s2,
-                    frame_idx=0,
-                    strength=refine_strength,
+            # Get latent indices already covered by --image args
+            image_latent_indices = set()
+            if images:
+                for _, frame_idx, _ in images:
+                    image_latent_indices.add(frame_idx // latent_stride)
+
+            v2v_stage2_conditionings = []
+            for frame_idx in range(0, actual_frames, latent_stride):
+                latent_idx = frame_idx // latent_stride
+
+                if latent_idx in image_latent_indices:
+                    continue
+
+                frame = video_tensor_s2[:, :, frame_idx:frame_idx+1, :, :]
+
+                with torch.no_grad():
+                    encoded_frame = stage_2_video_encoder(frame)
+
+                v2v_stage2_conditionings.append(
+                    VideoConditionByLatentIndex(
+                        latent=encoded_frame,
+                        strength=refine_strength,
+                        latent_idx=latent_idx,
+                    )
                 )
-            )
-            print(f">>> V2V Stage 2: Added video conditioning (strength={refine_strength}) in {time.time() - v2v_stage2_start:.1f}s")
+
+            stage_2_conditionings = stage_2_conditionings + v2v_stage2_conditionings
+            print(f">>> V2V Stage 2: Added {len(v2v_stage2_conditionings)} keyframe conditionings in {time.time() - v2v_stage2_start:.1f}s")
 
         # SVI Pro: Add motion latent conditionings for stage 2
         if _motion_latent is not None and _num_motion_latent > 0:
