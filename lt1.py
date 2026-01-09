@@ -12,7 +12,6 @@ Gradio-based web interface for LTX-2 video generation with:
 
 import os
 import sys
-import select
 import signal
 
 # Try to use local patched gradio from modules/ if available (allows jobs to continue after browser disconnect)
@@ -717,12 +716,16 @@ def generate_ltx_video(
         try:
             start_time = time.perf_counter()
 
+            # Use PYTHONUNBUFFERED to ensure subprocess output isn't block-buffered
+            env = os.environ.copy()
+            env["PYTHONUNBUFFERED"] = "1"
             process = subprocess.Popen(
                 command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
-                bufsize=1
+                bufsize=1,
+                env=env
             )
 
             current_process = process
@@ -732,23 +735,24 @@ def generate_ltx_video(
 
             while True:
                 if stop_event.is_set():
-                    process.kill()
-                    process.wait()
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
                     current_process = None
                     yield all_generated_videos, [], "Generation stopped by user.", ""
                     return
 
-                # Non-blocking read with select (0.1s timeout)
-                ready, _, _ = select.select([process.stdout], [], [], 0.1)
-                if ready:
-                    line = process.stdout.readline()
+                # Read output line by line (blocking but with PYTHONUNBUFFERED)
+                line = process.stdout.readline()
+                if line:
+                    line = line.strip()
                     if line:
-                        line = line.strip()
-                        if line:
-                            print(line)
-                            parsed = parse_ltx_progress_line(line)
-                            if parsed:
-                                last_progress = parsed
+                        print(line)
+                        parsed = parse_ltx_progress_line(line)
+                        if parsed:
+                            last_progress = parsed
 
                 # Check for preview updates
                 if enable_preview and preview_mp4_path:
@@ -1088,13 +1092,17 @@ def generate_svi_ltx_video(
             script_dir = os.path.dirname(os.path.abspath(__file__))
             print(f">>> Running from: {script_dir}")
 
+            # Use PYTHONUNBUFFERED to ensure subprocess output isn't block-buffered
+            env = os.environ.copy()
+            env["PYTHONUNBUFFERED"] = "1"
             process = subprocess.Popen(
                 command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
-                cwd=script_dir  # Run from the script directory
+                cwd=script_dir,  # Run from the script directory
+                env=env
             )
 
             current_process = process
@@ -1104,23 +1112,24 @@ def generate_svi_ltx_video(
 
             while True:
                 if stop_event.is_set():
-                    process.kill()
-                    process.wait()
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
                     current_process = None
                     yield all_generated_videos, [], "Generation stopped by user.", ""
                     return
 
-                # Non-blocking read with select (0.1s timeout)
-                ready, _, _ = select.select([process.stdout], [], [], 0.1)
-                if ready:
-                    line = process.stdout.readline()
+                # Read output line by line (blocking but with PYTHONUNBUFFERED)
+                line = process.stdout.readline()
+                if line:
+                    line = line.strip()
                     if line:
-                        line = line.strip()
-                        if line:
-                            print(line)
-                            progress_info = parse_ltx_progress_line(line)
-                            if progress_info:
-                                last_progress = progress_info
+                        print(line)
+                        progress_info = parse_ltx_progress_line(line)
+                        if progress_info:
+                            last_progress = progress_info
 
                 # Check for preview updates
                 if enable_preview and preview_mp4_path:

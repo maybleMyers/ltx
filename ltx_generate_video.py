@@ -1390,7 +1390,7 @@ class LTXVideoGeneratorWithOffloading:
         # =====================================================================
         # Phase 1: Text Encoding
         # =====================================================================
-        print(">>> Loading text encoder...")
+        print(">>> Loading text encoder...", flush=True)
         text_encoder_block_swap = None
         if self.enable_text_encoder_block_swap:
             # Load text encoder to CPU first for block swapping
@@ -1400,7 +1400,7 @@ class LTXVideoGeneratorWithOffloading:
             self.stage_1_model_ledger.device = original_device
 
             # Enable block swap for text encoder
-            print(f">>> Enabling text encoder block swap ({self.text_encoder_blocks_in_memory} layers in GPU)...")
+            print(f">>> Enabling text encoder block swap ({self.text_encoder_blocks_in_memory} layers in GPU)...", flush=True)
             text_encoder_block_swap = enable_text_encoder_block_swap(
                 text_encoder,
                 blocks_in_memory=self.text_encoder_blocks_in_memory,
@@ -1586,12 +1586,56 @@ class LTXVideoGeneratorWithOffloading:
             # For block swapping, load transformer to CPU first, then selectively move blocks
             block_swap_manager = None
             if self.enable_dit_block_swap:
-                print(f">>> Loading DiT transformer to CPU for block swapping...")
-                # Temporarily override device to load to CPU
-                original_device = self.stage_1_model_ledger.device
-                self.stage_1_model_ledger.device = torch.device("cpu")
-                transformer = self.stage_1_model_ledger.transformer()
-                self.stage_1_model_ledger.device = original_device
+                print(f">>> Loading DiT transformer for block swapping...", flush=True)
+                # Check if there are LoRAs to apply
+                has_loras = hasattr(self.stage_1_model_ledger, 'loras') and self.stage_1_model_ledger.loras
+
+                if has_loras:
+                    # Use chunked GPU LoRA application (like stage 2) to avoid slow CPU computation
+                    # 1. Create a ledger WITHOUT LoRAs to load base model quickly
+                    stage_1_ledger_no_lora = ModelLedger(
+                        dtype=self.dtype,
+                        device=torch.device("cpu"),
+                        checkpoint_path=self.stage_1_model_ledger.checkpoint_path,
+                        gemma_root_path=self.stage_1_model_ledger.gemma_root_path,
+                        spatial_upsampler_path=self.stage_1_model_ledger.spatial_upsampler_path,
+                        loras=(),  # No LoRAs - load base model only
+                        fp8transformer=self.stage_1_model_ledger.fp8transformer,
+                    )
+
+                    # 2. Load transformer without LoRAs (fast)
+                    print(">>> Loading base transformer to CPU...", flush=True)
+                    transformer = stage_1_ledger_no_lora.transformer()
+
+                    # 3. Apply LoRAs using chunked GPU computation
+                    loras = self.stage_1_model_ledger.loras
+                    print(f">>> Applying {len(loras)} LoRA(s) using chunked GPU computation...", flush=True)
+                    from ltx_core.loader.sft_loader import SafetensorsStateDictLoader
+                    lora_loader = SafetensorsStateDictLoader()
+                    lora_state_dicts = []
+                    lora_strengths = []
+                    for lora in loras:
+                        lora_sd = lora_loader.load(lora.path, sd_ops=lora.sd_ops, device=torch.device("cpu"))
+                        lora_state_dicts.append(lora_sd)
+                        lora_strengths.append(lora.strength)
+
+                    apply_loras_chunked_gpu(
+                        model=transformer,
+                        lora_state_dicts=lora_state_dicts,
+                        lora_strengths=lora_strengths,
+                        gpu_device=self.device,
+                        dtype=self.dtype,
+                    )
+
+                    # Clean up LoRA state dicts
+                    del lora_state_dicts
+                    synchronize_and_cleanup()
+                else:
+                    # No LoRAs - load directly to CPU
+                    original_device = self.stage_1_model_ledger.device
+                    self.stage_1_model_ledger.device = torch.device("cpu")
+                    transformer = self.stage_1_model_ledger.transformer()
+                    self.stage_1_model_ledger.device = original_device
 
                 # Move non-block components to GPU, keep blocks on CPU
                 print(f">>> Enabling DiT block swapping ({self.dit_blocks_in_memory} blocks in GPU)...")
