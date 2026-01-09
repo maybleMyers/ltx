@@ -236,11 +236,27 @@ def decode_audio_from_file(path: str, device: torch.device) -> tuple[torch.Tenso
         audio = []
         audio_stream = next(s for s in container.streams if s.type == "audio")
         sample_rate = audio_stream.rate
+
+        # Create resampler to convert to float planar format (normalized -1.0 to 1.0)
+        resampler = av.AudioResampler(format='fltp', layout=audio_stream.layout, rate=sample_rate)
+
         for frame in container.decode(audio_stream):
-            audio.append(torch.tensor(frame.to_ndarray(), dtype=torch.float32, device=device).unsqueeze(0))
+            # Resample to float format
+            resampled_frames = resampler.resample(frame)
+            for resampled_frame in resampled_frames:
+                audio.append(torch.tensor(resampled_frame.to_ndarray(), dtype=torch.float32, device=device).unsqueeze(0))
+
+        # Flush the resampler
+        resampled_frames = resampler.resample(None)
+        for resampled_frame in resampled_frames:
+            if resampled_frame is not None:
+                audio.append(torch.tensor(resampled_frame.to_ndarray(), dtype=torch.float32, device=device).unsqueeze(0))
+
         container.close()
         # Concatenate along samples dimension (last dim) since chunks may have different sizes
         audio = torch.cat(audio, dim=-1)
+        # Debug: print audio range to verify normalization
+        print(f">>> [Audio Debug] shape={audio.shape}, min={audio.min().item():.4f}, max={audio.max().item():.4f}, mean={audio.mean().item():.4f}")
         # Convert mono to stereo if needed (model expects 2 channels)
         if audio.shape[1] == 1:
             audio = audio.repeat(1, 2, 1)
