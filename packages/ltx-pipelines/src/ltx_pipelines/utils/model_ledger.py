@@ -228,7 +228,14 @@ class ModelLedger:
                 "ModelLedger constructor."
             )
 
-        return self.text_encoder_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device).eval()
+        print(f">>> [DEBUG] Building text encoder on {self._target_device()}...", flush=True)
+        model = self.text_encoder_builder.build(device=self._target_device(), dtype=self.dtype)
+        print(f">>> [DEBUG] Build complete, moving to {self.device}...", flush=True)
+        model = model.to(self.device)
+        print(">>> [DEBUG] Move complete, setting eval mode...", flush=True)
+        model = model.eval()
+        print(">>> [DEBUG] Text encoder ready", flush=True)
+        return model
 
     def audio_decoder(self) -> AudioDecoder:
         if not hasattr(self, "audio_decoder_builder"):

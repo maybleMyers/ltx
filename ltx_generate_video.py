@@ -701,6 +701,18 @@ Examples:
         action="store_true",
         help="Disable audio generation (video only output).",
     )
+    audio_group.add_argument(
+        "--audio",
+        type=resolve_path,
+        default=None,
+        help="Path to input audio file (wav, mp3, etc.) for audio-conditioned generation.",
+    )
+    audio_group.add_argument(
+        "--audio-strength",
+        type=float,
+        default=1.0,
+        help="Audio conditioning strength (1.0=frozen/exact, 0.0=regenerate). Default: 1.0.",
+    )
 
     # ==========================================================================
     # Pipeline Selection
@@ -1118,17 +1130,22 @@ def encode_video_chunked(
     video_tensor: torch.Tensor,
     video_encoder,
     chunk_frames: int = 65,  # 8*8 + 1
-    overlap_frames: int = 8,
+    overlap_frames: int = 8,  # kept for API compatibility, but we use context_frames internally
 ) -> torch.Tensor:
     """
     Encode video in temporal chunks to reduce memory usage.
-    Uses trapezoidal blending for smooth transitions.
+
+    Uses autoregressive chunking to handle the causal VAE encoder properly:
+    - The VAE encoder uses causal convolutions where each frame depends on previous frames
+    - For chunks after the first, we include context frames and discard the corresponding
+      latent tokens (the "warm-up" region where the encoder lacks sufficient context)
+    - This avoids blending artifacts from mismatched latents at chunk boundaries
 
     Args:
         video_tensor: Shape (1, C, F, H, W) normalized video
         video_encoder: VideoEncoder model
         chunk_frames: Frames per chunk (must be 8*k+1)
-        overlap_frames: Overlap between chunks (must be multiple of 8)
+        overlap_frames: Legacy parameter, context_frames is used internally
 
     Returns:
         Encoded latent tensor (1, latent_channels, F', H', W')
@@ -1141,44 +1158,53 @@ def encode_video_chunked(
 
     # Validate
     assert (chunk_frames - 1) % 8 == 0, "chunk_frames must be 8*k+1"
-    assert overlap_frames % 8 == 0, "overlap must be multiple of 8"
 
-    # Calculate latent overlap (temporal compression is 8x)
-    latent_overlap = overlap_frames // 8
+    # Context frames for causal encoder warm-up (must be 8*k for clean latent boundaries)
+    # Using 24 frames (3 latent tokens) provides enough context for the encoder's receptive field
+    context_frames = 24
+    context_latents = context_frames // 8  # 3 latent tokens to discard
 
-    # Collect chunks
-    chunks_info = []  # (start_frame, end_frame, pad_frames)
-    start = 0
-    while start < total_frames:
-        end = min(start + chunk_frames, total_frames)
+    # Calculate how many new frames each chunk contributes (excluding context)
+    new_frames_per_chunk = chunk_frames - context_frames  # e.g., 65 - 24 = 41 frames
+    new_latents_per_chunk = new_frames_per_chunk // 8  # e.g., 41 // 8 = 5 latent tokens
+
+    # Build chunk list: (start_frame, end_frame, is_first)
+    chunks_info = []
+
+    # First chunk: starts at 0, uses all latent tokens
+    first_end = min(chunk_frames, total_frames)
+    chunks_info.append((0, first_end, True))
+
+    # Subsequent chunks: start with context overlap, discard context latents
+    current_frame = first_end - context_frames  # Where the next chunk's "new" content starts
+    while current_frame + context_frames < total_frames:
+        chunk_start = current_frame  # Include context frames
+        chunk_end = min(chunk_start + chunk_frames, total_frames)
+        chunks_info.append((chunk_start, chunk_end, False))
+        current_frame = chunk_end - context_frames
+
+    print(f">>> Encoding {len(chunks_info)} chunk(s) with {context_frames}-frame context...")
+
+    # Encode chunks and collect latent segments
+    latent_segments = []
+
+    for i, (start, end, is_first) in enumerate(chunks_info):
         actual_frames = end - start
 
-        # Pad last chunk if needed to satisfy 8*k+1
+        # Pad if needed to satisfy 8*k+1
         if (actual_frames - 1) % 8 != 0:
-            # Find next valid size
             target = 8 * ((actual_frames - 1) // 8 + 1) + 1
             pad_frames = target - actual_frames
-            chunks_info.append((start, end, pad_frames))
         else:
-            chunks_info.append((start, end, 0))
+            pad_frames = 0
 
-        # Move to next chunk
-        if end >= total_frames:
-            break
-        start = end - overlap_frames
-
-    print(f">>> Encoding {len(chunks_info)} chunk(s) of {chunk_frames} frames each...")
-
-    # Encode each chunk
-    latent_chunks = []
-    for i, (start, end, pad) in enumerate(chunks_info):
         print(f">>> Encoding chunk {i+1}/{len(chunks_info)} (frames {start}-{end})...")
         chunk = video_tensor[:, :, start:end, :, :]
 
         # Pad if necessary
-        if pad > 0:
+        if pad_frames > 0:
             last_frame = chunk[:, :, -1:, :, :]
-            padding = last_frame.expand(-1, -1, pad, -1, -1)
+            padding = last_frame.expand(-1, -1, pad_frames, -1, -1)
             chunk = torch.cat([chunk, padding], dim=2)
 
         # Encode
@@ -1186,60 +1212,41 @@ def encode_video_chunked(
             latent = video_encoder(chunk)
 
         # Remove padded latent tokens if we padded
-        if pad > 0:
-            valid_tokens = (end - start - 1) // 8 + 1
+        if pad_frames > 0:
+            valid_tokens = (actual_frames - 1) // 8 + 1
             latent = latent[:, :, :valid_tokens, :, :]
 
-        latent_chunks.append(latent)
+        # For first chunk: use all latent tokens
+        # For subsequent chunks: discard context latents (warm-up region)
+        if is_first:
+            latent_segments.append(latent)
+        else:
+            # Discard the first context_latents tokens (the warm-up region)
+            if latent.shape[2] > context_latents:
+                latent_segments.append(latent[:, :, context_latents:, :, :])
+            # If chunk is very short, it might be entirely context - skip it
 
         # Free memory
         del chunk
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    # Combine chunks with blending
-    if len(latent_chunks) == 1:
-        return latent_chunks[0]
+    # Concatenate all segments directly (no blending needed with this approach)
+    if len(latent_segments) == 1:
+        result = latent_segments[0]
+    else:
+        result = torch.cat(latent_segments, dim=2)
 
-    # Calculate total latent frames
+    # Trim to exact expected length
     total_latent_frames = (total_frames - 1) // 8 + 1
-    result_shape = list(latent_chunks[0].shape)
-    result_shape[2] = total_latent_frames
-    result = torch.zeros(result_shape, dtype=latent_chunks[0].dtype, device=latent_chunks[0].device)
-    weight_sum = torch.zeros(total_latent_frames, dtype=torch.float32, device=result.device)
-
-    latent_pos = 0
-    for i, latent in enumerate(latent_chunks):
-        chunk_len = latent.shape[2]
-
-        # Create weight mask
-        weight = torch.ones(chunk_len, device=latent.device)
-
-        # Fade in for non-first chunks
-        if i > 0 and latent_overlap > 0:
-            fade_in = torch.linspace(0, 1, latent_overlap + 1, device=latent.device)[1:]
-            weight[:latent_overlap] = fade_in
-
-        # Fade out for non-last chunks
-        if i < len(latent_chunks) - 1 and latent_overlap > 0:
-            fade_out = torch.linspace(1, 0, latent_overlap + 1, device=latent.device)[1:]
-            weight[-latent_overlap:] = fade_out
-
-        # Add weighted latent to result
-        end_pos = min(latent_pos + chunk_len, total_latent_frames)
-        actual_len = end_pos - latent_pos
-
-        weight_expanded = weight[:actual_len].view(1, 1, actual_len, 1, 1)
-        result[:, :, latent_pos:end_pos, :, :] += latent[:, :, :actual_len, :, :] * weight_expanded
-        weight_sum[latent_pos:end_pos] += weight[:actual_len]
-
-        # Move position (accounting for overlap)
-        if i < len(latent_chunks) - 1:
-            latent_pos = latent_pos + chunk_len - latent_overlap
-
-    # Normalize by weight sum
-    weight_sum = weight_sum.clamp(min=1e-8).view(1, 1, -1, 1, 1)
-    result = result / weight_sum
+    if result.shape[2] > total_latent_frames:
+        result = result[:, :, :total_latent_frames, :, :]
+    elif result.shape[2] < total_latent_frames:
+        # Pad with last token if we're short (shouldn't happen with correct chunking)
+        pad_latents = total_latent_frames - result.shape[2]
+        last_latent = result[:, :, -1:, :, :]
+        padding = last_latent.expand(-1, -1, pad_latents, -1, -1)
+        result = torch.cat([result, padding], dim=2)
 
     return result
 
@@ -1349,6 +1356,8 @@ class LTXVideoGeneratorWithOffloading:
         anchor_interval: int | None = None,
         anchor_strength: float = 0.8,
         anchor_decay: str | None = None,
+        audio: str | None = None,
+        audio_strength: float = 1.0,
         # SVI Pro parameters
         _motion_latent: torch.Tensor | None = None,
         _num_motion_latent: int = 0,
@@ -1359,12 +1368,12 @@ class LTXVideoGeneratorWithOffloading:
         # Preview callback
         preview_callback: Callable | None = None,
         preview_callback_interval: int = 1,
-    ) -> tuple[Iterator[torch.Tensor], torch.Tensor | None]:
+    ) -> tuple[Iterator[torch.Tensor], torch.Tensor | None, str | None]:
         """
         Generate video with optional audio.
 
         Returns:
-            Tuple of (video_iterator, audio_tensor or None)
+            Tuple of (video_iterator, audio_tensor or None, enhanced_prompt or None)
         """
         # Validate resolution
         assert_resolution(height=height, width=width, is_two_stage=not self.one_stage)
@@ -1400,11 +1409,14 @@ class LTXVideoGeneratorWithOffloading:
         else:
             text_encoder = self.stage_1_model_ledger.text_encoder()
 
+        # Track the enhanced prompt for metadata (None if not enhanced)
+        enhanced_prompt = None
         if enhance_prompt:
             print(">>> Enhancing prompt with Gemma...")
             prompt = generate_enhanced_prompt(
                 text_encoder, prompt, images[0][0] if len(images) > 0 else None, seed=seed
             )
+            enhanced_prompt = prompt
             print(f">>> Enhanced prompt: {prompt}")
 
         print(">>> Encoding prompts...")
@@ -1440,13 +1452,16 @@ class LTXVideoGeneratorWithOffloading:
         # =====================================================================
         # Refine-only mode: Skip stage 1 and use input video directly
         # =====================================================================
+        # Store keyframe conditionings for refine-only mode (populated below if needed)
+        refine_keyframe_conditionings = []
+
         if self.refine_only and input_video:
-            print(">>> Refine-only mode: Loading and encoding input video...")
+            print(">>> Refine-only mode: Loading input video and creating keyframe conditionings...")
             refine_start = time.time()
 
             video_encoder = self.stage_1_model_ledger.video_encoder()
 
-            # Load and encode input video (using chunked encoding to manage memory)
+            # Load input video
             video_tensor = load_video_conditioning(
                 video_path=input_video,
                 height=height,
@@ -1455,14 +1470,51 @@ class LTXVideoGeneratorWithOffloading:
                 dtype=dtype,
                 device=self.device,
             )
-            upscaled_video_latent = encode_video_chunked(
-                video_tensor=video_tensor,
-                video_encoder=video_encoder,
-                chunk_frames=65,  # 8*8 + 1 frames per chunk
-                overlap_frames=8,  # 1 latent token overlap
-            )
-            # Ensure video latent is in the correct dtype for the pipeline
-            upscaled_video_latent = upscaled_video_latent.to(dtype=dtype)
+
+            # Use keyframe conditioning approach (like Wan2GP) instead of encoding whole video
+            # This avoids chunked encoding glitches from the causal VAE encoder
+            # Extract every 8th frame and create conditionings with strength=1.0
+            latent_stride = 8
+            actual_frames = video_tensor.shape[2]
+
+            # Get latent indices already covered by --image args (don't duplicate conditioning)
+            image_latent_indices = set()
+            if images:
+                for _, frame_idx, _ in images:
+                    image_latent_indices.add(frame_idx // latent_stride)
+
+            print(f">>> Creating keyframe conditionings for {actual_frames} frames (every {latent_stride} frames)...")
+            if image_latent_indices:
+                print(f">>> Skipping latent indices {sorted(image_latent_indices)} (covered by --image)")
+
+            from ltx_core.conditioning import VideoConditionByLatentIndex
+            for frame_idx in range(0, actual_frames, latent_stride):
+                latent_idx = frame_idx // latent_stride
+
+                # Skip frames already covered by --image conditionings
+                if latent_idx in image_latent_indices:
+                    continue
+
+                # Extract single frame: video_tensor is [1, C, F, H, W]
+                frame = video_tensor[:, :, frame_idx:frame_idx+1, :, :]  # [1, C, 1, H, W]
+
+                # Encode frame to latent
+                with torch.no_grad():
+                    encoded_frame = video_encoder(frame)
+
+                # Create conditioning with strength=1.0 to preserve frame exactly
+                refine_keyframe_conditionings.append(
+                    VideoConditionByLatentIndex(
+                        latent=encoded_frame,
+                        strength=1.0,
+                        latent_idx=latent_idx,
+                    )
+                )
+
+            print(f">>> Created {len(refine_keyframe_conditionings)} keyframe conditionings")
+
+            # No initial video latent - using keyframe conditionings instead
+            upscaled_video_latent = None
 
             # Extract and encode audio from input video (like stage 1 would)
             audio_latent = None
@@ -1470,10 +1522,9 @@ class LTXVideoGeneratorWithOffloading:
                 print(">>> Encoding audio from input video...")
 
                 # Extract audio waveform from input video
-                waveform = decode_audio_from_file(input_video, self.device)
+                waveform, sample_rate = decode_audio_from_file(input_video, self.device)
 
                 if waveform is not None:
-                    import av
                     audio_encoder = self.stage_1_model_ledger.audio_encoder()
 
                     # Create audio processor with encoder's parameters
@@ -1485,7 +1536,7 @@ class LTXVideoGeneratorWithOffloading:
                     ).to(self.device)
 
                     # Reshape waveform to [batch, channels, total_samples]
-                    # decode_audio_from_file returns [num_frames, channels, samples_per_frame]
+                    # decode_audio_from_file returns [1, channels, total_samples]
                     if waveform.dim() == 3:
                         # Flatten frames into samples: [num_frames, channels, samples] -> [1, channels, total_samples]
                         num_frames_audio, channels, samples_per_frame = waveform.shape
@@ -1493,12 +1544,6 @@ class LTXVideoGeneratorWithOffloading:
                     elif waveform.dim() == 2:
                         # [channels, samples] -> [1, channels, samples]
                         waveform = waveform.unsqueeze(0)
-
-                    # Get sample rate from the video file
-                    container = av.open(input_video)
-                    audio_stream = next(s for s in container.streams if s.type == "audio")
-                    sample_rate = audio_stream.sample_rate
-                    container.close()
 
                     # Convert waveform to mel spectrogram (use float32 for audio quality)
                     mel_spectrogram = audio_processor.waveform_to_mel(
@@ -1701,6 +1746,117 @@ class LTXVideoGeneratorWithOffloading:
                     stage_1_conditionings = stage_1_conditionings + anchor_conditionings
                     print(f">>> Added {len(anchor_conditionings)} anchor points at frames {[t[1] for t in anchor_tuples]}")
 
+            # V2V: Add video conditioning from input video (like ic_lora pipeline)
+            # Uses tiled encoding to handle long videos without OOM
+            v2v_audio_latent = None  # Will be set if input_video has audio
+            if input_video and not self.refine_only:
+                from ltx_core.conditioning import VideoConditionByKeyframeIndex
+                print(f">>> V2V: Loading and encoding input video with tiled encoding...")
+                v2v_start = time.time()
+
+                # Load input video at stage 1 resolution - keep on CPU to save GPU memory
+                video_tensor = load_video_conditioning(
+                    video_path=input_video,
+                    height=stage_1_output_shape.height,
+                    width=stage_1_output_shape.width,
+                    frame_cap=num_frames,
+                    dtype=dtype,
+                    device=torch.device("cpu"),
+                )
+
+                # Tiled encoding parameters (matching decoder's default temporal tiling)
+                # tile_size must be 8k+1 for valid VAE input
+                # Use small tiles since transformer is already in GPU memory
+                tile_size = 17  # 2 latent frames + 1 - minimal size for memory safety
+                tile_overlap = 8  # Overlap in pixel frames (divisible by 8)
+                tile_stride = tile_size - tile_overlap  # Non-overlapping portion
+
+                actual_frames = video_tensor.shape[2]
+                num_chunks = 0
+
+                # Encode video in overlapping tiles
+                frame_idx = 0
+                while frame_idx < actual_frames:
+                    # Calculate chunk bounds
+                    chunk_end = min(frame_idx + tile_size, actual_frames)
+                    chunk_frames = chunk_end - frame_idx
+
+                    # Ensure valid frame count (8k+1) for VAE
+                    valid_frames = ((chunk_frames - 1) // 8) * 8 + 1
+                    if valid_frames < 9:  # Need at least 9 frames for meaningful encoding
+                        break
+                    chunk_end = frame_idx + valid_frames
+
+                    # Extract chunk and move to GPU for encoding
+                    chunk = video_tensor[:, :, frame_idx:chunk_end, :, :].to(device=self.device, dtype=dtype)
+                    with torch.no_grad():
+                        encoded_chunk = video_encoder(chunk)
+                    del chunk
+                    torch.cuda.empty_cache()
+
+                    # Move encoded latent to CPU to free GPU memory
+                    encoded_chunk_cpu = encoded_chunk.cpu()
+                    del encoded_chunk
+                    torch.cuda.empty_cache()
+
+                    # Add as keyframe conditioning with frame offset
+                    stage_1_conditionings.append(
+                        VideoConditionByKeyframeIndex(
+                            keyframes=encoded_chunk_cpu,
+                            frame_idx=frame_idx,
+                            strength=refine_strength,
+                        )
+                    )
+                    num_chunks += 1
+
+                    # Move to next tile (with overlap)
+                    frame_idx += tile_stride
+                    if frame_idx >= actual_frames - 8:  # Don't create tiny final chunks
+                        break
+
+                # Clean up video tensor
+                del video_tensor
+
+                print(f">>> V2V: Added {num_chunks} video conditioning chunks (strength={refine_strength}) in {time.time() - v2v_start:.1f}s")
+
+                # Extract and encode audio from input video to preserve it
+                if not disable_audio:
+                    print(">>> V2V: Extracting audio from input video...")
+                    waveform, sample_rate = decode_audio_from_file(input_video, self.device)
+
+                    if waveform is not None:
+                        audio_encoder = self.stage_1_model_ledger.audio_encoder()
+
+                        audio_processor = AudioProcessor(
+                            sample_rate=audio_encoder.sample_rate,
+                            mel_bins=audio_encoder.mel_bins,
+                            mel_hop_length=audio_encoder.mel_hop_length,
+                            n_fft=audio_encoder.n_fft,
+                        ).to(self.device)
+
+                        if waveform.dim() == 3:
+                            num_frames_audio, channels, samples_per_frame = waveform.shape
+                            waveform = waveform.permute(1, 0, 2).reshape(channels, -1).unsqueeze(0)
+                        elif waveform.dim() == 2:
+                            waveform = waveform.unsqueeze(0)
+
+                        mel_spectrogram = audio_processor.waveform_to_mel(
+                            waveform.to(dtype=torch.float32),
+                            waveform_sample_rate=sample_rate
+                        )
+
+                        v2v_audio_latent = audio_encoder(mel_spectrogram.to(dtype=torch.float32))
+                        v2v_audio_latent = v2v_audio_latent.to(dtype=dtype)
+
+                        del audio_encoder, audio_processor
+                        cleanup_memory()
+                        print(">>> V2V: Audio extracted and encoded successfully")
+                    else:
+                        v2v_audio_latent = None
+                        print(">>> V2V: Input video has no audio track")
+                else:
+                    v2v_audio_latent = None
+
             # SVI Pro: Add motion latent conditionings
             if _motion_latent is not None and _num_motion_latent > 0:
                 motion_cond = VideoConditionByMotionLatent(
@@ -1718,7 +1874,7 @@ class LTXVideoGeneratorWithOffloading:
 
             # Sliding Window: Add overlap latent conditionings at the BEGINNING of the sequence
             if _overlap_latent is not None and _num_overlap_latent > 0:
-                from ltx_core.conditioning.types.latent_cond import VideoConditionByLatentIndex
+                from ltx_core.conditioning import VideoConditionByLatentIndex
                 overlap_latent_tensor = _overlap_latent.to(device=self.device, dtype=dtype)
                 num_overlap_frames = overlap_latent_tensor.shape[2]
 
@@ -1733,6 +1889,46 @@ class LTXVideoGeneratorWithOffloading:
                     )
                 print(f">>> Sliding Window: Injected {min(num_overlap_frames, _num_overlap_latent)} overlap latent frames at beginning")
 
+            audio_conditionings = []
+            if audio is not None:
+                from ltx_core.conditioning import AudioConditionByLatent
+                print(f">>> Loading and encoding audio from {audio}...")
+                waveform, sample_rate = decode_audio_from_file(audio, self.device)
+                if waveform is not None:
+                    audio_encoder = self.stage_1_model_ledger.audio_encoder()
+                    audio_processor = AudioProcessor(
+                        sample_rate=audio_encoder.sample_rate,
+                        mel_bins=audio_encoder.mel_bins,
+                        mel_hop_length=audio_encoder.mel_hop_length,
+                        n_fft=audio_encoder.n_fft,
+                    ).to(self.device)
+
+                    if waveform.dim() == 3:
+                        num_frames_audio, channels, samples_per_frame = waveform.shape
+                        waveform = waveform.permute(1, 0, 2).reshape(channels, -1).unsqueeze(0)
+                    elif waveform.dim() == 2:
+                        waveform = waveform.unsqueeze(0)
+
+                    mel_spectrogram = audio_processor.waveform_to_mel(
+                        waveform.to(dtype=torch.float32),
+                        waveform_sample_rate=sample_rate
+                    )
+                    audio_latent = audio_encoder(mel_spectrogram.to(dtype=torch.float32))
+                    audio_latent = audio_latent.to(dtype=dtype)
+
+                    audio_conditionings.append(
+                        AudioConditionByLatent(
+                            latent=audio_latent,
+                            strength=audio_strength,
+                        )
+                    )
+
+                    del audio_encoder, audio_processor
+                    cleanup_memory()
+                    print(f">>> Audio encoded with strength {audio_strength} (sample rate: {sample_rate}Hz)")
+                else:
+                    print(">>> Warning: Could not load audio file")
+
             stage_label = "One-stage" if self.one_stage else "Stage 1"
             print(f">>> {stage_label}: Generating at {stage_1_output_shape.width}x{stage_1_output_shape.height}...")
             video_state, audio_state = denoise_audio_video(
@@ -1745,6 +1941,7 @@ class LTXVideoGeneratorWithOffloading:
                 components=self.pipeline_components,
                 dtype=dtype,
                 device=self.device,
+                audio_conditionings=audio_conditionings if audio_conditionings else None,
             )
 
             print(f">>> {stage_label} completed in {time.time() - stage1_start:.1f}s", flush=True)
@@ -1798,7 +1995,7 @@ class LTXVideoGeneratorWithOffloading:
                 print(f">>> Decoding completed in {time.time() - decode_start:.1f}s")
                 print(f">>> Total generation time: {time.time() - start_time:.1f}s")
 
-                return decoded_video, decoded_audio
+                return decoded_video, decoded_audio, enhanced_prompt
 
             # =====================================================================
             # Phase 3: Spatial Upsampling (two-stage only)
@@ -2026,11 +2223,23 @@ class LTXVideoGeneratorWithOffloading:
         )
 
         # Image conditioning for stage 2 (i2v - replaces latent at frame 0)
+        # In refine-only mode, preserve image-conditioned frames without adding noise
+        # by using strength=1.0 (which sets denoise_mask=0 for those frames)
+        if self.refine_only and input_video and images:
+            images_for_conditioning = [(path, idx, 1.0) for path, idx, _ in images]
+        else:
+            images_for_conditioning = images
+
+        # Load video encoder for stage 2 image conditioning if needed
+        stage_2_video_encoder = video_encoder
+        if images_for_conditioning and stage_2_video_encoder is None:
+            stage_2_video_encoder = self.stage_1_model_ledger.video_encoder()
+
         stage_2_conditionings = image_conditionings_by_replacing_latent(
-            images=images,
+            images=images_for_conditioning,
             height=stage_2_output_shape.height,
             width=stage_2_output_shape.width,
-            video_encoder=video_encoder,
+            video_encoder=stage_2_video_encoder,
             dtype=dtype,
             device=self.device,
         )
@@ -2045,15 +2254,21 @@ class LTXVideoGeneratorWithOffloading:
                 images=images,
             )
             if anchor_tuples:
+                # Load video encoder for anchor conditioning if needed
+                if stage_2_video_encoder is None:
+                    stage_2_video_encoder = self.stage_1_model_ledger.video_encoder()
                 anchor_conditionings = image_conditionings_by_adding_guiding_latent(
                     images=anchor_tuples,
                     height=stage_2_output_shape.height,
                     width=stage_2_output_shape.width,
-                    video_encoder=video_encoder,
+                    video_encoder=stage_2_video_encoder,
                     dtype=dtype,
                     device=self.device,
                 )
                 stage_2_conditionings = stage_2_conditionings + anchor_conditionings
+
+        # Note: V2V video conditioning is NOT applied to stage 2 (matching ic_lora.py)
+        # Stage 2 only refines the upscaled latent from stage 1 - video guidance already applied there
 
         # SVI Pro: Add motion latent conditionings for stage 2
         if _motion_latent is not None and _num_motion_latent > 0:
@@ -2069,14 +2284,28 @@ class LTXVideoGeneratorWithOffloading:
             )
             stage_2_conditionings = stage_2_conditionings + motion_conditionings
 
+        # Refine-only mode: Add keyframe conditionings from input video
+        # This uses every 8th frame as conditioning with strength=1.0
+        # to guide generation while avoiding chunked encoding glitches
+        if refine_keyframe_conditionings:
+            stage_2_conditionings = stage_2_conditionings + refine_keyframe_conditionings
+            print(f">>> Added {len(refine_keyframe_conditionings)} keyframe conditionings from input video")
+
         # Note: Overlap latent conditioning is only applied in stage 1.
         # Stage 2 operates at full resolution while overlap latent is encoded at stage 1 resolution.
         # Stage 1 conditioning is sufficient for establishing coherence.
 
         print(f">>> Stage 2: Refining at {stage_2_output_shape.width}x{stage_2_output_shape.height}...")
         # For refine-only mode, use audio_latent from input video encoding
-        # For normal two-stage, use audio_state.latent from stage 1
-        stage_2_initial_audio = audio_latent if (self.refine_only and input_video) else audio_state.latent
+        # For v2v mode, use v2v_audio_latent if available
+        # For normal generation, use audio_state.latent from stage 1
+        if self.refine_only and input_video:
+            stage_2_initial_audio = audio_latent
+        elif v2v_audio_latent is not None:
+            stage_2_initial_audio = v2v_audio_latent
+            print(">>> Using audio from input video")
+        else:
+            stage_2_initial_audio = audio_state.latent
 
         # OOM retry loop - reduces blocks in GPU until denoising succeeds
         current_blocks = self.refiner_blocks_in_memory
@@ -2103,6 +2332,7 @@ class LTXVideoGeneratorWithOffloading:
                     noise_scale=distilled_sigmas[0],
                     initial_video_latent=upscaled_video_latent,
                     initial_audio_latent=stage_2_initial_audio,
+                    audio_conditionings=audio_conditionings if audio_conditionings else None,
                 )
                 # Success - break out of retry loop
                 break
@@ -2191,7 +2421,7 @@ class LTXVideoGeneratorWithOffloading:
         print(f">>> Decoding completed in {time.time() - decode_start:.1f}s")
         print(f">>> Total generation time: {time.time() - start_time:.1f}s")
 
-        return decoded_video, decoded_audio
+        return decoded_video, decoded_audio, enhanced_prompt
 
 
 # =============================================================================
@@ -2309,7 +2539,7 @@ def generate_svi_multi_clip(
                 )
 
             # Generate this clip
-            video_iterator, audio = generator.generate(
+            video_iterator, audio, _ = generator.generate(
                 prompt=clip_prompt,
                 negative_prompt=args.negative_prompt,
                 seed=clip_seed,
@@ -2328,6 +2558,8 @@ def generate_svi_multi_clip(
                 anchor_interval=args.anchor_interval if clip_idx > 0 else None,
                 anchor_strength=args.anchor_strength,
                 anchor_decay=args.anchor_decay,
+                audio=args.audio,
+                audio_strength=args.audio_strength,
                 # SVI-specific parameters
                 _motion_latent=prev_motion_latent if clip_idx > 0 else None,
                 _num_motion_latent=num_motion_latent if clip_idx > 0 else 0,
@@ -3081,8 +3313,9 @@ def sliding_window_generate(
         if (window_frames - 1) % 8 != 0:
             window_frames = ((window_frames - 1) // 8 + 1) * 8 + 1
 
-        # Calculate seed for this window
-        window_seed = args.seed + window_idx * 42
+        # Use same seed for all windows to maintain coherence
+        # The overlap latent conditioning handles continuity between windows
+        window_seed = args.seed
 
         # Build conditionings for this window
         window_images = list(args.images) if args.images else []
@@ -3125,7 +3358,7 @@ def sliding_window_generate(
             )
 
         # Generate this window
-        video_iterator, audio = generator.generate(
+        video_iterator, audio, _ = generator.generate(
             prompt=args.prompt,
             negative_prompt=args.negative_prompt,
             seed=window_seed,
@@ -3144,6 +3377,8 @@ def sliding_window_generate(
             anchor_interval=args.anchor_interval,
             anchor_strength=args.anchor_strength,
             anchor_decay=args.anchor_decay,
+            audio=args.audio,
+            audio_strength=args.audio_strength,
             # Sliding window overlap conditioning
             _overlap_latent=overlap_latent,
             _num_overlap_latent=num_overlap_latent,
@@ -3216,7 +3451,8 @@ def sliding_window_generate(
                 all_audio_chunks.append(audio)
             else:
                 samples_to_skip = overlap * samples_per_frame
-                all_audio_chunks.append(audio[samples_to_skip:])
+                # Audio is [channels, samples], so slice along dim=1
+                all_audio_chunks.append(audio[:, samples_to_skip:])
 
     # Concatenate all windows
     print("=" * 60)
@@ -3228,7 +3464,8 @@ def sliding_window_generate(
     if final_video.shape[0] > total_frames:
         final_video = final_video[:total_frames]
 
-    final_audio = torch.cat(all_audio_chunks, dim=0) if all_audio_chunks else None
+    # Audio is [channels, samples], concatenate along samples dimension (dim=1)
+    final_audio = torch.cat(all_audio_chunks, dim=1) if all_audio_chunks else None
 
     print(f">>> Final video shape: {final_video.shape}")
     if final_audio is not None:
@@ -3365,6 +3602,9 @@ def main():
         and not args.extend_video
     )
 
+    # Track enhanced prompt for metadata (only set in regular generation mode)
+    enhanced_prompt = None
+
     # Branch between sliding window, SVI Pro mode, and regular mode
     if use_sliding_window:
         # Sliding window mode for long videos
@@ -3475,7 +3715,7 @@ def main():
                 latent_width=lw,
             )
 
-        video, audio = generator.generate(
+        video, audio, enhanced_prompt = generator.generate(
             prompt=args.prompt,
             negative_prompt=args.negative_prompt,
             seed=args.seed,
@@ -3497,6 +3737,8 @@ def main():
             anchor_interval=args.anchor_interval,
             anchor_strength=args.anchor_strength,
             anchor_decay=args.anchor_decay,
+            audio=args.audio,
+            audio_strength=args.audio_strength,
             preview_callback=preview_callback,
             preview_callback_interval=args.preview_interval,
         )
@@ -3553,7 +3795,10 @@ def main():
         "anchor_strength": args.anchor_strength if args.anchor_interval else None,
         "anchor_decay": args.anchor_decay if args.anchor_interval and args.anchor_decay != "none" else None,
         "disable_audio": args.disable_audio,
+        "audio": args.audio,
+        "audio_strength": args.audio_strength if args.audio else None,
         "enhance_prompt": args.enhance_prompt,
+        "enhanced_prompt": enhanced_prompt,
         # SVI Pro metadata
         "svi_mode": args.svi_mode,
         "svi_num_clips": args.num_clips if (args.svi_mode or args.extend_video) else None,
