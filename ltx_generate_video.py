@@ -637,7 +637,16 @@ Examples:
         nargs="+",
         metavar=("PATH", "STRENGTH"),
         default=[],
-        help="User LoRA: path and optional strength (default: 1.0). Can be repeated.",
+        help="User LoRA for stage 1 (base generation): path and optional strength. Can be repeated.",
+    )
+    lora_group.add_argument(
+        "--stage2-lora",
+        dest="stage2_loras",
+        action=LoraAction,
+        nargs="+",
+        metavar=("PATH", "STRENGTH"),
+        default=[],
+        help="User LoRA for stage 2 (refinement) only: path and optional strength. Can be repeated.",
     )
 
     # ==========================================================================
@@ -1270,6 +1279,7 @@ class LTXVideoGeneratorWithOffloading:
         spatial_upsampler_path: str,
         gemma_root: str,
         loras: list[LoraPathStrengthAndSDOps],
+        stage2_loras: list[LoraPathStrengthAndSDOps] = None,
         device: str = None,
         fp8transformer: bool = False,
         offload: bool = False,
@@ -1316,7 +1326,8 @@ class LTXVideoGeneratorWithOffloading:
         self._stage_2_checkpoint_path = stage2_checkpoint if stage2_checkpoint else checkpoint_path
         self._stage_2_gemma_root = gemma_root
         self._stage_2_spatial_upsampler_path = spatial_upsampler_path
-        self._stage_2_loras = loras
+        # Stage 2 gets stage2_loras (user LoRAs for stage 2 only), not the stage 1 loras
+        self._stage_2_loras = stage2_loras or []
         self._stage_2_distilled_lora = distilled_lora
         self._stage_2_fp8transformer = fp8transformer
 
@@ -3621,6 +3632,7 @@ def main():
         spatial_upsampler_path=args.spatial_upsampler_path,
         gemma_root=args.gemma_root,
         loras=args.loras,
+        stage2_loras=args.stage2_loras,
         fp8transformer=args.enable_fp8,
         offload=args.offload,
         enable_dit_block_swap=args.enable_dit_block_swap,

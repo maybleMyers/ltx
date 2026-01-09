@@ -502,6 +502,7 @@ def generate_ltx_video(
     lora_folder: str,
     user_lora: str,
     user_lora_strength: float,
+    user_lora_stage: str,
     # Output
     save_path: str,
     batch_size: int,
@@ -648,11 +649,17 @@ def generate_ltx_video(
             if anchor_decay and anchor_decay != "none":
                 command.extend(["--anchor-decay", str(anchor_decay)])
 
-        # User LoRA
+        # User LoRA - apply to selected stage(s)
         if user_lora and user_lora != "None" and lora_folder:
             lora_path = os.path.join(lora_folder, user_lora)
             if os.path.exists(lora_path):
-                command.extend(["--lora", lora_path, str(user_lora_strength)])
+                if user_lora_stage == "Stage 1 (Base)":
+                    command.extend(["--lora", lora_path, str(user_lora_strength)])
+                elif user_lora_stage == "Stage 2 (Refine)":
+                    command.extend(["--stage2-lora", lora_path, str(user_lora_strength)])
+                else:  # "Both"
+                    command.extend(["--lora", lora_path, str(user_lora_strength)])
+                    command.extend(["--stage2-lora", lora_path, str(user_lora_strength)])
 
         # Audio handling
         if audio_input and os.path.exists(audio_input):
@@ -1440,6 +1447,13 @@ def create_interface():
                                     minimum=0.0, maximum=2.0, value=1.0, step=0.1,
                                     label="Strength", scale=1
                                 )
+                                user_lora_stage = gr.Dropdown(
+                                    label="Stage",
+                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Both"],
+                                    value="Stage 2 (Refine)",
+                                    scale=1,
+                                    info="Which pass to apply LoRA"
+                                )
                         # Memory Optimization
                         with gr.Accordion("Model settings", open=True):
                             with gr.Row():
@@ -1909,7 +1923,7 @@ def create_interface():
                 enable_dit_block_swap, dit_blocks_in_memory,
                 enable_text_encoder_block_swap, text_encoder_blocks_in_memory,
                 enable_refiner_block_swap, refiner_blocks_in_memory,
-                lora_folder, user_lora, user_lora_strength,
+                lora_folder, user_lora, user_lora_strength, user_lora_stage,
                 save_path, batch_size,
                 # Preview Generation
                 enable_preview, preview_interval,
@@ -2188,7 +2202,7 @@ def create_interface():
             enable_text_encoder_block_swap, text_encoder_blocks_in_memory,
             enable_refiner_block_swap, refiner_blocks_in_memory,
             # LoRA
-            lora_folder, user_lora, user_lora_strength,
+            lora_folder, user_lora, user_lora_strength, user_lora_stage,
             # Output
             save_path, batch_size,
             # Scale slider
@@ -2219,7 +2233,7 @@ def create_interface():
             "enable_text_encoder_block_swap", "text_encoder_blocks_in_memory",
             "enable_refiner_block_swap", "refiner_blocks_in_memory",
             # LoRA
-            "lora_folder", "user_lora", "user_lora_strength",
+            "lora_folder", "user_lora", "user_lora_strength", "user_lora_stage",
             # Output
             "save_path", "batch_size",
             # Scale slider
