@@ -239,6 +239,9 @@ def decode_audio_from_file(path: str, device: torch.device) -> torch.Tensor | No
         container.close()
         # Concatenate along samples dimension (last dim) since chunks may have different sizes
         audio = torch.cat(audio, dim=-1)
+        # Convert mono to stereo if needed (model expects 2 channels)
+        if audio.shape[1] == 1:
+            audio = audio.repeat(1, 2, 1)
     except StopIteration:
         audio = None
     finally:
