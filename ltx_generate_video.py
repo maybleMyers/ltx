@@ -1519,10 +1519,9 @@ class LTXVideoGeneratorWithOffloading:
                 print(">>> Encoding audio from input video...")
 
                 # Extract audio waveform from input video
-                waveform = decode_audio_from_file(input_video, self.device)
+                waveform, sample_rate = decode_audio_from_file(input_video, self.device)
 
                 if waveform is not None:
-                    import av
                     audio_encoder = self.stage_1_model_ledger.audio_encoder()
 
                     # Create audio processor with encoder's parameters
@@ -1534,7 +1533,7 @@ class LTXVideoGeneratorWithOffloading:
                     ).to(self.device)
 
                     # Reshape waveform to [batch, channels, total_samples]
-                    # decode_audio_from_file returns [num_frames, channels, samples_per_frame]
+                    # decode_audio_from_file returns [1, channels, total_samples]
                     if waveform.dim() == 3:
                         # Flatten frames into samples: [num_frames, channels, samples] -> [1, channels, total_samples]
                         num_frames_audio, channels, samples_per_frame = waveform.shape
@@ -1542,12 +1541,6 @@ class LTXVideoGeneratorWithOffloading:
                     elif waveform.dim() == 2:
                         # [channels, samples] -> [1, channels, samples]
                         waveform = waveform.unsqueeze(0)
-
-                    # Get sample rate from the video file
-                    container = av.open(input_video)
-                    audio_stream = next(s for s in container.streams if s.type == "audio")
-                    sample_rate = audio_stream.sample_rate
-                    container.close()
 
                     # Convert waveform to mel spectrogram (use float32 for audio quality)
                     mel_spectrogram = audio_processor.waveform_to_mel(
@@ -1826,10 +1819,9 @@ class LTXVideoGeneratorWithOffloading:
                 # Extract and encode audio from input video to preserve it
                 if not disable_audio:
                     print(">>> V2V: Extracting audio from input video...")
-                    waveform = decode_audio_from_file(input_video, self.device)
+                    waveform, sample_rate = decode_audio_from_file(input_video, self.device)
 
                     if waveform is not None:
-                        import av
                         audio_encoder = self.stage_1_model_ledger.audio_encoder()
 
                         audio_processor = AudioProcessor(
@@ -1844,11 +1836,6 @@ class LTXVideoGeneratorWithOffloading:
                             waveform = waveform.permute(1, 0, 2).reshape(channels, -1).unsqueeze(0)
                         elif waveform.dim() == 2:
                             waveform = waveform.unsqueeze(0)
-
-                        container = av.open(input_video)
-                        audio_stream = next(s for s in container.streams if s.type == "audio")
-                        sample_rate = audio_stream.sample_rate
-                        container.close()
 
                         mel_spectrogram = audio_processor.waveform_to_mel(
                             waveform.to(dtype=torch.float32),
@@ -1903,7 +1890,7 @@ class LTXVideoGeneratorWithOffloading:
             if audio is not None:
                 from ltx_core.conditioning import AudioConditionByLatent
                 print(f">>> Loading and encoding audio from {audio}...")
-                waveform = decode_audio_from_file(audio, self.device)
+                waveform, sample_rate = decode_audio_from_file(audio, self.device)
                 if waveform is not None:
                     audio_encoder = self.stage_1_model_ledger.audio_encoder()
                     audio_processor = AudioProcessor(
@@ -1919,7 +1906,6 @@ class LTXVideoGeneratorWithOffloading:
                     elif waveform.dim() == 2:
                         waveform = waveform.unsqueeze(0)
 
-                    sample_rate = 24000
                     mel_spectrogram = audio_processor.waveform_to_mel(
                         waveform.to(dtype=torch.float32),
                         waveform_sample_rate=sample_rate
@@ -1936,7 +1922,7 @@ class LTXVideoGeneratorWithOffloading:
 
                     del audio_encoder, audio_processor
                     cleanup_memory()
-                    print(f">>> Audio encoded with strength {audio_strength}")
+                    print(f">>> Audio encoded with strength {audio_strength} (sample rate: {sample_rate}Hz)")
                 else:
                     print(">>> Warning: Could not load audio file")
 

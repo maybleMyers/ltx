@@ -229,11 +229,13 @@ def encode_video(
     container.close()
 
 
-def decode_audio_from_file(path: str, device: torch.device) -> torch.Tensor | None:
+def decode_audio_from_file(path: str, device: torch.device) -> tuple[torch.Tensor | None, int | None]:
     container = av.open(path)
+    sample_rate = None
     try:
         audio = []
         audio_stream = next(s for s in container.streams if s.type == "audio")
+        sample_rate = audio_stream.rate
         for frame in container.decode(audio_stream):
             audio.append(torch.tensor(frame.to_ndarray(), dtype=torch.float32, device=device).unsqueeze(0))
         container.close()
@@ -247,7 +249,7 @@ def decode_audio_from_file(path: str, device: torch.device) -> torch.Tensor | No
     finally:
         container.close()
 
-    return audio
+    return audio, sample_rate
 
 
 def decode_video_from_file(path: str, frame_cap: int, device: DeviceLikeType) -> Generator[torch.Tensor]:
