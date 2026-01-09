@@ -1368,12 +1368,12 @@ class LTXVideoGeneratorWithOffloading:
         # Preview callback
         preview_callback: Callable | None = None,
         preview_callback_interval: int = 1,
-    ) -> tuple[Iterator[torch.Tensor], torch.Tensor | None]:
+    ) -> tuple[Iterator[torch.Tensor], torch.Tensor | None, str | None]:
         """
         Generate video with optional audio.
 
         Returns:
-            Tuple of (video_iterator, audio_tensor or None)
+            Tuple of (video_iterator, audio_tensor or None, enhanced_prompt or None)
         """
         # Validate resolution
         assert_resolution(height=height, width=width, is_two_stage=not self.one_stage)
@@ -1409,11 +1409,14 @@ class LTXVideoGeneratorWithOffloading:
         else:
             text_encoder = self.stage_1_model_ledger.text_encoder()
 
+        # Track the enhanced prompt for metadata (None if not enhanced)
+        enhanced_prompt = None
         if enhance_prompt:
             print(">>> Enhancing prompt with Gemma...")
             prompt = generate_enhanced_prompt(
                 text_encoder, prompt, images[0][0] if len(images) > 0 else None, seed=seed
             )
+            enhanced_prompt = prompt
             print(f">>> Enhanced prompt: {prompt}")
 
         print(">>> Encoding prompts...")
@@ -1992,7 +1995,7 @@ class LTXVideoGeneratorWithOffloading:
                 print(f">>> Decoding completed in {time.time() - decode_start:.1f}s")
                 print(f">>> Total generation time: {time.time() - start_time:.1f}s")
 
-                return decoded_video, decoded_audio
+                return decoded_video, decoded_audio, enhanced_prompt
 
             # =====================================================================
             # Phase 3: Spatial Upsampling (two-stage only)
@@ -2418,7 +2421,7 @@ class LTXVideoGeneratorWithOffloading:
         print(f">>> Decoding completed in {time.time() - decode_start:.1f}s")
         print(f">>> Total generation time: {time.time() - start_time:.1f}s")
 
-        return decoded_video, decoded_audio
+        return decoded_video, decoded_audio, enhanced_prompt
 
 
 # =============================================================================
@@ -2536,7 +2539,7 @@ def generate_svi_multi_clip(
                 )
 
             # Generate this clip
-            video_iterator, audio = generator.generate(
+            video_iterator, audio, _ = generator.generate(
                 prompt=clip_prompt,
                 negative_prompt=args.negative_prompt,
                 seed=clip_seed,
@@ -3355,7 +3358,7 @@ def sliding_window_generate(
             )
 
         # Generate this window
-        video_iterator, audio = generator.generate(
+        video_iterator, audio, _ = generator.generate(
             prompt=args.prompt,
             negative_prompt=args.negative_prompt,
             seed=window_seed,
@@ -3599,6 +3602,9 @@ def main():
         and not args.extend_video
     )
 
+    # Track enhanced prompt for metadata (only set in regular generation mode)
+    enhanced_prompt = None
+
     # Branch between sliding window, SVI Pro mode, and regular mode
     if use_sliding_window:
         # Sliding window mode for long videos
@@ -3709,7 +3715,7 @@ def main():
                 latent_width=lw,
             )
 
-        video, audio = generator.generate(
+        video, audio, enhanced_prompt = generator.generate(
             prompt=args.prompt,
             negative_prompt=args.negative_prompt,
             seed=args.seed,
@@ -3789,7 +3795,10 @@ def main():
         "anchor_strength": args.anchor_strength if args.anchor_interval else None,
         "anchor_decay": args.anchor_decay if args.anchor_interval and args.anchor_decay != "none" else None,
         "disable_audio": args.disable_audio,
+        "audio": args.audio,
+        "audio_strength": args.audio_strength if args.audio else None,
         "enhance_prompt": args.enhance_prompt,
+        "enhanced_prompt": enhanced_prompt,
         # SVI Pro metadata
         "svi_mode": args.svi_mode,
         "svi_num_clips": args.num_clips if (args.svi_mode or args.extend_video) else None,
