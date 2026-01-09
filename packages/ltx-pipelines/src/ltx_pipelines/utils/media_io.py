@@ -237,7 +237,8 @@ def decode_audio_from_file(path: str, device: torch.device) -> torch.Tensor | No
         for frame in container.decode(audio_stream):
             audio.append(torch.tensor(frame.to_ndarray(), dtype=torch.float32, device=device).unsqueeze(0))
         container.close()
-        audio = torch.cat(audio)
+        # Concatenate along samples dimension (last dim) since chunks may have different sizes
+        audio = torch.cat(audio, dim=-1)
     except StopIteration:
         audio = None
     finally:
