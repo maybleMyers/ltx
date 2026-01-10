@@ -3730,11 +3730,11 @@ def generate_av_extension(
     ) -> tuple[LatentState, LatentState]:
         # Apply custom video mask
         # The mask determines which regions get denoised (1) vs preserved (0)
+        # Note: clean_latent is already properly set from initial_video_latent by denoise_audio_video
         video_mask_flat = video_mask.reshape(-1, 1)[:video_state.denoise_mask.shape[0], :]
         video_state_masked = dataclass_replace(
             video_state,
             denoise_mask=video_mask_flat.to(device=device, dtype=dtype),
-            clean_latent=extended_video_latent.flatten(2).permute(0, 2, 1).reshape(-1, video_state.latent.shape[-1]),
         )
 
         # Apply custom audio mask if audio exists
@@ -3743,7 +3743,6 @@ def generate_av_extension(
             audio_state_masked = dataclass_replace(
                 audio_state,
                 denoise_mask=audio_mask_flat.to(device=device, dtype=dtype),
-                clean_latent=extended_audio_latent.flatten(2).permute(0, 2, 1).reshape(-1, audio_state.latent.shape[-1]),
             )
         else:
             audio_state_masked = audio_state
