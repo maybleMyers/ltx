@@ -3698,9 +3698,10 @@ def generate_av_extension(
 
     # Create output shape
     output_shape = VideoPixelShape(
+        batch=1,
+        frames=output_frames,
         height=stage1_height,
         width=stage1_width,
-        frames=output_frames,
         fps=output_fps,
     )
 
@@ -3916,11 +3917,11 @@ def generate_av_extension(
 
         # 9D: Create stage 2 output shape (full resolution)
         stage2_output_shape = VideoPixelShape(
+            batch=1,
+            frames=output_frames,
             height=args.height,  # Full resolution
             width=args.width,
-            frames=output_frames,
             fps=output_fps,
-            batch=1,
         )
 
         # 9E: Prepare stage 2 denoising components
