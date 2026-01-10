@@ -3382,21 +3382,59 @@ def generate_av_extension(
 
     video_encoder = generator.stage_1_model_ledger.video_encoder()
 
+    # Get the encoder's dtype (usually bfloat16)
+    encoder_dtype = next(video_encoder.parameters()).dtype
+
+    # Get VAE temporal scale factor
+    time_scale_factor = video_encoder.downscale_index_formula[0] if hasattr(video_encoder, 'downscale_index_formula') else 8
+
     # Convert from [F, H, W, C] to [1, C, F, H, W] and normalize to [-1, 1]
     video_input = input_frames_tensor.permute(3, 0, 1, 2).unsqueeze(0)  # [1, C, F, H, W]
     video_input = video_input * 2.0 - 1.0  # Normalize to [-1, 1]
 
-    # Get the encoder's dtype (usually bfloat16)
-    encoder_dtype = next(video_encoder.parameters()).dtype
+    # Encode in temporal chunks to avoid OOM
+    # Each chunk should be 8*k+1 frames to align with latent structure
+    chunk_pixel_frames = 65  # 8*8+1 = 65 frames per chunk (gives 9 latent frames)
+    total_pixel_frames = video_input.shape[2]
+
+    latent_chunks = []
+    chunk_idx = 0
 
     with torch.no_grad():
-        video_latent = video_encoder(video_input.to(device=device, dtype=encoder_dtype))
-        video_latent = video_latent.to(dtype=dtype)
+        for start_frame in range(0, total_pixel_frames, chunk_pixel_frames - 1):  # Overlap by 1 frame for continuity
+            end_frame = min(start_frame + chunk_pixel_frames, total_pixel_frames)
+            actual_frames = end_frame - start_frame
 
+            # Ensure we have at least 9 frames (minimum for VAE)
+            if actual_frames < 9:
+                # Pad with last frame
+                pad_frames = 9 - actual_frames
+                chunk = video_input[:, :, start_frame:end_frame, :, :]
+                last_frame = chunk[:, :, -1:, :, :].expand(-1, -1, pad_frames, -1, -1)
+                chunk = torch.cat([chunk, last_frame], dim=2)
+            else:
+                chunk = video_input[:, :, start_frame:end_frame, :, :]
+
+            # Encode chunk
+            chunk_latent = video_encoder(chunk.to(device=device, dtype=encoder_dtype))
+            chunk_latent = chunk_latent.to(dtype=dtype)
+
+            # For overlapping chunks, skip the first latent frame (except for first chunk)
+            if chunk_idx > 0 and len(latent_chunks) > 0:
+                chunk_latent = chunk_latent[:, :, 1:, :, :]
+
+            latent_chunks.append(chunk_latent)
+            chunk_idx += 1
+
+            print(f">>> Encoded chunk {chunk_idx}: frames {start_frame}-{end_frame} -> {chunk_latent.shape[2]} latent frames")
+
+            # Clear cache between chunks
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    # Concatenate all chunks
+    video_latent = torch.cat(latent_chunks, dim=2)
     print(f">>> Video latent shape: {video_latent.shape}")
-
-    # Get VAE temporal scale factor
-    time_scale_factor = video_encoder.downscale_index_formula[0] if hasattr(video_encoder, 'downscale_index_formula') else 8
 
     # Encode audio
     audio_latent = None
