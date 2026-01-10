@@ -1880,6 +1880,20 @@ class LTXVideoGeneratorWithOffloading:
                     waveform, sample_rate = decode_audio_from_file(input_video, self.device)
 
                     if waveform is not None:
+                        # Calculate expected audio duration and trim/pad waveform to match
+                        expected_duration = float(num_frames) / float(frame_rate)
+                        expected_samples = int(expected_duration * sample_rate)
+
+                        # Trim waveform if longer than expected
+                        if waveform.shape[-1] > expected_samples:
+                            waveform = waveform[..., :expected_samples]
+                            print(f">>> V2V: Trimmed audio to {expected_samples} samples ({expected_duration:.3f}s)")
+                        elif waveform.shape[-1] < expected_samples:
+                            # Pad waveform if shorter than expected
+                            padding = expected_samples - waveform.shape[-1]
+                            waveform = torch.nn.functional.pad(waveform, (0, padding))
+                            print(f">>> V2V: Padded audio by {padding} samples to {expected_samples} total ({expected_duration:.3f}s)")
+
                         audio_encoder = self.stage_1_model_ledger.audio_encoder()
 
                         audio_processor = AudioProcessor(
