@@ -97,6 +97,21 @@ def parse_ltx_progress_line(line: str) -> Optional[str]:
         return "Decoding audio..."
     if ">>> Encoding video" in line:
         return "Encoding video to MP4..."
+    # AV Extension mode
+    if "AV Extension Mode" in line:
+        return "AV Extension: Starting..."
+    if "[AV Extension] Video mask" in line:
+        return "AV Extension: Creating video mask..."
+    if "[AV Extension] Audio mask" in line:
+        return "AV Extension: Creating audio mask..."
+    if ">>> Running masked denoising" in line:
+        return "AV Extension: Masked denoising..."
+    if ">>> Creating extended latent" in line:
+        return "AV Extension: Creating extended latent space..."
+    if ">>> Extracting audio from input" in line:
+        return "AV Extension: Extracting audio..."
+    if ">>> Encoding video to latent" in line:
+        return "AV Extension: Encoding video to latent..."
     if ">>> Done!" in line:
         return "Generation complete!"
     if ">>> Total generation time" in line:
@@ -517,6 +532,14 @@ def generate_ltx_video(
     sliding_window_overlap: int,
     sliding_window_overlap_noise: float,
     sliding_window_color_correction: float,
+    # AV Extension (Time-Based Audio-Video Continuation)
+    av_extend_video: str,
+    av_extend_start_time: float,
+    av_extend_end_time: float,
+    av_extend_steps: int,
+    av_extend_terminal: float,
+    av_slope_len: int,
+    av_no_stage2: bool,
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     """
     Generate video using LTX-2 pipeline.
@@ -713,6 +736,19 @@ def generate_ltx_video(
                 command.extend(["--sliding-window-overlap-noise", str(float(sliding_window_overlap_noise))])
             if sliding_window_color_correction and float(sliding_window_color_correction) > 0:
                 command.extend(["--sliding-window-color-correction", str(float(sliding_window_color_correction))])
+
+        # AV Extension (time-based audio-video continuation)
+        if av_extend_video and os.path.exists(av_extend_video):
+            command.extend(["--av-extend-from", str(av_extend_video)])
+            if av_extend_start_time and float(av_extend_start_time) > 0:
+                command.extend(["--av-extend-start-time", str(float(av_extend_start_time))])
+            if av_extend_end_time and float(av_extend_end_time) > 0:
+                command.extend(["--av-extend-end-time", str(float(av_extend_end_time))])
+            command.extend(["--av-extend-steps", str(int(av_extend_steps))])
+            command.extend(["--av-extend-terminal", str(float(av_extend_terminal))])
+            command.extend(["--av-slope-len", str(int(av_slope_len))])
+            if av_no_stage2:
+                command.append("--av-no-stage2")
 
         # Print command for debugging
         print("\n" + "=" * 80)
@@ -1405,6 +1441,57 @@ def create_interface():
                                     info="LAB color correction strength between windows"
                                 )
 
+                        # AV Extension (Time-Based Audio-Video Continuation)
+                        with gr.Accordion("AV Extension (Audio-Video Continuation)", open=False):
+                            gr.Markdown("""
+**Time-based audio-video continuation** - Extends a video by preserving the beginning and generating new content from a specific time point.
+Unlike SVI Pro (which uses motion latents), this method uses noise masking to preserve the original content exactly while generating seamless continuations.
+Audio is synchronized with the video extension.
+                            """)
+                            with gr.Row():
+                                av_extend_video = gr.File(
+                                    label="Input Video to Extend",
+                                    file_types=["video"],
+                                    type="filepath"
+                                )
+                            with gr.Row():
+                                av_extend_start_time = gr.Number(
+                                    label="Start Time (seconds)",
+                                    value=0,
+                                    minimum=0,
+                                    maximum=300,
+                                    info="Time to start generating new content. 0 = auto (end of video)"
+                                )
+                                av_extend_end_time = gr.Number(
+                                    label="End Time (seconds)",
+                                    value=0,
+                                    minimum=0,
+                                    maximum=300,
+                                    info="Time to stop generation. 0 = auto (start + 5 seconds)"
+                                )
+                            with gr.Row():
+                                av_extend_steps = gr.Slider(
+                                    minimum=4, maximum=30, value=8, step=1,
+                                    label="Extension Steps",
+                                    info="Denoising steps for extension (lower = faster, higher = better quality)"
+                                )
+                                av_extend_terminal = gr.Slider(
+                                    minimum=0.0, maximum=0.5, value=0.1, step=0.01,
+                                    label="Terminal Sigma",
+                                    info="Smaller = smoother continuation, larger = more creative"
+                                )
+                            with gr.Row():
+                                av_slope_len = gr.Slider(
+                                    minimum=1, maximum=16, value=3, step=1,
+                                    label="Transition Length",
+                                    info="Smoothness at mask boundaries (latent frames)"
+                                )
+                                av_no_stage2 = gr.Checkbox(
+                                    label="Skip Stage 2 Refinement",
+                                    value=False,
+                                    info="Faster but lower quality"
+                                )
+
 
                     # Right column - Output
                     with gr.Column():
@@ -1932,6 +2019,9 @@ def create_interface():
                 # Sliding Window (Long Video)
                 sliding_window_size, sliding_window_overlap,
                 sliding_window_overlap_noise, sliding_window_color_correction,
+                # AV Extension (Time-Based Audio-Video Continuation)
+                av_extend_video, av_extend_start_time, av_extend_end_time,
+                av_extend_steps, av_extend_terminal, av_slope_len, av_no_stage2,
             ],
             outputs=[output_gallery, preview_gallery, status_text, progress_text]
         )
