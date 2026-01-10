@@ -3465,7 +3465,7 @@ def generate_av_extension(
             mel_bins=audio_encoder.mel_bins,
             mel_hop_length=audio_encoder.mel_hop_length,
             n_fft=audio_encoder.n_fft,
-        )
+        ).to(device)
 
         # Prepare waveform
         if audio_waveform.dim() == 3:
