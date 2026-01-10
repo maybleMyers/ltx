@@ -3714,8 +3714,9 @@ def generate_av_extension(
     # Create the denoise function
     if args.cfg_guidance_scale > 1.0:
         denoise_fn = guider_denoising_func(
+            cfg_guider,  # First argument is the guider
             v_context_p, v_context_n, a_context_p, a_context_n,
-            cfg_guider, transformer
+            transformer
         )
     else:
         denoise_fn = simple_denoising_func(v_context_p, a_context_p, transformer)
