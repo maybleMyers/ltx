@@ -3524,9 +3524,13 @@ def generate_av_extension(
     # Similarly extend audio latent if present
     extended_audio_latent = None
     if audio_latent is not None:
-        # Calculate audio latent frames for output duration
-        audio_latents_per_second = AUDIO_SAMPLE_RATE / audio_mel_hop_length / AUDIO_LATENT_DOWNSAMPLE_FACTOR
-        output_audio_latent_frames = int(round(end_time * audio_latents_per_second))
+        # Calculate audio latents per second from actual encoded input
+        # This ensures we match the audio encoder's actual parameters
+        # instead of using potentially mismatched constants (AUDIO_LATENT_DOWNSAMPLE_FACTOR etc.)
+        input_audio_latent_frames = audio_latent.shape[2]  # e.g., 126 for 5s input
+        input_audio_duration = start_time  # Duration of input/preserved region
+        audio_latents_per_second = input_audio_latent_frames / input_audio_duration  # e.g., 25 fps
+        output_audio_latent_frames = int(round(end_time * audio_latents_per_second))  # e.g., 251 for 10s
 
         extended_audio_latent = torch.zeros(
             audio_latent.shape[0],
