@@ -389,46 +389,25 @@ def _encode_frames_to_latent(
 # AV Extension Helper Functions (Time-Based Audio-Video Masking)
 # =============================================================================
 
-# Constants from ComfyUI-LTXVideo
-AUDIO_LATENT_DOWNSAMPLE_FACTOR = 8  # From comfy.ldm.lightricks.vae.audio_vae
+AUDIO_LATENT_DOWNSAMPLE_FACTOR = 8
 
 def time_to_video_latent_idx(
     time_sec: float,
     video_fps: float,
     time_scale_factor: int,
     video_latent_frame_count: int,
+    is_end_index: bool = False,
 ) -> int:
-    """
-    Convert time in seconds to video latent frame index.
-
-    Uses the same searchsorted logic as LTXVSetAudioVideoMaskByTime in ComfyUI-LTXVideo.
-
-    Args:
-        time_sec: Time in seconds
-        video_fps: Video frame rate
-        time_scale_factor: VAE temporal downscale factor (typically 8)
-        video_latent_frame_count: Total number of latent frames
-
-    Returns:
-        Latent frame index (clamped to valid range)
-    """
     import numpy as np
-
-    # Calculate video pixel frame count from latent frame count
     video_pixel_frame_count = (video_latent_frame_count - 1) * time_scale_factor + 1
-
-    # Build the xp array for interpolation (matches ComfyUI implementation)
     xp = np.array(
         [0] + list(range(1, video_pixel_frame_count + time_scale_factor, time_scale_factor))
     )
-
-    # Convert time to pixel frame
     video_pixel_frame = int(round(time_sec * video_fps))
-
-    # Find latent frame index using searchsorted
-    latent_idx = np.searchsorted(xp, video_pixel_frame, side="left")
-
-    # Clamp to valid range
+    if is_end_index:
+        latent_idx = np.searchsorted(xp, video_pixel_frame, side="right") - 1
+    else:
+        latent_idx = np.searchsorted(xp, video_pixel_frame, side="left")
     return max(0, min(latent_idx, video_latent_frame_count))
 
 
@@ -467,85 +446,62 @@ def create_av_noise_mask(
     init_video_mask: float = 0.0,
     init_audio_mask: float = 0.0,
     slope_len: int = 3,
+    audio_latents_per_second: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """
-    Create noise masks for video and audio latents based on time windows.
-
-    Implements the masking logic from LTXVSetAudioVideoMaskByTime.
-    Mask value 0.0 = preserve original (no denoising)
-    Mask value 1.0 = full denoising (generate new content)
-
-    CRITICAL: Masks are created with single channel [B, 1, F, H, W] to match
-    the expected shape after patchification. The patchifier will convert this
-    to [B, num_patches, 1] which can then be broadcast during denoising.
-
-    Args:
-        video_latent: Video latent tensor [B, C, F, H, W]
-        audio_latent: Audio latent tensor [B, C, F, features] or None
-        start_time: Time to start generating new content (seconds)
-        end_time: Time to stop generating (seconds)
-        video_fps: Video frame rate
-        time_scale_factor: VAE temporal downscale factor
-        sampling_rate: Audio sampling rate (required if audio_latent provided)
-        mel_hop_length: Mel hop length (required if audio_latent provided)
-        init_video_mask: Initial mask value for video (0=preserve, 1=denoise)
-        init_audio_mask: Initial mask value for audio (0=preserve, 1=denoise)
-        slope_len: Number of frames for gradient transition at boundaries
-
-    Returns:
-        Tuple of (video_mask, audio_mask) tensors with single channel
-    """
-    # Video mask - CRITICAL: use single channel [B, 1, F, H, W]
     B, C, F, H, W = video_latent.shape
     video_latent_frame_count = F
     video_mask = torch.full(
-        (B, 1, F, H, W),  # Single channel, NOT full latent shape!
+        (B, 1, F, H, W),
         fill_value=init_video_mask,
         device=video_latent.device,
-        dtype=torch.float32,  # Mask should be float32 for proper blending
+        dtype=torch.float32,
     )
 
     video_start_idx = time_to_video_latent_idx(
-        start_time, video_fps, time_scale_factor, video_latent_frame_count
+        start_time, video_fps, time_scale_factor, video_latent_frame_count,
+        is_end_index=False,
     )
     video_end_idx = time_to_video_latent_idx(
-        end_time, video_fps, time_scale_factor, video_latent_frame_count
+        end_time, video_fps, time_scale_factor, video_latent_frame_count,
+        is_end_index=True,
     )
 
-    # Use HARD 0/1 masks during denoising (like ComfyUI)
-    # slope_len is only for post-processing blend coefficients, NOT for the denoising mask
-    # Partial mask values cause grey noise because model receives inconsistent signals
     video_mask[:, :, video_start_idx:video_end_idx, :, :] = 1.0
 
     print(f"[AV Extension] Video mask: preserve frames 0-{video_start_idx}, "
           f"generate frames {video_start_idx}-{video_end_idx} "
           f"(total {video_latent_frame_count} latent frames)")
 
-    # Audio mask - shape must match AudioLatentShape.mask_shape() which has channels=1, mel_bins=1
     audio_mask = None
-    if audio_latent is not None and sampling_rate is not None and mel_hop_length is not None:
+    if audio_latent is not None:
         B_a, C_a, F_a, mel_bins = audio_latent.shape
         audio_latent_frame_count = F_a
         audio_mask = torch.full(
-            (B_a, 1, F_a, 1),  # [B, 1, F, 1] to match mask_shape()
+            (B_a, 1, F_a, 1),
             fill_value=init_audio_mask,
             device=audio_latent.device,
             dtype=torch.float32,
         )
 
-        audio_start_idx = time_to_audio_latent_idx(
-            start_time, sampling_rate, mel_hop_length, audio_latent_frame_count
-        )
-        audio_end_idx = time_to_audio_latent_idx(
-            end_time, sampling_rate, mel_hop_length, audio_latent_frame_count
-        )
+        if audio_latents_per_second is not None:
+            actual_rate = audio_latents_per_second
+        elif sampling_rate is not None and mel_hop_length is not None:
+            actual_rate = sampling_rate / mel_hop_length / AUDIO_LATENT_DOWNSAMPLE_FACTOR
+            print(f"[WARNING] Using fallback audio rate calculation - may be incorrect!")
+        else:
+            raise ValueError("Either audio_latents_per_second or (sampling_rate, mel_hop_length) required")
 
-        # Use HARD 0/1 masks during denoising (like ComfyUI)
+        audio_start_idx = int(round(start_time * actual_rate))
+        audio_end_idx = int(round(end_time * actual_rate)) + 1
+
+        audio_start_idx = max(0, audio_start_idx)
+        audio_end_idx = min(audio_end_idx, audio_latent_frame_count)
+
         audio_mask[:, :, audio_start_idx:audio_end_idx] = 1.0
 
         print(f"[AV Extension] Audio mask: preserve frames 0-{audio_start_idx}, "
               f"generate frames {audio_start_idx}-{audio_end_idx} "
-              f"(total {audio_latent_frame_count} latent frames)")
+              f"(total {audio_latent_frame_count} latent frames, rate={actual_rate:.2f} fps)")
 
     return video_mask, audio_mask
 
@@ -3521,16 +3477,13 @@ def generate_av_extension(
 
     print(f">>> Extended video latent: {extended_video_latent.shape}")
 
-    # Similarly extend audio latent if present
     extended_audio_latent = None
+    audio_latents_per_second = None
     if audio_latent is not None:
-        # Calculate audio latents per second from actual encoded input
-        # This ensures we match the audio encoder's actual parameters
-        # instead of using potentially mismatched constants (AUDIO_LATENT_DOWNSAMPLE_FACTOR etc.)
-        input_audio_latent_frames = audio_latent.shape[2]  # e.g., 126 for 5s input
-        input_audio_duration = start_time  # Duration of input/preserved region
-        audio_latents_per_second = input_audio_latent_frames / input_audio_duration  # e.g., 25 fps
-        output_audio_latent_frames = int(round(end_time * audio_latents_per_second))  # e.g., 251 for 10s
+        input_audio_latent_frames = audio_latent.shape[2]
+        input_audio_duration = start_time
+        audio_latents_per_second = input_audio_latent_frames / input_audio_duration
+        output_audio_latent_frames = int(round(end_time * audio_latents_per_second))
 
         extended_audio_latent = torch.zeros(
             audio_latent.shape[0],
@@ -3567,9 +3520,10 @@ def generate_av_extension(
         time_scale_factor=time_scale_factor,
         sampling_rate=AUDIO_SAMPLE_RATE if extended_audio_latent is not None else None,
         mel_hop_length=audio_mel_hop_length,
-        init_video_mask=0.0,  # Preserve by default
-        init_audio_mask=0.0,  # Preserve by default
-        slope_len=slope_len,  # Gradient transition at boundaries
+        init_video_mask=0.0,
+        init_audio_mask=0.0,
+        slope_len=slope_len,
+        audio_latents_per_second=audio_latents_per_second if extended_audio_latent is not None else None,
     )
 
     # OFFLOAD: Move latents and masks to CPU before loading text encoder
@@ -3705,12 +3659,9 @@ def generate_av_extension(
     else:
         transformer = generator.stage_1_model_ledger.transformer()
 
-    # Create sigma schedule with terminal value for smooth continuation
-    # CRITICAL: Pass latent to scheduler for correct sigma shift based on token count
-    # Without latent, scheduler defaults to 4096 tokens which gives wrong sigma schedule
     sigmas = LTX2Scheduler().execute(
         steps=extend_steps,
-        latent=extended_video_latent,  # For correct sigma shift calculation
+        latent=extended_video_latent,
         terminal=terminal,
         stretch=True,
     ).to(dtype=torch.float32, device=device)
@@ -3746,18 +3697,6 @@ def generate_av_extension(
     else:
         denoise_fn = simple_denoising_func(v_context_p, a_context_p, transformer)
 
-    # =========================================================================
-    # CRITICAL FIX: Apply mask BEFORE noising
-    # =========================================================================
-    # The issue was that denoise_audio_video() creates states with all-ones mask,
-    # then adds noise to ALL frames. Our mask was applied AFTER noising in the
-    # wrapper function, which was too late - the original frames were already
-    # corrupted with noise.
-    #
-    # The fix: Create states manually and apply our custom mask BEFORE noising.
-    # This ensures preserved regions don't get noise added.
-    # =========================================================================
-
     from ltx_core.types import VideoLatentShape, AudioLatentShape
     from ltx_core.tools import VideoLatentTools, AudioLatentTools
     from ltx_pipelines.utils.helpers import euler_denoising_loop
@@ -3787,42 +3726,28 @@ def generate_av_extension(
         denoise_mask=patchified_video_mask.to(dtype=torch.float32),
     )
 
-    # NOW apply noiser - it will use our mask to NOT noise preserved regions
-    # Where mask=0 (preserve): latent = noise * 0 + original * 1 = original
-    # Where mask=1 (generate): latent = noise * 1 + original * 0 = noise
     video_state = noiser(video_state, noise_scale=1.0)
 
-    # Create audio state similarly (if audio exists)
-    # Use from_torch_shape to match the actual extended_audio_latent dimensions
-    # (from_video_pixel_shape uses different default audio parameters)
     if extended_audio_latent is not None:
         audio_latent_shape = AudioLatentShape.from_torch_shape(extended_audio_latent.shape)
         audio_tools = AudioLatentTools(
             patchifier=components.audio_patchifier,
             target_shape=audio_latent_shape,
         )
-
-        # Create initial audio state
         audio_state = audio_tools.create_initial_state(device, dtype, extended_audio_latent)
-
-        # Patchify and apply audio mask BEFORE noising
         patchified_audio_mask = audio_tools.patchifier.patchify(audio_mask.to(device=device))
         audio_state = dataclass_replace(
             audio_state,
             denoise_mask=patchified_audio_mask.to(dtype=torch.float32),
         )
-
-        # Apply noiser with mask
         audio_state = noiser(audio_state, noise_scale=1.0)
     else:
-        # Create dummy audio state (required by euler_denoising_loop)
         audio_latent_shape = AudioLatentShape.from_video_pixel_shape(shape=output_shape)
         audio_tools = AudioLatentTools(
             patchifier=components.audio_patchifier,
             target_shape=audio_latent_shape,
         )
         audio_state = audio_tools.create_initial_state(device, dtype, None)
-        # Disable audio by setting mask to 0 (no denoising)
         audio_state = dataclass_replace(
             audio_state,
             denoise_mask=torch.zeros_like(audio_state.denoise_mask),
@@ -4142,12 +4067,6 @@ def generate_av_extension(
         # Apply noiser WITH mask - preserved frames won't get noise
         stage2_video_state = noiser(stage2_video_state, noise_scale=stage2_sigmas[0].item())
 
-        # Handle audio state for stage 2
-        # IMPORTANT: Audio does NOT go through stage 2 refinement (matching ComfyUI behavior)
-        # - Audio has no spatial dimensions to upsample
-        # - Audio latent frame count stays constant from stage 1
-        # - Stage 2 is specifically for video spatial upsampling refinement
-        # Use actual audio latent shape (from stage 1), not upscaled video shape
         if denoised_audio_latent is not None:
             stage2_audio_latent_shape = AudioLatentShape.from_torch_shape(denoised_audio_latent.shape)
         else:
@@ -4158,8 +4077,6 @@ def generate_av_extension(
             target_shape=stage2_audio_latent_shape,
         )
 
-        # Create audio state with zero mask to DISABLE stage 2 audio denoising
-        # Audio passes through unchanged, only video gets refined
         stage2_audio_state = stage2_audio_tools.create_initial_state(
             device, dtype, denoised_audio_latent
         )
