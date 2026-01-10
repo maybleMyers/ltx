@@ -3920,56 +3920,50 @@ def generate_av_extension(
         # 9E: Use the generator's pipeline components
         stage2_components = generator.pipeline_components
 
-        # 9F: Create stage 2 video state
-        from ltx_pipelines.utils.helpers import noise_video_state, noise_audio_state
-
-        stage2_video_state, stage2_video_tools = noise_video_state(
-            output_shape=stage2_output_shape,
-            noiser=noiser,
-            conditionings=[],  # No additional conditionings for stage 2
-            components=stage2_components,
-            dtype=dtype,
-            device=device,
-            noise_scale=stage2_sigmas[0].item(),
-            initial_latent=upscaled_video_latent,
-        )
-
-        # 9G: Create stage 2 audio state if present
-        stage2_audio_state = None
-        stage2_audio_tools = None
-        if denoised_audio_latent is not None:
-            stage2_audio_state, stage2_audio_tools = noise_audio_state(
-                output_shape=stage2_output_shape,
-                noiser=noiser,
-                conditionings=[],
-                components=stage2_components,
-                dtype=dtype,
-                device=device,
-                noise_scale=stage2_sigmas[0].item(),
-                initial_latent=denoised_audio_latent,
-            )
-
-        # 9H: Stage 2 denoising function (NO CFG, just positive context)
+        # 9F: Stage 2 denoising function (NO CFG, just positive context)
         stage2_denoise_fn = simple_denoising_func(
             video_context=v_context_p,
             audio_context=a_context_p,
             transformer=stage2_transformer,
         )
 
-        # 9I: Run stage 2 denoising loop
+        # 9G: Define stage 2 denoising loop
+        def stage2_denoising_loop(
+            sigmas: torch.Tensor,
+            video_state: LatentState,
+            audio_state: LatentState,
+            stepper: DiffusionStepProtocol,
+        ) -> tuple[LatentState, LatentState]:
+            return euler_denoising_loop(
+                sigmas=sigmas,
+                video_state=video_state,
+                audio_state=audio_state,
+                stepper=stepper,
+                denoise_fn=stage2_denoise_fn,
+            )
+
+        # 9H: Run stage 2 denoising with denoise_audio_video
         print(f">>> Stage 2 denoising with {len(stage2_sigmas) - 1} steps...")
-        final_stage2_video, final_stage2_audio = euler_denoising_loop(
+        final_stage2_video, final_stage2_audio = denoise_audio_video(
+            output_shape=stage2_output_shape,
+            conditionings=[],  # No additional conditionings for stage 2
+            noiser=noiser,
             sigmas=stage2_sigmas,
-            video_state=stage2_video_state,
-            audio_state=stage2_audio_state if stage2_audio_state is not None else stage2_video_state,
             stepper=stepper,
-            denoise_fn=stage2_denoise_fn,
+            denoising_loop_fn=stage2_denoising_loop,
+            components=stage2_components,
+            dtype=dtype,
+            device=device,
+            noise_scale=stage2_sigmas[0].item(),
+            initial_video_latent=upscaled_video_latent,
+            initial_audio_latent=denoised_audio_latent,
+            audio_conditionings=None,
         )
 
-        # 9J: Unpatchify stage 2 results
-        denoised_video_latent = stage2_video_tools.unpatchify(final_stage2_video.latent)
-        if final_stage2_audio is not None and stage2_audio_tools is not None:
-            denoised_audio_latent = stage2_audio_tools.unpatchify(final_stage2_audio.latent)
+        # 9I: Get stage 2 results (already unpatchified by denoise_audio_video)
+        denoised_video_latent = final_stage2_video.latent
+        if denoised_audio_latent is not None:
+            denoised_audio_latent = final_stage2_audio.latent
 
         # Cleanup stage 2 transformer with proper block swap handling
         if stage2_block_swap_manager is not None:
