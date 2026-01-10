@@ -466,6 +466,7 @@ def create_av_noise_mask(
     mel_hop_length: int | None = None,
     init_video_mask: float = 0.0,
     init_audio_mask: float = 0.0,
+    slope_len: int = 3,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """
     Create noise masks for video and audio latents based on time windows.
@@ -489,6 +490,7 @@ def create_av_noise_mask(
         mel_hop_length: Mel hop length (required if audio_latent provided)
         init_video_mask: Initial mask value for video (0=preserve, 1=denoise)
         init_audio_mask: Initial mask value for audio (0=preserve, 1=denoise)
+        slope_len: Number of frames for gradient transition at boundaries
 
     Returns:
         Tuple of (video_mask, audio_mask) tensors with single channel
@@ -510,12 +512,34 @@ def create_av_noise_mask(
         end_time, video_fps, time_scale_factor, video_latent_frame_count
     )
 
-    # Set mask to 1.0 for the region to be denoised
-    video_mask[:, :, video_start_idx:video_end_idx, :, :] = 1.0
+    # Create gradient mask with slope transition at boundaries
+    # This prevents artifacts from hard mask boundaries
+    for frame_idx in range(video_latent_frame_count):
+        if frame_idx < video_start_idx - slope_len:
+            # Fully preserve (before transition)
+            mask_value = 0.0
+        elif frame_idx < video_start_idx + slope_len:
+            # Gradient transition from preserve to generate
+            # Linear ramp from 0 to 1 over 2*slope_len frames centered at video_start_idx
+            t = (frame_idx - (video_start_idx - slope_len)) / (2 * slope_len)
+            mask_value = min(1.0, max(0.0, t))
+        elif frame_idx < video_end_idx - slope_len:
+            # Fully generate (middle region)
+            mask_value = 1.0
+        elif frame_idx < video_end_idx + slope_len:
+            # Gradient transition from generate back to preserve (if end is within video)
+            t = (frame_idx - (video_end_idx - slope_len)) / (2 * slope_len)
+            mask_value = max(0.0, min(1.0, 1.0 - t))
+        else:
+            # Fully preserve (after end transition)
+            mask_value = 0.0
 
-    print(f"[AV Extension] Video mask: preserve frames 0-{video_start_idx}, "
-          f"generate frames {video_start_idx}-{video_end_idx} "
-          f"(total {video_latent_frame_count} latent frames)")
+        video_mask[:, :, frame_idx, :, :] = mask_value
+
+    print(f"[AV Extension] Video mask: preserve frames 0-{max(0, video_start_idx - slope_len)}, "
+          f"transition {max(0, video_start_idx - slope_len)}-{min(video_latent_frame_count, video_start_idx + slope_len)}, "
+          f"generate frames {video_start_idx + slope_len}-{video_end_idx - slope_len} "
+          f"(total {video_latent_frame_count} latent frames, slope_len={slope_len})")
 
     # Audio mask - also single channel [B, 1, F, mel_bins]
     audio_mask = None
@@ -536,12 +560,26 @@ def create_av_noise_mask(
             end_time, sampling_rate, mel_hop_length, audio_latent_frame_count
         )
 
-        # Set mask to 1.0 for the region to be denoised
-        audio_mask[:, :, audio_start_idx:audio_end_idx, :] = 1.0
+        # Create gradient mask for audio with slope transition
+        for frame_idx in range(audio_latent_frame_count):
+            if frame_idx < audio_start_idx - slope_len:
+                mask_value = 0.0
+            elif frame_idx < audio_start_idx + slope_len:
+                t = (frame_idx - (audio_start_idx - slope_len)) / (2 * slope_len)
+                mask_value = min(1.0, max(0.0, t))
+            elif frame_idx < audio_end_idx - slope_len:
+                mask_value = 1.0
+            elif frame_idx < audio_end_idx + slope_len:
+                t = (frame_idx - (audio_end_idx - slope_len)) / (2 * slope_len)
+                mask_value = max(0.0, min(1.0, 1.0 - t))
+            else:
+                mask_value = 0.0
 
-        print(f"[AV Extension] Audio mask: preserve frames 0-{audio_start_idx}, "
-              f"generate frames {audio_start_idx}-{audio_end_idx} "
-              f"(total {audio_latent_frame_count} latent frames)")
+            audio_mask[:, :, frame_idx, :] = mask_value
+
+        print(f"[AV Extension] Audio mask: preserve frames 0-{max(0, audio_start_idx - slope_len)}, "
+              f"generate frames {audio_start_idx + slope_len}-{audio_end_idx - slope_len} "
+              f"(total {audio_latent_frame_count} latent frames, slope_len={slope_len})")
 
     return video_mask, audio_mask
 
@@ -3554,6 +3592,7 @@ def generate_av_extension(
         mel_hop_length=audio_mel_hop_length,
         init_video_mask=0.0,  # Preserve by default
         init_audio_mask=0.0,  # Preserve by default
+        slope_len=slope_len,  # Gradient transition at boundaries
     )
 
     # OFFLOAD: Move latents and masks to CPU before loading text encoder
@@ -3946,9 +3985,12 @@ def generate_av_extension(
             start_time, output_fps, time_scale_factor, full_res_latent.shape[2]
         )
 
-        # Replace preserved frames in upscaled latent with original full-res encoding
-        print(f">>> Replacing preserved frames 0-{video_start_idx} with original full-res encoding...")
-        upscaled_video_latent[:, :, :video_start_idx, :, :] = full_res_latent[:, :, :video_start_idx, :, :]
+        # Replace preserved frames AND transition zone in upscaled latent with original full-res encoding
+        # Include slope_len extra frames to cover the gradient transition zone where mask < 1.0
+        # This ensures clean_latent is correct for partial preservation blending
+        preserve_end_idx = min(video_start_idx + slope_len, full_res_latent.shape[2])
+        print(f">>> Replacing frames 0-{preserve_end_idx} (including transition zone) with original full-res encoding...")
+        upscaled_video_latent[:, :, :preserve_end_idx, :, :] = full_res_latent[:, :, :preserve_end_idx, :, :]
 
         # Cleanup
         del full_res_frames, full_res_tensor, full_res_input, full_res_latent_chunks, full_res_latent
