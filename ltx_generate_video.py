@@ -513,6 +513,12 @@ Examples:
         help="Number of denoising steps for stage 2 refinement (default: 3). "
              "Uses LTX2Scheduler to generate sigma schedule.",
     )
+    model_group.add_argument(
+        "--stage2-audio-strength",
+        type=float,
+        default=1.0,
+        help="Audio refinement strength in Stage 2 (0.0=unchanged, 1.0=full regeneration). Default: 1.0",
+    )
 
     # ==========================================================================
     # Generation Parameters
@@ -1363,6 +1369,7 @@ class LTXVideoGeneratorWithOffloading:
         refine_strength: float = 0.3,
         refine_steps: int = 10,
         stage2_steps: int = 3,
+        stage2_audio_strength: float = 1.0,
         anchor_image: str | None = None,
         anchor_interval: int | None = None,
         anchor_strength: float = 0.8,
@@ -2351,25 +2358,32 @@ class LTXVideoGeneratorWithOffloading:
         # Stage 1 conditioning is sufficient for establishing coherence.
 
         print(f">>> Stage 2: Refining at {stage_2_output_shape.width}x{stage_2_output_shape.height}...")
-        # For refine-only mode, use audio_latent from input video encoding
-        # For v2v mode, use v2v_audio_latent if available
-        # For normal generation, use audio_state.latent from stage 1
-        if self.refine_only and input_video:
-            stage_2_initial_audio = audio_latent
-        elif v2v_audio_latent is not None:
-            stage_2_initial_audio = v2v_audio_latent
-            print(">>> Using audio from input video")
+        if stage2_audio_strength == 0.0:
+            if self.refine_only and input_video:
+                stage_2_initial_audio = audio_latent
+            elif v2v_audio_latent is not None:
+                stage_2_initial_audio = v2v_audio_latent
+            else:
+                stage_2_initial_audio = audio_state.latent
+            audio_noise_scale = 0.0
+        elif stage2_audio_strength >= 1.0:
+            stage_2_initial_audio = None
+            audio_noise_scale = 1.0
         else:
-            stage_2_initial_audio = audio_state.latent
+            if self.refine_only and input_video:
+                stage_2_initial_audio = audio_latent
+            elif v2v_audio_latent is not None:
+                stage_2_initial_audio = v2v_audio_latent
+            else:
+                stage_2_initial_audio = audio_state.latent
+            audio_noise_scale = stage2_audio_strength
 
-        # OOM retry loop - reduces blocks in GPU until denoising succeeds
         current_blocks = self.refiner_blocks_in_memory
-        min_blocks = 1  # Minimum blocks to try before giving up
-        max_retries = current_blocks - min_blocks + 1  # Maximum retry attempts
+        min_blocks = 1
+        max_retries = current_blocks - min_blocks + 1
 
         for retry_attempt in range(max_retries):
             try:
-                # Reset generator for reproducibility on retries
                 if retry_attempt > 0:
                     generator = torch.Generator(device=self.device).manual_seed(seed)
                     noiser = GaussianNoiser(generator=generator)
@@ -2388,6 +2402,7 @@ class LTXVideoGeneratorWithOffloading:
                     initial_video_latent=upscaled_video_latent,
                     initial_audio_latent=stage_2_initial_audio,
                     audio_conditionings=audio_conditionings if audio_conditionings else None,
+                    audio_noise_scale=audio_noise_scale,
                 )
                 # Success - break out of retry loop
                 break
@@ -2609,6 +2624,7 @@ def generate_svi_multi_clip(
                 enhance_prompt=False,
                 disable_audio=args.disable_audio,
                 stage2_steps=args.stage2_steps,
+                stage2_audio_strength=args.stage2_audio_strength,
                 anchor_image=anchor_image_path if clip_idx > 0 else None,
                 anchor_interval=args.anchor_interval if clip_idx > 0 else None,
                 anchor_strength=args.anchor_strength,
@@ -3428,6 +3444,7 @@ def sliding_window_generate(
             enhance_prompt=False,
             disable_audio=args.disable_audio,
             stage2_steps=args.stage2_steps,
+            stage2_audio_strength=args.stage2_audio_strength,
             anchor_image=args.anchor_image,
             anchor_interval=args.anchor_interval,
             anchor_strength=args.anchor_strength,
@@ -3789,6 +3806,7 @@ def main():
             refine_strength=args.refine_strength,
             refine_steps=args.refine_steps,
             stage2_steps=args.stage2_steps,
+            stage2_audio_strength=args.stage2_audio_strength,
             anchor_image=args.anchor_image,
             anchor_interval=args.anchor_interval,
             anchor_strength=args.anchor_strength,

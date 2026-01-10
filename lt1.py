@@ -467,6 +467,7 @@ def generate_ltx_video(
     cfg_guidance_scale: float,
     num_inference_steps: int,
     stage2_steps: int,
+    stage2_audio_strength: float,
     seed: int,
     # Image conditioning (for I2V)
     input_image: str,
@@ -602,6 +603,7 @@ def generate_ltx_video(
             "--cfg-guidance-scale", str(float(cfg_guidance_scale)),
             "--num-inference-steps", str(int(num_inference_steps)),
             "--stage2-steps", str(int(stage2_steps)),
+            "--stage2-audio-strength", str(float(stage2_audio_strength)),
             "--seed", str(current_seed),
             "--output-path", output_filename,
         ]
@@ -1310,24 +1312,27 @@ def create_interface():
                                 gr.Markdown("Set an ending frame to generate video that transitions from start to end image.")
                                 with gr.Row():
                                     end_image_strength = gr.Slider(minimum=0.0, maximum=1.0, value=0.9, step=0.05, label="End Image Strength")
-                            gr.Markdown("### Resolution Settings")
-                            scale_slider = gr.Slider(
-                                minimum=1, maximum=200, value=100, step=1,
-                                label="Scale % (adjusts resolution while maintaining aspect ratio)",
-                                info="Scale the input image dimensions. Works for I2V mode."
-                            )
-                            with gr.Row():
-                                width = gr.Number(label="Width", value=1024, step=64, info="Must be divisible by 64")
-                                calc_height_btn = gr.Button("→", size="sm", min_width=40)
-                                calc_width_btn = gr.Button("←", size="sm", min_width=40)
-                                height = gr.Number(label="Height", value=1024, step=64, info="Must be divisible by 64")
-                            with gr.Row():
-                                num_frames = gr.Slider(minimum=9, maximum=2001, step=8, value=121, label="Num Frames (8*K+1)", info="e.g., 121 = 5s @ 24fps")
-                                frame_rate = gr.Slider(minimum=12, maximum=60, value=24, step=1, label="Frame Rate")
-                            with gr.Row():
-                                cfg_guidance_scale = gr.Slider(minimum=1.0, maximum=15.0, value=4.0, step=0.5, label="CFG Scale")
-                                num_inference_steps = gr.Slider(minimum=1, maximum=60, value=40, step=1, label="Inference Steps")
-                                stage2_steps = gr.Slider(minimum=1, maximum=60, value=3, step=1, label="Stage 2 Steps")
+
+                        gr.Markdown("### Resolution Settings")
+                        scale_slider = gr.Slider(
+                            minimum=1, maximum=200, value=100, step=1,
+                            label="Scale % (adjusts resolution while maintaining aspect ratio)",
+                            info="Scale the input image dimensions. Works for I2V mode."
+                        )
+                        with gr.Row():
+                            width = gr.Number(label="Width", value=1024, step=64, info="Must be divisible by 64")
+                            calc_height_btn = gr.Button("→", size="sm", min_width=40)
+                            calc_width_btn = gr.Button("←", size="sm", min_width=40)
+                            height = gr.Number(label="Height", value=1024, step=64, info="Must be divisible by 64")
+                        with gr.Row():
+                            num_frames = gr.Slider(minimum=9, maximum=2001, step=8, value=121, label="Num Frames (8*K+1)", info="e.g., 121 = 5s @ 24fps")
+                            frame_rate = gr.Slider(minimum=12, maximum=60, value=24, step=1, label="Frame Rate")
+                        with gr.Row():
+                            cfg_guidance_scale = gr.Slider(minimum=1.0, maximum=15.0, value=4.0, step=0.5, label="CFG Scale")
+                            num_inference_steps = gr.Slider(minimum=1, maximum=60, value=40, step=1, label="Inference Steps")
+                        with gr.Row():
+                            stage2_steps = gr.Slider(minimum=1, maximum=60, value=3, step=1, label="Stage 2 Steps")
+                            stage2_audio_strength = gr.Slider(minimum=0.0, maximum=1.0, value=1.0, step=0.1, label="Stage 2 Audio Strength", info="0=unchanged, 1=regenerate")
 
                         # Video Input (V2V / Refine)
                         with gr.Accordion("Video Input (V2V / Refine)", open=False) as v2v_section:
@@ -1913,7 +1918,7 @@ def create_interface():
                 checkpoint_path, distilled_checkpoint, stage2_checkpoint, gemma_root, spatial_upsampler_path,
                 distilled_lora_path, distilled_lora_strength,
                 mode, pipeline, enable_sliding_window, width, height, num_frames, frame_rate,
-                cfg_guidance_scale, num_inference_steps, stage2_steps, seed,
+                cfg_guidance_scale, num_inference_steps, stage2_steps, stage2_audio_strength, seed,
                 input_image, image_frame_idx, image_strength,
                 end_image, end_image_strength,
                 anchor_image, anchor_interval, anchor_strength, anchor_decay,
@@ -1948,7 +1953,7 @@ def create_interface():
         def send_to_generation_handler(metadata, first_frame):
             """Send loaded metadata to generation tab parameters and switch to Generation tab."""
             if not metadata:
-                return [gr.update()] * 38 + ["No metadata loaded - upload a video first"]
+                return [gr.update()] * 35 + ["No metadata loaded - upload a video first"]
 
             # Handle legacy metadata that used single enable_block_swap
             legacy_block_swap = metadata.get("enable_block_swap", True)
@@ -1985,6 +1990,7 @@ def create_interface():
                 gr.update(value=metadata.get("cfg_guidance_scale", 4.0)),  # cfg_guidance_scale
                 gr.update(value=metadata.get("num_inference_steps", 40)),  # num_inference_steps
                 gr.update(value=metadata.get("stage2_steps", 3)),  # stage2_steps
+                gr.update(value=metadata.get("stage2_audio_strength", 1.0)),  # stage2_audio_strength
                 gr.update(value=metadata.get("seed", -1)),  # seed
                 # Image conditioning
                 gr.update(value=first_frame),  # input_image - use extracted first frame
@@ -2025,7 +2031,7 @@ def create_interface():
                 tabs,  # Switch tab
                 prompt, negative_prompt, mode, pipeline,
                 width, height, num_frames, frame_rate,
-                cfg_guidance_scale, num_inference_steps, stage2_steps, seed,
+                cfg_guidance_scale, num_inference_steps, stage2_steps, stage2_audio_strength, seed,
                 # Image conditioning
                 input_image, image_frame_idx, image_strength, end_image_strength,
                 # Anchor conditioning
@@ -2186,7 +2192,7 @@ def create_interface():
             spatial_upsampler_path, distilled_lora_path, distilled_lora_strength,
             # Generation parameters
             mode, pipeline, width, height, num_frames, frame_rate,
-            cfg_guidance_scale, num_inference_steps, stage2_steps, seed,
+            cfg_guidance_scale, num_inference_steps, stage2_steps, stage2_audio_strength, seed,
             # Image conditioning (not input_image itself - that's a file upload)
             image_frame_idx, image_strength,
             end_image_strength,
@@ -2217,7 +2223,7 @@ def create_interface():
             "spatial_upsampler_path", "distilled_lora_path", "distilled_lora_strength",
             # Generation parameters
             "mode", "pipeline", "width", "height", "num_frames", "frame_rate",
-            "cfg_guidance_scale", "num_inference_steps", "stage2_steps", "seed",
+            "cfg_guidance_scale", "num_inference_steps", "stage2_steps", "stage2_audio_strength", "seed",
             # Image conditioning
             "image_frame_idx", "image_strength",
             "end_image_strength",
