@@ -3867,6 +3867,93 @@ def generate_av_extension(
         del spatial_upsampler
         cleanup_memory()
 
+        # =====================================================================
+        # 9A-FIX: Re-encode original video at full resolution for preserved frames
+        # =====================================================================
+        # The LatentUpsampler is a neural network that modifies ALL latent values,
+        # corrupting the preserved frames. We fix this by:
+        # 1. Re-loading the input video at full (Stage 2) resolution
+        # 2. Encoding it to latent space
+        # 3. Replacing the upsampler output's preserved frames with the original encoding
+        print(">>> Loading original video at full resolution for preserved frames...")
+
+        stage2_width = stage1_width * 2
+        stage2_height = stage1_height * 2
+
+        cap_full = cv2.VideoCapture(input_video_path)
+        cap_full.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        full_res_frames = []
+        frames_to_load = min(int(cap_full.get(cv2.CAP_PROP_FRAME_COUNT)), int(start_time * input_fps) + 16)
+        for _ in range(frames_to_load):
+            ret, frame = cap_full.read()
+            if not ret:
+                break
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame = cv2.resize(frame, (stage2_width, stage2_height), interpolation=cv2.INTER_LANCZOS4)
+            full_res_frames.append(frame)
+        cap_full.release()
+
+        print(f">>> Loaded {len(full_res_frames)} frames at {stage2_width}x{stage2_height}")
+
+        # Convert to tensor and encode
+        import numpy as np
+        full_res_tensor = torch.from_numpy(np.stack(full_res_frames)).float() / 255.0
+        full_res_tensor = full_res_tensor.to(device=device, dtype=dtype)
+        full_res_input = full_res_tensor.permute(3, 0, 1, 2).unsqueeze(0)  # [1, C, F, H, W]
+        full_res_input = full_res_input * 2.0 - 1.0  # Normalize to [-1, 1]
+
+        # Encode in temporal chunks (same logic as Stage 1)
+        encoder_dtype = next(video_encoder.parameters()).dtype
+        chunk_pixel_frames = 65
+        total_pixel_frames_full = full_res_input.shape[2]
+
+        full_res_latent_chunks = []
+        chunk_idx_full = 0
+
+        print(">>> Encoding full-resolution video to latent space...")
+        with torch.no_grad():
+            for start_frame_idx in range(0, total_pixel_frames_full, chunk_pixel_frames - 1):
+                end_frame_idx = min(start_frame_idx + chunk_pixel_frames, total_pixel_frames_full)
+                actual_frames_chunk = end_frame_idx - start_frame_idx
+
+                if actual_frames_chunk < 9:
+                    pad_frames = 9 - actual_frames_chunk
+                    chunk = full_res_input[:, :, start_frame_idx:end_frame_idx, :, :]
+                    last_frame = chunk[:, :, -1:, :, :].expand(-1, -1, pad_frames, -1, -1)
+                    chunk = torch.cat([chunk, last_frame], dim=2)
+                else:
+                    chunk = full_res_input[:, :, start_frame_idx:end_frame_idx, :, :]
+
+                chunk_latent = video_encoder(chunk.to(device=device, dtype=encoder_dtype))
+                chunk_latent = chunk_latent.to(dtype=dtype)
+
+                if chunk_idx_full > 0 and len(full_res_latent_chunks) > 0:
+                    chunk_latent = chunk_latent[:, :, 1:, :, :]
+
+                full_res_latent_chunks.append(chunk_latent)
+                chunk_idx_full += 1
+
+                print(f">>> Encoded full-res chunk {chunk_idx_full}: frames {start_frame_idx}-{end_frame_idx} -> {chunk_latent.shape[2]} latent frames")
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        full_res_latent = torch.cat(full_res_latent_chunks, dim=2)
+        print(f">>> Full-res latent shape: {full_res_latent.shape}")
+
+        # Calculate how many latent frames to preserve (same formula as create_av_noise_mask)
+        video_start_idx = time_to_video_latent_idx(
+            start_time, output_fps, time_scale_factor, full_res_latent.shape[2]
+        )
+
+        # Replace preserved frames in upscaled latent with original full-res encoding
+        print(f">>> Replacing preserved frames 0-{video_start_idx} with original full-res encoding...")
+        upscaled_video_latent[:, :, :video_start_idx, :, :] = full_res_latent[:, :, :video_start_idx, :, :]
+
+        # Cleanup
+        del full_res_frames, full_res_tensor, full_res_input, full_res_latent_chunks, full_res_latent
+        cleanup_memory()
+
         # 9B: Load stage 2 transformer with distilled LoRA
         print(">>> Loading stage 2 transformer...")
         stage2_block_swap_manager = None
