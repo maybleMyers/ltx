@@ -3436,6 +3436,12 @@ def generate_av_extension(
     video_latent = torch.cat(latent_chunks, dim=2)
     print(f">>> Video latent shape: {video_latent.shape}")
 
+    # FREE: Delete chunk list and input tensors no longer needed
+    del latent_chunks
+    del video_input
+    del input_frames_tensor
+    cleanup_memory()
+
     # Encode audio
     audio_latent = None
     audio_mel_hop_length = None
@@ -3520,6 +3526,12 @@ def generate_av_extension(
 
         print(f">>> Extended audio latent: {extended_audio_latent.shape}")
 
+    # FREE: Delete original latents (already copied to extended versions)
+    del video_latent
+    if audio_latent is not None:
+        del audio_latent
+    cleanup_memory()
+
     # =========================================================================
     # Step 6: Create noise masks
     # =========================================================================
@@ -3532,11 +3544,22 @@ def generate_av_extension(
         end_time=end_time,
         video_fps=output_fps,
         time_scale_factor=time_scale_factor,
-        sampling_rate=AUDIO_SAMPLE_RATE if audio_latent is not None else None,
+        sampling_rate=AUDIO_SAMPLE_RATE if extended_audio_latent is not None else None,
         mel_hop_length=audio_mel_hop_length,
         init_video_mask=0.0,  # Preserve by default
         init_audio_mask=0.0,  # Preserve by default
     )
+
+    # OFFLOAD: Move latents and masks to CPU before loading text encoder
+    # This frees GPU memory for the large text encoder model
+    print(">>> Offloading latents to CPU for model loading...")
+    extended_video_latent = extended_video_latent.cpu()
+    if extended_audio_latent is not None:
+        extended_audio_latent = extended_audio_latent.cpu()
+    video_mask = video_mask.cpu()
+    if audio_mask is not None:
+        audio_mask = audio_mask.cpu()
+    cleanup_memory()
 
     # =========================================================================
     # Step 7: Run masked denoising
@@ -3567,6 +3590,15 @@ def generate_av_extension(
 
     del text_encoder
     cleanup_memory()
+
+    # RELOAD: Move latents and masks back to GPU for denoising
+    print(">>> Reloading latents to GPU for denoising...")
+    extended_video_latent = extended_video_latent.to(device=device, dtype=dtype)
+    if extended_audio_latent is not None:
+        extended_audio_latent = extended_audio_latent.to(device=device, dtype=dtype)
+    video_mask = video_mask.to(device=device)
+    if audio_mask is not None:
+        audio_mask = audio_mask.to(device=device)
 
     # Initialize diffusion components
     generator_torch = torch.Generator(device=device).manual_seed(args.seed)
