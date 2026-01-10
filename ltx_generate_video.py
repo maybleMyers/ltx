@@ -3909,12 +3909,14 @@ def generate_av_extension(
             dtype=torch.float32, device=device
         )
 
-        # 9D: Create stage 2 output shape (full resolution)
+        # 9D: Create stage 2 output shape (2x upscaled from stage 1)
+        # Note: Use actual upscaled dimensions, not args.height/width
+        # because stage1 dimensions may be rounded to be divisible by 64
         stage2_output_shape = VideoPixelShape(
             batch=1,
             frames=output_frames,
-            height=args.height,  # Full resolution
-            width=args.width,
+            height=stage1_height * 2,  # 2x stage 1 height
+            width=stage1_width * 2,    # 2x stage 1 width
             fps=output_fps,
         )
 
