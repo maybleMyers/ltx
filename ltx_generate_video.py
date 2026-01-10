@@ -3386,8 +3386,11 @@ def generate_av_extension(
     video_input = input_frames_tensor.permute(3, 0, 1, 2).unsqueeze(0)  # [1, C, F, H, W]
     video_input = video_input * 2.0 - 1.0  # Normalize to [-1, 1]
 
+    # Get the encoder's dtype (usually bfloat16)
+    encoder_dtype = next(video_encoder.parameters()).dtype
+
     with torch.no_grad():
-        video_latent = video_encoder(video_input.to(dtype=torch.float32))
+        video_latent = video_encoder(video_input.to(device=device, dtype=encoder_dtype))
         video_latent = video_latent.to(dtype=dtype)
 
     print(f">>> Video latent shape: {video_latent.shape}")
