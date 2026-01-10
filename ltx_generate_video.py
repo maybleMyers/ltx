@@ -3854,9 +3854,9 @@ def generate_av_extension(
         full_res_input = full_res_tensor.permute(3, 0, 1, 2).unsqueeze(0)  # [1, C, F, H, W]
         full_res_input = full_res_input * 2.0 - 1.0  # Normalize to [-1, 1]
 
-        # Encode in temporal chunks (same logic as Stage 1)
+        # Encode in temporal chunks (smaller than Stage 1 due to 4x resolution)
         encoder_dtype = next(video_encoder.parameters()).dtype
-        chunk_pixel_frames = 65
+        chunk_pixel_frames = 17  # Smaller chunks for full-res to avoid OOM (8*2+1 = 17)
         total_pixel_frames_full = full_res_input.shape[2]
 
         full_res_latent_chunks = []
