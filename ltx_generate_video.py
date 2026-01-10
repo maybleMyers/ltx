@@ -474,6 +474,10 @@ def create_av_noise_mask(
     Mask value 0.0 = preserve original (no denoising)
     Mask value 1.0 = full denoising (generate new content)
 
+    CRITICAL: Masks are created with single channel [B, 1, F, H, W] to match
+    the expected shape after patchification. The patchifier will convert this
+    to [B, num_patches, 1] which can then be broadcast during denoising.
+
     Args:
         video_latent: Video latent tensor [B, C, F, H, W]
         audio_latent: Audio latent tensor [B, C, F, features] or None
@@ -487,15 +491,16 @@ def create_av_noise_mask(
         init_audio_mask: Initial mask value for audio (0=preserve, 1=denoise)
 
     Returns:
-        Tuple of (video_mask, audio_mask) tensors
+        Tuple of (video_mask, audio_mask) tensors with single channel
     """
-    # Video mask
-    video_latent_frame_count = video_latent.shape[2]
+    # Video mask - CRITICAL: use single channel [B, 1, F, H, W]
+    B, C, F, H, W = video_latent.shape
+    video_latent_frame_count = F
     video_mask = torch.full(
-        video_latent.shape,
+        (B, 1, F, H, W),  # Single channel, NOT full latent shape!
         fill_value=init_video_mask,
         device=video_latent.device,
-        dtype=video_latent.dtype,
+        dtype=torch.float32,  # Mask should be float32 for proper blending
     )
 
     video_start_idx = time_to_video_latent_idx(
@@ -512,15 +517,16 @@ def create_av_noise_mask(
           f"generate frames {video_start_idx}-{video_end_idx} "
           f"(total {video_latent_frame_count} latent frames)")
 
-    # Audio mask
+    # Audio mask - also single channel [B, 1, F, mel_bins]
     audio_mask = None
     if audio_latent is not None and sampling_rate is not None and mel_hop_length is not None:
-        audio_latent_frame_count = audio_latent.shape[2]
+        B_a, C_a, F_a, mel_bins = audio_latent.shape
+        audio_latent_frame_count = F_a
         audio_mask = torch.full(
-            audio_latent.shape,
+            (B_a, 1, F_a, mel_bins),  # Single channel for audio mask
             fill_value=init_audio_mask,
             device=audio_latent.device,
-            dtype=audio_latent.dtype,
+            dtype=torch.float32,
         )
 
         audio_start_idx = time_to_audio_latent_idx(
@@ -3721,66 +3727,107 @@ def generate_av_extension(
     else:
         denoise_fn = simple_denoising_func(v_context_p, a_context_p, transformer)
 
-    # Define denoising loop wrapper that applies our custom masks
-    # This matches the pattern used in the main generate() method
-    def av_extension_denoising_loop(
-        sigmas: torch.Tensor,
-        video_state: LatentState,
-        audio_state: LatentState,
-        stepper: DiffusionStepProtocol,
-    ) -> tuple[LatentState, LatentState]:
-        # Apply custom video mask
-        # The mask determines which regions get denoised (1) vs preserved (0)
-        # Note: denoise_mask shape is [batch, num_patches, 1] (3D)
-        # Note: clean_latent is already properly set from initial_video_latent by denoise_audio_video
-        num_video_patches = video_state.denoise_mask.shape[1]
-        video_mask_flat = video_mask.reshape(1, -1, 1)[:, :num_video_patches, :]
-        video_state_masked = dataclass_replace(
-            video_state,
-            denoise_mask=video_mask_flat.to(device=device, dtype=torch.float32),
-        )
+    # =========================================================================
+    # CRITICAL FIX: Apply mask BEFORE noising
+    # =========================================================================
+    # The issue was that denoise_audio_video() creates states with all-ones mask,
+    # then adds noise to ALL frames. Our mask was applied AFTER noising in the
+    # wrapper function, which was too late - the original frames were already
+    # corrupted with noise.
+    #
+    # The fix: Create states manually and apply our custom mask BEFORE noising.
+    # This ensures preserved regions don't get noise added.
+    # =========================================================================
 
-        # Apply custom audio mask if audio exists
-        if extended_audio_latent is not None:
-            num_audio_patches = audio_state.denoise_mask.shape[1]
-            audio_mask_flat = audio_mask.reshape(1, -1, 1)[:, :num_audio_patches, :]
-            audio_state_masked = dataclass_replace(
-                audio_state,
-                denoise_mask=audio_mask_flat.to(device=device, dtype=torch.float32),
-            )
-        else:
-            audio_state_masked = audio_state
+    from ltx_core.types import VideoLatentShape, AudioLatentShape
+    from ltx_core.tools import VideoLatentTools, AudioLatentTools
+    from ltx_pipelines.utils.helpers import euler_denoising_loop
 
-        return euler_denoising_loop(
-            sigmas=sigmas,
-            video_state=video_state_masked,
-            audio_state=audio_state_masked,
-            stepper=stepper,
-            denoise_fn=denoise_fn,
-        )
-
-    # Use denoise_audio_video like the working generate() method
-    # This properly handles audio state creation with correct positional dimensions
-    from ltx_pipelines.utils.helpers import denoise_audio_video
-
-    final_video_state, final_audio_state = denoise_audio_video(
-        output_shape=output_shape,
-        conditionings=[],  # AV extension uses mask-based conditioning in the loop
-        noiser=noiser,
-        sigmas=sigmas,
-        stepper=stepper,
-        denoising_loop_fn=av_extension_denoising_loop,
-        components=components,
-        dtype=dtype,
-        device=device,
-        noise_scale=1.0,
-        initial_video_latent=extended_video_latent,
-        initial_audio_latent=extended_audio_latent,
-        audio_conditionings=None,
+    # Create video latent tools
+    video_latent_shape = VideoLatentShape.from_pixel_shape(
+        shape=output_shape,
+        latent_channels=components.video_latent_channels,
+        scale_factors=components.video_scale_factors,
+    )
+    video_tools = VideoLatentTools(
+        patchifier=components.video_patchifier,
+        target_shape=video_latent_shape,
+        fps=output_fps,
     )
 
+    # Create initial state (this creates all-ones mask and patchifies everything)
+    video_state = video_tools.create_initial_state(device, dtype, extended_video_latent)
+
+    # Patchify our custom mask to match the state's mask shape
+    # video_mask is [B, 1, F, H, W] -> patchified becomes [B, num_patches, 1]
+    patchified_video_mask = video_tools.patchifier.patchify(video_mask.to(device=device))
+
+    # Replace the all-ones mask with our custom mask BEFORE noising
+    video_state = dataclass_replace(
+        video_state,
+        denoise_mask=patchified_video_mask.to(dtype=torch.float32),
+    )
+
+    # NOW apply noiser - it will use our mask to NOT noise preserved regions
+    # Where mask=0 (preserve): latent = noise * 0 + original * 1 = original
+    # Where mask=1 (generate): latent = noise * 1 + original * 0 = noise
+    video_state = noiser(video_state, noise_scale=1.0)
+
+    # Create audio state similarly (if audio exists)
+    # Note: AudioLatentShape.from_video_pixel_shape defaults to channels=8
+    if extended_audio_latent is not None:
+        audio_latent_shape = AudioLatentShape.from_video_pixel_shape(shape=output_shape)
+        audio_tools = AudioLatentTools(
+            patchifier=components.audio_patchifier,
+            target_shape=audio_latent_shape,
+        )
+
+        # Create initial audio state
+        audio_state = audio_tools.create_initial_state(device, dtype, extended_audio_latent)
+
+        # Patchify and apply audio mask BEFORE noising
+        patchified_audio_mask = audio_tools.patchifier.patchify(audio_mask.to(device=device))
+        audio_state = dataclass_replace(
+            audio_state,
+            denoise_mask=patchified_audio_mask.to(dtype=torch.float32),
+        )
+
+        # Apply noiser with mask
+        audio_state = noiser(audio_state, noise_scale=1.0)
+    else:
+        # Create dummy audio state (required by euler_denoising_loop)
+        audio_latent_shape = AudioLatentShape.from_video_pixel_shape(shape=output_shape)
+        audio_tools = AudioLatentTools(
+            patchifier=components.audio_patchifier,
+            target_shape=audio_latent_shape,
+        )
+        audio_state = audio_tools.create_initial_state(device, dtype, None)
+        # Disable audio by setting mask to 0 (no denoising)
+        audio_state = dataclass_replace(
+            audio_state,
+            denoise_mask=torch.zeros_like(audio_state.denoise_mask),
+        )
+        audio_state = noiser(audio_state, noise_scale=1.0)
+
+    # Run denoising loop with properly masked states
+    final_video_state, final_audio_state = euler_denoising_loop(
+        sigmas=sigmas,
+        video_state=video_state,
+        audio_state=audio_state,
+        stepper=stepper,
+        denoise_fn=denoise_fn,
+    )
+
+    # Clear conditioning and unpatchify
+    final_video_state = video_tools.clear_conditioning(final_video_state)
+    final_video_state = video_tools.unpatchify(final_video_state)
+
+    if extended_audio_latent is not None:
+        final_audio_state = audio_tools.clear_conditioning(final_audio_state)
+        final_audio_state = audio_tools.unpatchify(final_audio_state)
+
     # =========================================================================
-    # Step 8: Get denoised latents (already unpatchified by denoise_audio_video)
+    # Step 8: Get denoised latents
     # =========================================================================
     print(">>> Denoising complete...")
     denoised_video_latent = final_video_state.latent
