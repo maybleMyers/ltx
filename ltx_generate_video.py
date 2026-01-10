@@ -3992,25 +3992,92 @@ def generate_av_extension(
                 denoise_fn=stage2_denoise_fn,
             )
 
-        # 9H: Run stage 2 denoising with denoise_audio_video
-        print(f">>> Stage 2 denoising with {len(stage2_sigmas) - 1} steps...")
-        final_stage2_video, final_stage2_audio = denoise_audio_video(
-            output_shape=stage2_output_shape,
-            conditionings=[],  # No additional conditionings for stage 2
-            noiser=noiser,
-            sigmas=stage2_sigmas,
-            stepper=stepper,
-            denoising_loop_fn=stage2_denoising_loop,
-            components=stage2_components,
-            dtype=dtype,
-            device=device,
-            noise_scale=stage2_sigmas[0].item(),
-            initial_video_latent=upscaled_video_latent,
-            initial_audio_latent=denoised_audio_latent,
-            audio_conditionings=None,
+        # 9H: Run stage 2 denoising WITH PRESERVATION MASK
+        # Unlike denoise_audio_video which creates all-ones mask, we manually apply
+        # the preservation mask to prevent re-denoising the input video frames
+        print(f">>> Stage 2 denoising with {len(stage2_sigmas) - 1} steps (with preservation mask)...")
+
+        # Upscale video_mask to stage 2 resolution (2x spatial)
+        # video_mask is [B, 1, F, H, W] from stage 1
+        stage2_video_mask = torch.nn.functional.interpolate(
+            video_mask.to(device=device, dtype=torch.float32),
+            scale_factor=(1, 2, 2),  # Keep F, 2x H and W
+            mode='nearest'  # Binary mask, use nearest neighbor
         )
 
-        # 9I: Get stage 2 results (already unpatchified by denoise_audio_video)
+        # Create stage 2 video latent tools
+        stage2_video_latent_shape = VideoLatentShape.from_pixel_shape(
+            shape=stage2_output_shape,
+            latent_channels=stage2_components.video_latent_channels,
+            scale_factors=stage2_components.video_scale_factors,
+        )
+        stage2_video_tools = VideoLatentTools(
+            patchifier=stage2_components.video_patchifier,
+            target_shape=stage2_video_latent_shape,
+            fps=output_fps,
+        )
+
+        # Create initial video state with upscaled latent
+        stage2_video_state = stage2_video_tools.create_initial_state(
+            device, dtype, upscaled_video_latent
+        )
+
+        # Apply preservation mask (patchify and replace)
+        patchified_stage2_video_mask = stage2_video_tools.patchifier.patchify(stage2_video_mask)
+        stage2_video_state = dataclass_replace(
+            stage2_video_state,
+            denoise_mask=patchified_stage2_video_mask.to(dtype=torch.float32),
+        )
+
+        # Apply noiser WITH mask - preserved frames won't get noise
+        stage2_video_state = noiser(stage2_video_state, noise_scale=stage2_sigmas[0].item())
+
+        # Handle audio state similarly
+        stage2_audio_latent_shape = AudioLatentShape.from_video_pixel_shape(stage2_output_shape)
+        stage2_audio_tools = AudioLatentTools(
+            patchifier=stage2_components.audio_patchifier,
+            target_shape=stage2_audio_latent_shape,
+        )
+
+        if denoised_audio_latent is not None and audio_mask is not None:
+            # Upscale audio mask (only temporal, no spatial for audio)
+            # audio_mask is [B, 1, F_audio, mel_bins]
+            stage2_audio_mask = audio_mask.to(device=device, dtype=torch.float32)
+
+            stage2_audio_state = stage2_audio_tools.create_initial_state(
+                device, dtype, denoised_audio_latent
+            )
+            patchified_stage2_audio_mask = stage2_audio_tools.patchifier.patchify(stage2_audio_mask)
+            stage2_audio_state = dataclass_replace(
+                stage2_audio_state,
+                denoise_mask=patchified_stage2_audio_mask.to(dtype=torch.float32),
+            )
+            stage2_audio_state = noiser(stage2_audio_state, noise_scale=stage2_sigmas[0].item())
+        else:
+            # Create dummy audio state with no denoising (mask=0)
+            stage2_audio_state = stage2_audio_tools.create_initial_state(device, dtype, None)
+            stage2_audio_state = dataclass_replace(
+                stage2_audio_state,
+                denoise_mask=torch.zeros_like(stage2_audio_state.denoise_mask),
+            )
+            stage2_audio_state = noiser(stage2_audio_state, noise_scale=stage2_sigmas[0].item())
+
+        # Run stage 2 denoising loop with masked states
+        final_stage2_video, final_stage2_audio = euler_denoising_loop(
+            sigmas=stage2_sigmas,
+            video_state=stage2_video_state,
+            audio_state=stage2_audio_state,
+            stepper=stepper,
+            denoise_fn=stage2_denoise_fn,
+        )
+
+        # Unpatchify results
+        final_stage2_video = stage2_video_tools.clear_conditioning(final_stage2_video)
+        final_stage2_video = stage2_video_tools.unpatchify(final_stage2_video)
+        final_stage2_audio = stage2_audio_tools.clear_conditioning(final_stage2_audio)
+        final_stage2_audio = stage2_audio_tools.unpatchify(final_stage2_audio)
+
+        # 9I: Get stage 2 results
         denoised_video_latent = final_stage2_video.latent
         if denoised_audio_latent is not None:
             denoised_audio_latent = final_stage2_audio.latent
