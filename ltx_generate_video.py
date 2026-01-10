@@ -512,34 +512,14 @@ def create_av_noise_mask(
         end_time, video_fps, time_scale_factor, video_latent_frame_count
     )
 
-    # Create gradient mask with slope transition at boundaries
-    # This prevents artifacts from hard mask boundaries
-    for frame_idx in range(video_latent_frame_count):
-        if frame_idx < video_start_idx - slope_len:
-            # Fully preserve (before transition)
-            mask_value = 0.0
-        elif frame_idx < video_start_idx + slope_len:
-            # Gradient transition from preserve to generate
-            # Linear ramp from 0 to 1 over 2*slope_len frames centered at video_start_idx
-            t = (frame_idx - (video_start_idx - slope_len)) / (2 * slope_len)
-            mask_value = min(1.0, max(0.0, t))
-        elif frame_idx < video_end_idx - slope_len:
-            # Fully generate (middle region)
-            mask_value = 1.0
-        elif frame_idx < video_end_idx + slope_len:
-            # Gradient transition from generate back to preserve (if end is within video)
-            t = (frame_idx - (video_end_idx - slope_len)) / (2 * slope_len)
-            mask_value = max(0.0, min(1.0, 1.0 - t))
-        else:
-            # Fully preserve (after end transition)
-            mask_value = 0.0
+    # Use HARD 0/1 masks during denoising (like ComfyUI)
+    # slope_len is only for post-processing blend coefficients, NOT for the denoising mask
+    # Partial mask values cause grey noise because model receives inconsistent signals
+    video_mask[:, :, video_start_idx:video_end_idx, :, :] = 1.0
 
-        video_mask[:, :, frame_idx, :, :] = mask_value
-
-    print(f"[AV Extension] Video mask: preserve frames 0-{max(0, video_start_idx - slope_len)}, "
-          f"transition {max(0, video_start_idx - slope_len)}-{min(video_latent_frame_count, video_start_idx + slope_len)}, "
-          f"generate frames {video_start_idx + slope_len}-{video_end_idx - slope_len} "
-          f"(total {video_latent_frame_count} latent frames, slope_len={slope_len})")
+    print(f"[AV Extension] Video mask: preserve frames 0-{video_start_idx}, "
+          f"generate frames {video_start_idx}-{video_end_idx} "
+          f"(total {video_latent_frame_count} latent frames)")
 
     # Audio mask - also single channel [B, 1, F, mel_bins]
     audio_mask = None
@@ -560,26 +540,12 @@ def create_av_noise_mask(
             end_time, sampling_rate, mel_hop_length, audio_latent_frame_count
         )
 
-        # Create gradient mask for audio with slope transition
-        for frame_idx in range(audio_latent_frame_count):
-            if frame_idx < audio_start_idx - slope_len:
-                mask_value = 0.0
-            elif frame_idx < audio_start_idx + slope_len:
-                t = (frame_idx - (audio_start_idx - slope_len)) / (2 * slope_len)
-                mask_value = min(1.0, max(0.0, t))
-            elif frame_idx < audio_end_idx - slope_len:
-                mask_value = 1.0
-            elif frame_idx < audio_end_idx + slope_len:
-                t = (frame_idx - (audio_end_idx - slope_len)) / (2 * slope_len)
-                mask_value = max(0.0, min(1.0, 1.0 - t))
-            else:
-                mask_value = 0.0
+        # Use HARD 0/1 masks during denoising (like ComfyUI)
+        audio_mask[:, :, audio_start_idx:audio_end_idx, :] = 1.0
 
-            audio_mask[:, :, frame_idx, :] = mask_value
-
-        print(f"[AV Extension] Audio mask: preserve frames 0-{max(0, audio_start_idx - slope_len)}, "
-              f"generate frames {audio_start_idx + slope_len}-{audio_end_idx - slope_len} "
-              f"(total {audio_latent_frame_count} latent frames, slope_len={slope_len})")
+        print(f"[AV Extension] Audio mask: preserve frames 0-{audio_start_idx}, "
+              f"generate frames {audio_start_idx}-{audio_end_idx} "
+              f"(total {audio_latent_frame_count} latent frames)")
 
     return video_mask, audio_mask
 
@@ -3409,7 +3375,9 @@ def generate_av_extension(
     audio_sample_rate = None
 
     try:
-        waveform, sample_rate = decode_audio_from_file(input_video_path, AUDIO_SAMPLE_RATE)
+        # Pass device (not sample_rate!) to decode_audio_from_file
+        # The function gets sample_rate from the audio stream itself
+        waveform, sample_rate = decode_audio_from_file(input_video_path, device)
         if waveform is not None:
             audio_waveform = waveform
             audio_sample_rate = sample_rate
@@ -3729,11 +3697,14 @@ def generate_av_extension(
         transformer = generator.stage_1_model_ledger.transformer()
 
     # Create sigma schedule with terminal value for smooth continuation
-    sigmas = LTX2Scheduler().execute(steps=extend_steps).to(
-        dtype=torch.float32, device=device
-    )
-    # Apply terminal sigma scaling for partial denoising
-    sigmas = sigmas * (1.0 - terminal) + terminal * sigmas[-1]
+    # CRITICAL: Pass latent to scheduler for correct sigma shift based on token count
+    # Without latent, scheduler defaults to 4096 tokens which gives wrong sigma schedule
+    sigmas = LTX2Scheduler().execute(
+        steps=extend_steps,
+        latent=extended_video_latent,  # For correct sigma shift calculation
+        terminal=terminal,
+        stretch=True,
+    ).to(dtype=torch.float32, device=device)
 
     # Initialize diffusion components
     generator_torch = torch.Generator(device=device).manual_seed(args.seed)
