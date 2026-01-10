@@ -3597,7 +3597,6 @@ def generate_av_extension(
     if generator.enable_dit_block_swap:
         print(f">>> Loading DiT transformer with block swapping ({generator.dit_blocks_in_memory} blocks in GPU)...", flush=True)
         from ltx_core.loader.sft_loader import SafetensorsStateDictLoader
-        from ltx_core.loader.block_swap import enable_block_swap
 
         # Check if there are LoRAs to apply
         has_loras = hasattr(generator.stage_1_model_ledger, 'loras') and generator.stage_1_model_ledger.loras
@@ -3797,7 +3796,6 @@ def generate_av_extension(
 
     # Delete stage 1 transformer with proper block swap cleanup
     if block_swap_manager is not None:
-        from ltx_core.loader.block_swap import offload_all_blocks
         offload_all_blocks(transformer)
         transformer.velocity_model._block_swap_offloader = None
         transformer.velocity_model._blocks_ref = None
@@ -3833,7 +3831,6 @@ def generate_av_extension(
         if generator.enable_refiner_block_swap:
             print(f">>> Loading stage 2 transformer with block swapping ({generator.refiner_blocks_in_memory} blocks in GPU)...", flush=True)
             from ltx_core.loader.sft_loader import SafetensorsStateDictLoader
-            from ltx_core.loader.block_swap import enable_block_swap
 
             # Create ledger without LoRAs for fast base model loading
             stage_2_ledger_no_lora = ModelLedger(
@@ -3988,7 +3985,6 @@ def generate_av_extension(
 
         # Cleanup stage 2 transformer with proper block swap handling
         if stage2_block_swap_manager is not None:
-            from ltx_core.loader.block_swap import offload_all_blocks
             offload_all_blocks(stage2_transformer)
             stage2_transformer.velocity_model._block_swap_offloader = None
             stage2_transformer.velocity_model._blocks_ref = None
