@@ -4138,35 +4138,32 @@ def generate_av_extension(
         # Apply noiser WITH mask - preserved frames won't get noise
         stage2_video_state = noiser(stage2_video_state, noise_scale=stage2_sigmas[0].item())
 
-        # Handle audio state similarly
-        stage2_audio_latent_shape = AudioLatentShape.from_video_pixel_shape(stage2_output_shape)
+        # Handle audio state for stage 2
+        # IMPORTANT: Audio does NOT go through stage 2 refinement (matching ComfyUI behavior)
+        # - Audio has no spatial dimensions to upsample
+        # - Audio latent frame count stays constant from stage 1
+        # - Stage 2 is specifically for video spatial upsampling refinement
+        # Use actual audio latent shape (from stage 1), not upscaled video shape
+        if denoised_audio_latent is not None:
+            stage2_audio_latent_shape = AudioLatentShape.from_torch_shape(denoised_audio_latent.shape)
+        else:
+            stage2_audio_latent_shape = AudioLatentShape.from_video_pixel_shape(stage2_output_shape)
+
         stage2_audio_tools = AudioLatentTools(
             patchifier=stage2_components.audio_patchifier,
             target_shape=stage2_audio_latent_shape,
         )
 
-        if denoised_audio_latent is not None and audio_mask is not None:
-            # Upscale audio mask (only temporal, no spatial for audio)
-            # audio_mask is [B, 1, F_audio, mel_bins]
-            stage2_audio_mask = audio_mask.to(device=device, dtype=torch.float32)
-
-            stage2_audio_state = stage2_audio_tools.create_initial_state(
-                device, dtype, denoised_audio_latent
-            )
-            patchified_stage2_audio_mask = stage2_audio_tools.patchifier.patchify(stage2_audio_mask)
-            stage2_audio_state = dataclass_replace(
-                stage2_audio_state,
-                denoise_mask=patchified_stage2_audio_mask.to(dtype=torch.float32),
-            )
-            stage2_audio_state = noiser(stage2_audio_state, noise_scale=stage2_sigmas[0].item())
-        else:
-            # Create dummy audio state with no denoising (mask=0)
-            stage2_audio_state = stage2_audio_tools.create_initial_state(device, dtype, None)
-            stage2_audio_state = dataclass_replace(
-                stage2_audio_state,
-                denoise_mask=torch.zeros_like(stage2_audio_state.denoise_mask),
-            )
-            stage2_audio_state = noiser(stage2_audio_state, noise_scale=stage2_sigmas[0].item())
+        # Create audio state with zero mask to DISABLE stage 2 audio denoising
+        # Audio passes through unchanged, only video gets refined
+        stage2_audio_state = stage2_audio_tools.create_initial_state(
+            device, dtype, denoised_audio_latent
+        )
+        stage2_audio_state = dataclass_replace(
+            stage2_audio_state,
+            denoise_mask=torch.zeros_like(stage2_audio_state.denoise_mask),
+        )
+        stage2_audio_state = noiser(stage2_audio_state, noise_scale=stage2_sigmas[0].item())
 
         # Run stage 2 denoising loop with masked states
         final_stage2_video, final_stage2_audio = euler_denoising_loop(
