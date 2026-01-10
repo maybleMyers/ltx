@@ -4009,9 +4009,9 @@ def generate_av_extension(
         del audio_decoder, vocoder
         cleanup_memory()
 
-    print(f">>> Output video shape: {decoded_video.shape}")
+    print(">>> Decoding complete.")
     if decoded_audio is not None:
-        print(f">>> Output audio shape: {decoded_audio.shape}")
+        print(f">>> Audio decoded: {decoded_audio.shape}")
 
     return decoded_video, decoded_audio
 
