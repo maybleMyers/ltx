@@ -3566,17 +3566,7 @@ def generate_av_extension(
     # =========================================================================
     print(">>> Running masked denoising...")
 
-    # Load transformer
-    transformer = generator.stage_1_model_ledger.transformer()
-
-    # Create sigma schedule with terminal value for smooth continuation
-    sigmas = LTX2Scheduler().execute(steps=extend_steps).to(
-        dtype=torch.float32, device=device
-    )
-    # Apply terminal sigma scaling for partial denoising
-    sigmas = sigmas * (1.0 - terminal) + terminal * sigmas[-1]
-
-    # Encode prompts
+    # 7A: Load text encoder FIRST and encode prompts (before transformer!)
     text_encoder = generator.stage_1_model_ledger.text_encoder()
     print(">>> Encoding prompts...")
     if args.cfg_guidance_scale > 1.0:
@@ -3588,10 +3578,11 @@ def generate_av_extension(
         v_context_p, a_context_p = context_p
         v_context_n, a_context_n = None, None
 
+    # 7B: Delete text encoder BEFORE loading transformer
     del text_encoder
     cleanup_memory()
 
-    # RELOAD: Move latents and masks back to GPU for denoising
+    # 7C: Reload latents to GPU (after text encoder is gone)
     print(">>> Reloading latents to GPU for denoising...")
     extended_video_latent = extended_video_latent.to(device=device, dtype=dtype)
     if extended_audio_latent is not None:
@@ -3599,6 +3590,106 @@ def generate_av_extension(
     video_mask = video_mask.to(device=device)
     if audio_mask is not None:
         audio_mask = audio_mask.to(device=device)
+
+    # 7D: NOW load transformer (text encoder memory is freed)
+    # Use the same block swapping pattern as main generate() if enabled
+    block_swap_manager = None
+    if generator.enable_dit_block_swap:
+        print(f">>> Loading DiT transformer with block swapping ({generator.dit_blocks_in_memory} blocks in GPU)...", flush=True)
+        from ltx_core.loader.sft_loader import SafetensorsStateDictLoader
+        from ltx_core.loader.block_swap import enable_block_swap
+
+        # Check if there are LoRAs to apply
+        has_loras = hasattr(generator.stage_1_model_ledger, 'loras') and generator.stage_1_model_ledger.loras
+
+        if has_loras:
+            # Create ledger without LoRAs for fast base model loading
+            stage_1_ledger_no_lora = ModelLedger(
+                dtype=generator.dtype,
+                device=torch.device("cpu"),
+                checkpoint_path=generator.stage_1_model_ledger.checkpoint_path,
+                gemma_root_path=generator.stage_1_model_ledger.gemma_root_path,
+                spatial_upsampler_path=generator.stage_1_model_ledger.spatial_upsampler_path,
+                loras=(),  # No LoRAs - load base model only
+                fp8transformer=generator.stage_1_model_ledger.fp8transformer,
+            )
+            transformer = stage_1_ledger_no_lora.transformer()
+
+            # Apply LoRAs using chunked GPU computation
+            loras = generator.stage_1_model_ledger.loras
+            print(f">>> Applying {len(loras)} LoRA(s) using chunked GPU computation...", flush=True)
+            lora_loader = SafetensorsStateDictLoader()
+            lora_state_dicts = []
+            lora_strengths = []
+            for lora in loras:
+                lora_sd = lora_loader.load(lora.path, sd_ops=lora.sd_ops, device=torch.device("cpu"))
+                lora_state_dicts.append(lora_sd)
+                lora_strengths.append(lora.strength)
+
+            apply_loras_chunked_gpu(
+                model=transformer,
+                lora_state_dicts=lora_state_dicts,
+                lora_strengths=lora_strengths,
+                gpu_device=device,
+                dtype=dtype,
+            )
+            del lora_state_dicts
+            cleanup_memory()
+        else:
+            # No LoRAs - load directly to CPU
+            original_device = generator.stage_1_model_ledger.device
+            generator.stage_1_model_ledger.device = torch.device("cpu")
+            transformer = generator.stage_1_model_ledger.transformer()
+            generator.stage_1_model_ledger.device = original_device
+
+        # Move non-block components to GPU, keep blocks on CPU
+        transformer.velocity_model.patchify_proj.to(device)
+        transformer.velocity_model.adaln_single.to(device)
+        transformer.velocity_model.caption_projection.to(device)
+        transformer.velocity_model.norm_out.to(device)
+        transformer.velocity_model.proj_out.to(device)
+        transformer.velocity_model.scale_shift_table = torch.nn.Parameter(
+            transformer.velocity_model.scale_shift_table.to(device)
+        )
+        # Audio components
+        if hasattr(transformer.velocity_model, "audio_patchify_proj"):
+            transformer.velocity_model.audio_patchify_proj.to(device)
+        if hasattr(transformer.velocity_model, "audio_adaln_single"):
+            transformer.velocity_model.audio_adaln_single.to(device)
+        if hasattr(transformer.velocity_model, "audio_caption_projection"):
+            transformer.velocity_model.audio_caption_projection.to(device)
+        if hasattr(transformer.velocity_model, "audio_norm_out"):
+            transformer.velocity_model.audio_norm_out.to(device)
+        if hasattr(transformer.velocity_model, "audio_proj_out"):
+            transformer.velocity_model.audio_proj_out.to(device)
+        if hasattr(transformer.velocity_model, "audio_scale_shift_table"):
+            transformer.velocity_model.audio_scale_shift_table = torch.nn.Parameter(
+                transformer.velocity_model.audio_scale_shift_table.to(device)
+            )
+        # Cross-attention components
+        if hasattr(transformer.velocity_model, "av_ca_video_scale_shift_adaln_single"):
+            transformer.velocity_model.av_ca_video_scale_shift_adaln_single.to(device)
+        if hasattr(transformer.velocity_model, "av_ca_audio_scale_shift_adaln_single"):
+            transformer.velocity_model.av_ca_audio_scale_shift_adaln_single.to(device)
+        if hasattr(transformer.velocity_model, "av_ca_a2v_gate_adaln_single"):
+            transformer.velocity_model.av_ca_a2v_gate_adaln_single.to(device)
+        if hasattr(transformer.velocity_model, "av_ca_v2a_gate_adaln_single"):
+            transformer.velocity_model.av_ca_v2a_gate_adaln_single.to(device)
+
+        block_swap_manager = enable_block_swap(
+            transformer,
+            blocks_in_memory=generator.dit_blocks_in_memory,
+            device=device,
+        )
+    else:
+        transformer = generator.stage_1_model_ledger.transformer()
+
+    # Create sigma schedule with terminal value for smooth continuation
+    sigmas = LTX2Scheduler().execute(steps=extend_steps).to(
+        dtype=torch.float32, device=device
+    )
+    # Apply terminal sigma scaling for partial denoising
+    sigmas = sigmas * (1.0 - terminal) + terminal * sigmas[-1]
 
     # Initialize diffusion components
     generator_torch = torch.Generator(device=device).manual_seed(args.seed)
@@ -3694,22 +3785,229 @@ def generate_av_extension(
         denoise_fn=denoise_fn,
     )
 
+    # =========================================================================
+    # Step 8: Unpatchify denoised latents (DO NOT DECODE YET - stage 2 needs latents)
+    # =========================================================================
+    print(">>> Unpatchifying latents...")
+    denoised_video_latent = video_tools.unpatchify(final_video_state.latent)
+
+    denoised_audio_latent = None
+    if final_audio_state is not None and extended_audio_latent is not None:
+        denoised_audio_latent = audio_tools.unpatchify(final_audio_state.latent)
+
+    # Delete stage 1 transformer with proper block swap cleanup
+    if block_swap_manager is not None:
+        from ltx_core.loader.block_swap import offload_all_blocks
+        offload_all_blocks(transformer)
+        transformer.velocity_model._block_swap_offloader = None
+        transformer.velocity_model._blocks_ref = None
+        block_swap_manager = None
     del transformer
     cleanup_memory()
 
     # =========================================================================
-    # Step 8: Decode latents to pixel space
+    # Step 9: Stage 2 Refinement (if enabled) - operates on LATENTS, not pixels
+    # =========================================================================
+    if not skip_stage2 and not generator.one_stage:
+        print(">>> Stage 2 refinement...")
+
+        # 9A: Spatial upsampling of LATENT (2x in H/W)
+        from ltx_core.model.upsampler import upsample_video as upsample_latent_fn
+
+        video_encoder = generator.stage_1_model_ledger.video_encoder()
+        spatial_upsampler = generator.stage_2_model_ledger.spatial_upsampler()
+
+        print(">>> Upsampling latents (2x)...")
+        upscaled_video_latent = upsample_latent_fn(
+            latent=denoised_video_latent,
+            video_encoder=video_encoder,
+            upsampler=spatial_upsampler,
+        )
+
+        del spatial_upsampler
+        cleanup_memory()
+
+        # 9B: Load stage 2 transformer with distilled LoRA
+        print(">>> Loading stage 2 transformer...")
+        stage2_block_swap_manager = None
+        if generator.enable_refiner_block_swap:
+            print(f">>> Loading stage 2 transformer with block swapping ({generator.refiner_blocks_in_memory} blocks in GPU)...", flush=True)
+            from ltx_core.loader.sft_loader import SafetensorsStateDictLoader
+            from ltx_core.loader.block_swap import enable_block_swap
+
+            # Create ledger without LoRAs for fast base model loading
+            stage_2_ledger_no_lora = ModelLedger(
+                dtype=generator.dtype,
+                device=torch.device("cpu"),
+                checkpoint_path=generator.stage_2_model_ledger.checkpoint_path if hasattr(generator.stage_2_model_ledger, 'checkpoint_path') else generator.stage_1_model_ledger.checkpoint_path,
+                gemma_root_path=generator.stage_2_model_ledger.gemma_root_path if hasattr(generator.stage_2_model_ledger, 'gemma_root_path') else generator.stage_1_model_ledger.gemma_root_path,
+                spatial_upsampler_path=generator.stage_2_model_ledger.spatial_upsampler_path if hasattr(generator.stage_2_model_ledger, 'spatial_upsampler_path') else generator.stage_1_model_ledger.spatial_upsampler_path,
+                loras=(),  # No LoRAs - load base model only
+                fp8transformer=generator.stage_2_model_ledger.fp8transformer if hasattr(generator.stage_2_model_ledger, 'fp8transformer') else generator.stage_1_model_ledger.fp8transformer,
+            )
+            stage2_transformer = stage_2_ledger_no_lora.transformer()
+
+            # Apply LoRAs (distilled + user LoRAs) using chunked GPU computation
+            if hasattr(generator.stage_2_model_ledger, 'loras') and generator.stage_2_model_ledger.loras:
+                loras = generator.stage_2_model_ledger.loras
+                print(f">>> Applying {len(loras)} LoRA(s) for stage 2...", flush=True)
+                lora_loader = SafetensorsStateDictLoader()
+                lora_state_dicts = []
+                lora_strengths = []
+                for lora in loras:
+                    lora_sd = lora_loader.load(lora.path, sd_ops=lora.sd_ops, device=torch.device("cpu"))
+                    lora_state_dicts.append(lora_sd)
+                    lora_strengths.append(lora.strength)
+
+                apply_loras_chunked_gpu(
+                    model=stage2_transformer,
+                    lora_state_dicts=lora_state_dicts,
+                    lora_strengths=lora_strengths,
+                    gpu_device=device,
+                    dtype=dtype,
+                )
+                del lora_state_dicts
+                cleanup_memory()
+
+            # Move non-block components to GPU
+            stage2_transformer.velocity_model.patchify_proj.to(device)
+            stage2_transformer.velocity_model.adaln_single.to(device)
+            stage2_transformer.velocity_model.caption_projection.to(device)
+            stage2_transformer.velocity_model.norm_out.to(device)
+            stage2_transformer.velocity_model.proj_out.to(device)
+            stage2_transformer.velocity_model.scale_shift_table = torch.nn.Parameter(
+                stage2_transformer.velocity_model.scale_shift_table.to(device)
+            )
+            if hasattr(stage2_transformer.velocity_model, "audio_patchify_proj"):
+                stage2_transformer.velocity_model.audio_patchify_proj.to(device)
+            if hasattr(stage2_transformer.velocity_model, "audio_adaln_single"):
+                stage2_transformer.velocity_model.audio_adaln_single.to(device)
+            if hasattr(stage2_transformer.velocity_model, "audio_caption_projection"):
+                stage2_transformer.velocity_model.audio_caption_projection.to(device)
+            if hasattr(stage2_transformer.velocity_model, "audio_norm_out"):
+                stage2_transformer.velocity_model.audio_norm_out.to(device)
+            if hasattr(stage2_transformer.velocity_model, "audio_proj_out"):
+                stage2_transformer.velocity_model.audio_proj_out.to(device)
+            if hasattr(stage2_transformer.velocity_model, "audio_scale_shift_table"):
+                stage2_transformer.velocity_model.audio_scale_shift_table = torch.nn.Parameter(
+                    stage2_transformer.velocity_model.audio_scale_shift_table.to(device)
+                )
+            if hasattr(stage2_transformer.velocity_model, "av_ca_video_scale_shift_adaln_single"):
+                stage2_transformer.velocity_model.av_ca_video_scale_shift_adaln_single.to(device)
+            if hasattr(stage2_transformer.velocity_model, "av_ca_audio_scale_shift_adaln_single"):
+                stage2_transformer.velocity_model.av_ca_audio_scale_shift_adaln_single.to(device)
+            if hasattr(stage2_transformer.velocity_model, "av_ca_a2v_gate_adaln_single"):
+                stage2_transformer.velocity_model.av_ca_a2v_gate_adaln_single.to(device)
+            if hasattr(stage2_transformer.velocity_model, "av_ca_v2a_gate_adaln_single"):
+                stage2_transformer.velocity_model.av_ca_v2a_gate_adaln_single.to(device)
+
+            stage2_block_swap_manager = enable_block_swap(
+                stage2_transformer,
+                blocks_in_memory=generator.refiner_blocks_in_memory,
+                device=device,
+            )
+        else:
+            stage2_transformer = generator.stage_2_model_ledger.transformer()
+
+        # 9C: Stage 2 sigma schedule (pre-tuned for distilled model)
+        STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
+        num_stage2_sigmas = min(args.stage2_steps + 1, len(STAGE_2_DISTILLED_SIGMA_VALUES))
+        stage2_sigmas = torch.tensor(
+            STAGE_2_DISTILLED_SIGMA_VALUES[:num_stage2_sigmas],
+            dtype=torch.float32, device=device
+        )
+
+        # 9D: Create stage 2 output shape (full resolution)
+        stage2_output_shape = VideoPixelShape(
+            height=args.height,  # Full resolution
+            width=args.width,
+            frames=output_frames,
+            fps=output_fps,
+            batch=1,
+        )
+
+        # 9E: Prepare stage 2 denoising components
+        stage2_components = PipelineComponents(
+            video_patchifier=stage2_transformer.velocity_model.patchify_proj,
+            video_latent_channels=128,
+            video_scale_factors=(1, time_scale_factor, 32, 32),
+            audio_patchifier=getattr(stage2_transformer.velocity_model, 'audio_patchify_proj', None),
+            audio_latent_channels=32 if hasattr(stage2_transformer.velocity_model, 'audio_patchify_proj') and stage2_transformer.velocity_model.audio_patchify_proj is not None else 0,
+        )
+
+        # 9F: Create stage 2 video state
+        from ltx_pipelines.utils.helpers import noise_video_state, noise_audio_state
+
+        stage2_video_state, stage2_video_tools = noise_video_state(
+            output_shape=stage2_output_shape,
+            noiser=noiser,
+            conditionings=[],  # No additional conditionings for stage 2
+            components=stage2_components,
+            dtype=dtype,
+            device=device,
+            noise_scale=stage2_sigmas[0].item(),
+            initial_latent=upscaled_video_latent,
+        )
+
+        # 9G: Create stage 2 audio state if present
+        stage2_audio_state = None
+        stage2_audio_tools = None
+        if denoised_audio_latent is not None:
+            stage2_audio_state, stage2_audio_tools = noise_audio_state(
+                output_shape=stage2_output_shape,
+                noiser=noiser,
+                conditionings=[],
+                components=stage2_components,
+                dtype=dtype,
+                device=device,
+                noise_scale=stage2_sigmas[0].item(),
+                initial_latent=denoised_audio_latent,
+            )
+
+        # 9H: Stage 2 denoising function (NO CFG, just positive context)
+        stage2_denoise_fn = simple_denoising_func(
+            video_context=v_context_p,
+            audio_context=a_context_p,
+            transformer=stage2_transformer,
+        )
+
+        # 9I: Run stage 2 denoising loop
+        print(f">>> Stage 2 denoising with {len(stage2_sigmas) - 1} steps...")
+        final_stage2_video, final_stage2_audio = euler_denoising_loop(
+            sigmas=stage2_sigmas,
+            video_state=stage2_video_state,
+            audio_state=stage2_audio_state if stage2_audio_state is not None else stage2_video_state,
+            stepper=stepper,
+            denoise_fn=stage2_denoise_fn,
+        )
+
+        # 9J: Unpatchify stage 2 results
+        denoised_video_latent = stage2_video_tools.unpatchify(final_stage2_video.latent)
+        if final_stage2_audio is not None and stage2_audio_tools is not None:
+            denoised_audio_latent = stage2_audio_tools.unpatchify(final_stage2_audio.latent)
+
+        # Cleanup stage 2 transformer with proper block swap handling
+        if stage2_block_swap_manager is not None:
+            from ltx_core.loader.block_swap import offload_all_blocks
+            offload_all_blocks(stage2_transformer)
+            stage2_transformer.velocity_model._block_swap_offloader = None
+            stage2_transformer.velocity_model._blocks_ref = None
+            stage2_block_swap_manager = None
+        del stage2_transformer, video_encoder
+        cleanup_memory()
+
+    # =========================================================================
+    # Step 10: Decode final video (after stage 2 if enabled)
     # =========================================================================
     print(">>> Decoding video...")
 
-    # Reshape denoised latent back to spatial format
-    denoised_video_latent = video_tools.unpatchify(final_video_state.latent)
+    # Use stage 2 decoder for full resolution if stage 2 was run
+    if not skip_stage2 and not generator.one_stage:
+        video_decoder = generator.stage_2_model_ledger.video_decoder()
+    else:
+        video_decoder = generator.stage_1_model_ledger.video_decoder()
 
-    video_decoder = generator.stage_1_model_ledger.video_decoder()
-
-    # Decode with tiling for memory efficiency
     tiling_config = TilingConfig.default()
-
     decoded_video = list(vae_decode_video(
         latent_state=denoised_video_latent.to(dtype=torch.float32),
         vae_decoder=video_decoder,
@@ -3723,32 +4021,15 @@ def generate_av_extension(
 
     # Decode audio if present
     decoded_audio = None
-    if final_audio_state is not None and extended_audio_latent is not None:
+    if denoised_audio_latent is not None:
         print(">>> Decoding audio...")
-        denoised_audio_latent = audio_tools.unpatchify(final_audio_state.latent)
+        audio_decoder = generator.stage_1_model_ledger.audio_decoder()
         decoded_audio = vae_decode_audio(
             audio_latent=denoised_audio_latent.to(dtype=torch.float32),
-            audio_decoder=generator.stage_1_model_ledger.audio_decoder(),
+            audio_decoder=audio_decoder,
             sample_rate=AUDIO_SAMPLE_RATE,
         )
-
-    # =========================================================================
-    # Step 9: Optional Stage 2 refinement
-    # =========================================================================
-    if not skip_stage2 and not generator.one_stage:
-        print(">>> Stage 2 refinement...")
-        # TODO: Implement stage 2 refinement for extended video
-        # For now, just upsample spatially
-        from ltx_core.model.upsampler import upsample_video as upsample_video_fn
-
-        spatial_upsampler = generator.stage_2_model_ledger.spatial_upsampler()
-        decoded_video = upsample_video_fn(
-            video=decoded_video.permute(3, 0, 1, 2).unsqueeze(0),  # [1, C, F, H, W]
-            upsampler=spatial_upsampler,
-        )
-        decoded_video = decoded_video.squeeze(0).permute(1, 2, 3, 0)  # [F, H, W, C]
-
-        del spatial_upsampler
+        del audio_decoder
         cleanup_memory()
 
     print(f">>> Output video shape: {decoded_video.shape}")
