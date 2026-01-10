@@ -532,10 +532,10 @@ def generate_ltx_video(
     sliding_window_overlap: int,
     sliding_window_overlap_noise: float,
     sliding_window_color_correction: float,
-    # AV Extension (Time-Based Audio-Video Continuation)
+    # AV Extension (Frame-Based Audio-Video Continuation)
     av_extend_video: str,
-    av_extend_start_time: float,
-    av_extend_end_time: float,
+    av_extend_start_frame: int,
+    av_extend_end_frame: int,
     av_extend_steps: int,
     av_extend_terminal: float,
     av_slope_len: int,
@@ -737,13 +737,11 @@ def generate_ltx_video(
             if sliding_window_color_correction and float(sliding_window_color_correction) > 0:
                 command.extend(["--sliding-window-color-correction", str(float(sliding_window_color_correction))])
 
-        # AV Extension (time-based audio-video continuation)
+        # AV Extension (frame-based audio-video continuation)
         if av_extend_video and os.path.exists(av_extend_video):
             command.extend(["--av-extend-from", str(av_extend_video)])
-            if av_extend_start_time and float(av_extend_start_time) > 0:
-                command.extend(["--av-extend-start-time", str(float(av_extend_start_time))])
-            if av_extend_end_time and float(av_extend_end_time) > 0:
-                command.extend(["--av-extend-end-time", str(float(av_extend_end_time))])
+            command.extend(["--av-extend-start-frame", str(int(av_extend_start_frame))])
+            command.extend(["--av-extend-end-frame", str(int(av_extend_end_frame))])
             command.extend(["--av-extend-steps", str(int(av_extend_steps))])
             command.extend(["--av-extend-terminal", str(float(av_extend_terminal))])
             command.extend(["--av-slope-len", str(int(av_slope_len))])
@@ -1455,19 +1453,15 @@ Audio is synchronized with the video extension.
                                     type="filepath"
                                 )
                             with gr.Row():
-                                av_extend_start_time = gr.Number(
-                                    label="Start Time (seconds)",
-                                    value=0,
-                                    minimum=0,
-                                    maximum=300,
-                                    info="Time to start generating new content. 0 = auto (end of video)"
+                                av_extend_start_frame = gr.Slider(
+                                    minimum=9, maximum=2001, step=8, value=9,
+                                    label="Start Frame (8*K+1)",
+                                    info="Frame to start generating new content"
                                 )
-                                av_extend_end_time = gr.Number(
-                                    label="End Time (seconds)",
-                                    value=0,
-                                    minimum=0,
-                                    maximum=300,
-                                    info="Time to stop generation. 0 = auto (start + 5 seconds)"
+                                av_extend_end_frame = gr.Slider(
+                                    minimum=9, maximum=2001, step=8, value=121,
+                                    label="End Frame (8*K+1)",
+                                    info="Total output frames"
                                 )
                             with gr.Row():
                                 av_extend_steps = gr.Slider(
@@ -2019,8 +2013,8 @@ Audio is synchronized with the video extension.
                 # Sliding Window (Long Video)
                 sliding_window_size, sliding_window_overlap,
                 sliding_window_overlap_noise, sliding_window_color_correction,
-                # AV Extension (Time-Based Audio-Video Continuation)
-                av_extend_video, av_extend_start_time, av_extend_end_time,
+                # AV Extension (Frame-Based Audio-Video Continuation)
+                av_extend_video, av_extend_start_frame, av_extend_end_frame,
                 av_extend_steps, av_extend_terminal, av_slope_len, av_no_stage2,
             ],
             outputs=[output_gallery, preview_gallery, status_text, progress_text]

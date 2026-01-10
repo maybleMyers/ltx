@@ -1062,16 +1062,16 @@ Examples:
         help="Input video path to extend/continue from using time-based AV masking.",
     )
     av_ext_group.add_argument(
-        "--av-extend-start-time",
-        type=float,
+        "--av-extend-start-frame",
+        type=int,
         default=None,
-        help="Time (seconds) to start generating new content. Default: end of input video.",
+        help="Frame number (8*K+1 format) to start generating new content.",
     )
     av_ext_group.add_argument(
-        "--av-extend-end-time",
-        type=float,
+        "--av-extend-end-frame",
+        type=int,
         default=None,
-        help="Time (seconds) to stop generation. Default: start_time + 5 seconds.",
+        help="Total output frame count (8*K+1 format).",
     )
     av_ext_group.add_argument(
         "--av-extend-steps",
@@ -3209,19 +3209,19 @@ def generate_av_extension(
     generator: "LTXVideoGeneratorWithOffloading",
     args,
     input_video_path: str,
-    start_time: float | None = None,
-    end_time: float | None = None,
+    start_frame: int,
+    end_frame: int,
     extend_steps: int = 8,
     terminal: float = 0.1,
     slope_len: int = 3,
     skip_stage2: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """
-    Extend a video using time-based audio-video masking.
+    Extend a video using frame-based audio-video masking.
 
     This implements the LTXVSetAudioVideoMaskByTime approach from ComfyUI-LTXVideo:
     1. Load and encode input video and audio to latent space
-    2. Create noise masks based on time windows (preserve before start_time, generate after)
+    2. Create noise masks based on frame windows (preserve before start_frame, generate after)
     3. Run masked denoising to generate new content while preserving original
     4. Decode and return the extended video
 
@@ -3229,8 +3229,8 @@ def generate_av_extension(
         generator: LTXVideoGeneratorWithOffloading instance
         args: Command line arguments
         input_video_path: Path to video to extend
-        start_time: Time (seconds) to start generating new content (default: end of video)
-        end_time: Time (seconds) to stop generation (default: start_time + 5)
+        start_frame: Frame number (8*K+1) to start generating new content
+        end_frame: Total output frame count (8*K+1)
         extend_steps: Number of denoising steps for extension
         terminal: Terminal sigma for partial denoising (smaller = smoother continuation)
         slope_len: Transition length at mask boundaries
@@ -3247,7 +3247,7 @@ def generate_av_extension(
     dtype = generator.dtype
 
     print("=" * 60)
-    print("AV Extension Mode (Time-Based Audio-Video Masking)")
+    print("AV Extension Mode (Frame-Based Audio-Video Masking)")
     print("=" * 60)
 
     # =========================================================================
@@ -3266,20 +3266,16 @@ def generate_av_extension(
     print(f">>> Input video: {total_frames} frames at {input_fps:.1f} fps, {video_width}x{video_height}")
     print(f">>> Duration: {input_duration:.2f} seconds")
 
-    # Calculate time parameters
-    if start_time is None:
-        start_time = input_duration  # Start generating at end of video
-    if end_time is None:
-        end_time = start_time + 5.0  # Generate 5 seconds by default
-
-    print(f">>> Preserve: 0 - {start_time:.2f}s, Generate: {start_time:.2f} - {end_time:.2f}s")
-
-    # Calculate total output frames
+    # Use frame-based parameters directly (already 8n+1 from GUI)
     output_fps = args.frame_rate
-    output_frames = int(round(end_time * output_fps))
-    # Ensure output frames is valid (8n+1 format)
-    output_frames = ((output_frames - 1) // 8) * 8 + 1
+    output_frames = end_frame
 
+    # Calculate time equivalents for display
+    start_time = start_frame / output_fps
+    end_time = end_frame / output_fps
+
+    print(f">>> Preserve: frames 0-{start_frame} ({start_time:.2f}s)")
+    print(f">>> Generate: frames {start_frame}-{end_frame} ({start_time:.2f}s - {end_time:.2f}s)")
     print(f">>> Output: {output_frames} frames at {output_fps} fps ({output_frames / output_fps:.2f}s)")
 
     # =========================================================================
@@ -3304,9 +3300,14 @@ def generate_av_extension(
     stage1_height = (stage1_height // 64) * 64
 
     # Load frames from input video
+    # Convert start_frame (output fps) to input video frame count
+    input_start_frame = int(start_frame * input_fps / output_fps)
+    # Round to 8n+1 format to ensure proper VAE encoding
+    input_frames_to_load = ((input_start_frame - 1) // 8 + 1) * 8 + 1
+    input_frames_to_load = min(total_frames, input_frames_to_load + 16)  # Add buffer
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     input_frames = []
-    for _ in range(min(total_frames, int(start_time * input_fps) + 16)):  # Load up to start_time + some buffer
+    for _ in range(input_frames_to_load):
         ret, frame = cap.read()
         if not ret:
             break
@@ -3373,15 +3374,18 @@ def generate_av_extension(
             end_frame = min(start_frame + chunk_pixel_frames, total_pixel_frames)
             actual_frames = end_frame - start_frame
 
-            # Ensure we have at least 9 frames (minimum for VAE)
-            if actual_frames < 9:
-                # Pad with last frame
-                pad_frames = 9 - actual_frames
-                chunk = video_input[:, :, start_frame:end_frame, :, :]
+            # Ensure chunk has valid 8n+1 frame count for VAE
+            # Calculate target frames (next 8n+1 value >= actual_frames, minimum 9)
+            target_frames = ((actual_frames - 1) // 8 + 1) * 8 + 1
+            if target_frames < 9:
+                target_frames = 9
+
+            chunk = video_input[:, :, start_frame:end_frame, :, :]
+            if actual_frames < target_frames:
+                # Pad with last frame to reach valid 8n+1 count
+                pad_frames = target_frames - actual_frames
                 last_frame = chunk[:, :, -1:, :, :].expand(-1, -1, pad_frames, -1, -1)
                 chunk = torch.cat([chunk, last_frame], dim=2)
-            else:
-                chunk = video_input[:, :, start_frame:end_frame, :, :]
 
             # Encode chunk
             chunk_latent = video_encoder(chunk.to(device=device, dtype=encoder_dtype))
@@ -3828,7 +3832,10 @@ def generate_av_extension(
         cap_full = cv2.VideoCapture(input_video_path)
         cap_full.set(cv2.CAP_PROP_POS_FRAMES, 0)
         full_res_frames = []
-        frames_to_load = min(int(cap_full.get(cv2.CAP_PROP_FRAME_COUNT)), int(start_time * input_fps) + 16)
+        # Convert start_frame (output fps) to input video frame count
+        full_res_input_frames = int(start_frame * input_fps / output_fps)
+        full_res_input_frames = ((full_res_input_frames - 1) // 8 + 1) * 8 + 1
+        frames_to_load = min(int(cap_full.get(cv2.CAP_PROP_FRAME_COUNT)), full_res_input_frames + 16)
         for _ in range(frames_to_load):
             ret, frame = cap_full.read()
             if not ret:
@@ -3861,13 +3868,16 @@ def generate_av_extension(
                 end_frame_idx = min(start_frame_idx + chunk_pixel_frames, total_pixel_frames_full)
                 actual_frames_chunk = end_frame_idx - start_frame_idx
 
-                if actual_frames_chunk < 9:
-                    pad_frames = 9 - actual_frames_chunk
-                    chunk = full_res_input[:, :, start_frame_idx:end_frame_idx, :, :]
+                # Ensure chunk has valid 8n+1 frame count for VAE
+                target_frames_chunk = ((actual_frames_chunk - 1) // 8 + 1) * 8 + 1
+                if target_frames_chunk < 9:
+                    target_frames_chunk = 9
+
+                chunk = full_res_input[:, :, start_frame_idx:end_frame_idx, :, :]
+                if actual_frames_chunk < target_frames_chunk:
+                    pad_frames = target_frames_chunk - actual_frames_chunk
                     last_frame = chunk[:, :, -1:, :, :].expand(-1, -1, pad_frames, -1, -1)
                     chunk = torch.cat([chunk, last_frame], dim=2)
-                else:
-                    chunk = full_res_input[:, :, start_frame_idx:end_frame_idx, :, :]
 
                 chunk_latent = video_encoder(chunk.to(device=device, dtype=encoder_dtype))
                 chunk_latent = chunk_latent.to(dtype=dtype)
@@ -4862,10 +4872,10 @@ def main():
             print(f"  Prepend Original: {args.prepend_original}")
     # AV Extension mode info
     if args.av_extend_from:
-        print(f"AV Extension Mode: Time-Based Audio-Video Continuation")
+        print(f"AV Extension Mode: Frame-Based Audio-Video Continuation")
         print(f"  Input Video: {args.av_extend_from}")
-        print(f"  Start Time: {args.av_extend_start_time or 'auto (end of video)'}s")
-        print(f"  End Time: {args.av_extend_end_time or 'auto (start + 5s)'}s")
+        print(f"  Start Frame: {args.av_extend_start_frame}")
+        print(f"  End Frame: {args.av_extend_end_frame}")
         print(f"  Extension Steps: {args.av_extend_steps}")
         print(f"  Terminal Sigma: {args.av_extend_terminal}")
         print(f"  Skip Stage 2: {args.av_no_stage2}")
@@ -4938,15 +4948,15 @@ def main():
     elif args.av_extend_from:
         # AV Extension mode: time-based audio-video masking
         print("=" * 60)
-        print(">>> Using AV Extension mode (time-based audio-video masking)")
+        print(">>> Using AV Extension mode (frame-based audio-video masking)")
         print("=" * 60)
 
         video_tensor, audio = generate_av_extension(
             generator=generator,
             args=args,
             input_video_path=args.av_extend_from,
-            start_time=args.av_extend_start_time,
-            end_time=args.av_extend_end_time,
+            start_frame=args.av_extend_start_frame,
+            end_frame=args.av_extend_end_frame,
             extend_steps=args.av_extend_steps,
             terminal=args.av_extend_terminal,
             slope_len=args.av_slope_len,
