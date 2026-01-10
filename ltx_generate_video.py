@@ -3789,9 +3789,10 @@ def generate_av_extension(
     video_state = noiser(video_state, noise_scale=1.0)
 
     # Create audio state similarly (if audio exists)
-    # Note: AudioLatentShape.from_video_pixel_shape defaults to channels=8
+    # Use from_torch_shape to match the actual extended_audio_latent dimensions
+    # (from_video_pixel_shape uses different default audio parameters)
     if extended_audio_latent is not None:
-        audio_latent_shape = AudioLatentShape.from_video_pixel_shape(shape=output_shape)
+        audio_latent_shape = AudioLatentShape.from_torch_shape(extended_audio_latent.shape)
         audio_tools = AudioLatentTools(
             patchifier=components.audio_patchifier,
             target_shape=audio_latent_shape,
