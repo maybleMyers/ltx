@@ -3987,7 +3987,7 @@ def generate_av_extension(
 
     tiling_config = TilingConfig.default()
     decoded_video_chunks = list(vae_decode_video(
-        denoised_video_latent.to(dtype=torch.float32),
+        denoised_video_latent,  # Pass directly, decoder handles dtype
         video_decoder,
         tiling_config,
     ))
@@ -4003,7 +4003,7 @@ def generate_av_extension(
         audio_decoder = generator.stage_1_model_ledger.audio_decoder()
         vocoder = generator.stage_1_model_ledger.vocoder()
         decoded_audio = vae_decode_audio(
-            denoised_audio_latent.to(dtype=torch.float32),
+            denoised_audio_latent,  # Pass directly, decoder handles dtype
             audio_decoder,
             vocoder,
         )
