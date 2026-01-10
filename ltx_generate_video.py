@@ -521,13 +521,13 @@ def create_av_noise_mask(
           f"generate frames {video_start_idx}-{video_end_idx} "
           f"(total {video_latent_frame_count} latent frames)")
 
-    # Audio mask - also single channel [B, 1, F, mel_bins]
+    # Audio mask - shape must match AudioLatentShape.mask_shape() which has channels=1, mel_bins=1
     audio_mask = None
     if audio_latent is not None and sampling_rate is not None and mel_hop_length is not None:
         B_a, C_a, F_a, mel_bins = audio_latent.shape
         audio_latent_frame_count = F_a
         audio_mask = torch.full(
-            (B_a, 1, F_a, mel_bins),  # Single channel for audio mask
+            (B_a, 1, F_a, 1),  # [B, 1, F, 1] to match mask_shape()
             fill_value=init_audio_mask,
             device=audio_latent.device,
             dtype=torch.float32,
@@ -541,7 +541,7 @@ def create_av_noise_mask(
         )
 
         # Use HARD 0/1 masks during denoising (like ComfyUI)
-        audio_mask[:, :, audio_start_idx:audio_end_idx, :] = 1.0
+        audio_mask[:, :, audio_start_idx:audio_end_idx] = 1.0
 
         print(f"[AV Extension] Audio mask: preserve frames 0-{audio_start_idx}, "
               f"generate frames {audio_start_idx}-{audio_end_idx} "
