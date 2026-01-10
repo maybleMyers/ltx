@@ -3705,15 +3705,8 @@ def generate_av_extension(
         fps=output_fps,
     )
 
-    # Create pipeline components
-    from ltx_pipelines.utils.types import PipelineComponents
-    components = PipelineComponents(
-        video_patchifier=transformer.velocity_model.patchify_proj,
-        video_latent_channels=128,
-        video_scale_factors=(1, time_scale_factor, 32, 32),
-        audio_patchifier=getattr(transformer.velocity_model, 'audio_patchify_proj', None),
-        audio_latent_channels=32 if hasattr(transformer.velocity_model, 'audio_patchify_proj') else 0,
-    )
+    # Use the generator's pipeline components
+    components = generator.pipeline_components
 
     # Import required functions
     from ltx_pipelines.utils.helpers import (
@@ -3924,14 +3917,8 @@ def generate_av_extension(
             fps=output_fps,
         )
 
-        # 9E: Prepare stage 2 denoising components
-        stage2_components = PipelineComponents(
-            video_patchifier=stage2_transformer.velocity_model.patchify_proj,
-            video_latent_channels=128,
-            video_scale_factors=(1, time_scale_factor, 32, 32),
-            audio_patchifier=getattr(stage2_transformer.velocity_model, 'audio_patchify_proj', None),
-            audio_latent_channels=32 if hasattr(stage2_transformer.velocity_model, 'audio_patchify_proj') and stage2_transformer.velocity_model.audio_patchify_proj is not None else 0,
-        )
+        # 9E: Use the generator's pipeline components
+        stage2_components = generator.pipeline_components
 
         # 9F: Create stage 2 video state
         from ltx_pipelines.utils.helpers import noise_video_state, noise_audio_state
