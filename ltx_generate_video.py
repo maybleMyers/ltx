@@ -3708,60 +3708,10 @@ def generate_av_extension(
     # Use the generator's pipeline components
     components = generator.pipeline_components
 
-    # Import required functions
-    from ltx_pipelines.utils.helpers import (
-        noise_video_state,
-        noise_audio_state,
-    )
-
-    # Create noised states with the extended latents
-    video_state, video_tools = noise_video_state(
-        output_shape=output_shape,
-        noiser=noiser,
-        conditionings=[],  # No keyframe conditioning for now
-        components=components,
-        dtype=dtype,
-        device=device,
-        noise_scale=1.0,
-        initial_latent=extended_video_latent,
-    )
-
-    # Apply the noise mask to the video state
-    # The mask determines which regions get denoised (1) vs preserved (0)
-    # We need to set the denoise_mask in the state
-    video_mask_flat = video_mask.reshape(-1, 1)[:video_state.denoise_mask.shape[0], :]
-    video_state = dataclass_replace(
-        video_state,
-        denoise_mask=video_mask_flat.to(device=device, dtype=dtype),
-        clean_latent=extended_video_latent.flatten(2).permute(0, 2, 1).reshape(-1, video_state.latent.shape[-1]),
-    )
-
-    if extended_audio_latent is not None:
-        audio_state, audio_tools = noise_audio_state(
-            output_shape=output_shape,
-            noiser=noiser,
-            conditionings=[],
-            components=components,
-            dtype=dtype,
-            device=device,
-            noise_scale=1.0,
-            initial_latent=extended_audio_latent,
-        )
-
-        # Apply audio mask
-        audio_mask_flat = audio_mask.reshape(-1, 1)[:audio_state.denoise_mask.shape[0], :]
-        audio_state = dataclass_replace(
-            audio_state,
-            denoise_mask=audio_mask_flat.to(device=device, dtype=dtype),
-            clean_latent=extended_audio_latent.flatten(2).permute(0, 2, 1).reshape(-1, audio_state.latent.shape[-1]),
-        )
-    else:
-        audio_state = None
-        audio_tools = None
-
     # Run denoising loop
     print(f">>> Denoising with {len(sigmas) - 1} steps...")
 
+    # Create the denoise function
     if args.cfg_guidance_scale > 1.0:
         denoise_fn = guider_denoising_func(
             v_context_p, v_context_n, a_context_p, a_context_n,
@@ -3770,23 +3720,71 @@ def generate_av_extension(
     else:
         denoise_fn = simple_denoising_func(v_context_p, a_context_p, transformer)
 
-    final_video_state, final_audio_state = euler_denoising_loop(
-        video_state=video_state,
-        audio_state=audio_state if audio_state is not None else video_state,  # Placeholder if no audio
+    # Define denoising loop wrapper that applies our custom masks
+    # This matches the pattern used in the main generate() method
+    def av_extension_denoising_loop(
+        sigmas: torch.Tensor,
+        video_state: LatentState,
+        audio_state: LatentState,
+        stepper: DiffusionStepProtocol,
+    ) -> tuple[LatentState, LatentState]:
+        # Apply custom video mask
+        # The mask determines which regions get denoised (1) vs preserved (0)
+        video_mask_flat = video_mask.reshape(-1, 1)[:video_state.denoise_mask.shape[0], :]
+        video_state_masked = dataclass_replace(
+            video_state,
+            denoise_mask=video_mask_flat.to(device=device, dtype=dtype),
+            clean_latent=extended_video_latent.flatten(2).permute(0, 2, 1).reshape(-1, video_state.latent.shape[-1]),
+        )
+
+        # Apply custom audio mask if audio exists
+        if extended_audio_latent is not None:
+            audio_mask_flat = audio_mask.reshape(-1, 1)[:audio_state.denoise_mask.shape[0], :]
+            audio_state_masked = dataclass_replace(
+                audio_state,
+                denoise_mask=audio_mask_flat.to(device=device, dtype=dtype),
+                clean_latent=extended_audio_latent.flatten(2).permute(0, 2, 1).reshape(-1, audio_state.latent.shape[-1]),
+            )
+        else:
+            audio_state_masked = audio_state
+
+        return euler_denoising_loop(
+            sigmas=sigmas,
+            video_state=video_state_masked,
+            audio_state=audio_state_masked,
+            stepper=stepper,
+            denoise_fn=denoise_fn,
+        )
+
+    # Use denoise_audio_video like the working generate() method
+    # This properly handles audio state creation with correct positional dimensions
+    from ltx_pipelines.utils.helpers import denoise_audio_video
+
+    final_video_state, final_audio_state = denoise_audio_video(
+        output_shape=output_shape,
+        conditionings=[],  # AV extension uses mask-based conditioning in the loop
+        noiser=noiser,
         sigmas=sigmas,
         stepper=stepper,
-        denoise_fn=denoise_fn,
+        denoising_loop_fn=av_extension_denoising_loop,
+        components=components,
+        dtype=dtype,
+        device=device,
+        noise_scale=1.0,
+        initial_video_latent=extended_video_latent,
+        initial_audio_latent=extended_audio_latent,
+        audio_conditionings=None,
     )
 
     # =========================================================================
-    # Step 8: Unpatchify denoised latents (DO NOT DECODE YET - stage 2 needs latents)
+    # Step 8: Get denoised latents (already unpatchified by denoise_audio_video)
     # =========================================================================
-    print(">>> Unpatchifying latents...")
-    denoised_video_latent = video_tools.unpatchify(final_video_state.latent)
+    print(">>> Denoising complete...")
+    denoised_video_latent = final_video_state.latent
 
     denoised_audio_latent = None
-    if final_audio_state is not None and extended_audio_latent is not None:
-        denoised_audio_latent = audio_tools.unpatchify(final_audio_state.latent)
+    if extended_audio_latent is not None:
+        denoised_audio_latent = final_audio_state.latent
 
     # Delete stage 1 transformer with proper block swap cleanup
     if block_swap_manager is not None:
