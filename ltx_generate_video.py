@@ -3986,13 +3986,11 @@ def generate_av_extension(
         video_decoder = generator.stage_1_model_ledger.video_decoder()
 
     tiling_config = TilingConfig.default()
-    decoded_video = list(vae_decode_video(
-        latent_state=denoised_video_latent.to(dtype=torch.float32),
-        vae_decoder=video_decoder,
-        vae_per_channel_normalize=True,
-        tiling_config=tiling_config,
-    ))
-    decoded_video = torch.cat(decoded_video, dim=0)  # [F, H, W, C]
+    decoded_video = vae_decode_video(
+        denoised_video_latent.to(dtype=torch.float32),
+        video_decoder,
+        tiling_config,
+    )
 
     del video_decoder
     cleanup_memory()
@@ -4002,12 +4000,13 @@ def generate_av_extension(
     if denoised_audio_latent is not None:
         print(">>> Decoding audio...")
         audio_decoder = generator.stage_1_model_ledger.audio_decoder()
+        vocoder = generator.stage_1_model_ledger.vocoder()
         decoded_audio = vae_decode_audio(
-            audio_latent=denoised_audio_latent.to(dtype=torch.float32),
-            audio_decoder=audio_decoder,
-            sample_rate=AUDIO_SAMPLE_RATE,
+            denoised_audio_latent.to(dtype=torch.float32),
+            audio_decoder,
+            vocoder,
         )
-        del audio_decoder
+        del audio_decoder, vocoder
         cleanup_memory()
 
     print(f">>> Output video shape: {decoded_video.shape}")
