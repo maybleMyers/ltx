@@ -3460,7 +3460,12 @@ def generate_av_extension(
     if audio_waveform is not None and not args.disable_audio:
         print(">>> Encoding audio to latent space...")
         audio_encoder = generator.stage_1_model_ledger.audio_encoder()
-        audio_processor = AudioProcessor()
+        audio_processor = AudioProcessor(
+            sample_rate=audio_encoder.sample_rate,
+            mel_bins=audio_encoder.mel_bins,
+            mel_hop_length=audio_encoder.mel_hop_length,
+            n_fft=audio_encoder.n_fft,
+        )
 
         # Prepare waveform
         if audio_waveform.dim() == 3:
