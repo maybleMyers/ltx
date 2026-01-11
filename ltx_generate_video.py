@@ -3318,6 +3318,14 @@ def generate_av_extension(
 
     print(f">>> Loaded {len(input_frames)} frames, resized to {stage1_width}x{stage1_height}")
 
+    # Trim to 8n+1 frames (required by VAE encoder)
+    num_loaded = len(input_frames)
+    n = max(1, (num_loaded - 1) // 8)  # At least 9 frames (8*1+1)
+    valid_frames = 8 * n + 1
+    if valid_frames < num_loaded:
+        input_frames = input_frames[:valid_frames]
+        print(f">>> Trimmed to {valid_frames} frames (8*{n}+1) for VAE compatibility")
+
     # Convert to tensor [F, H, W, C]
     import numpy as np
     input_frames_tensor = torch.from_numpy(np.stack(input_frames)).float() / 255.0
