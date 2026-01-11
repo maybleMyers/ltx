@@ -3690,12 +3690,23 @@ def generate_av_extension(
     else:
         transformer = generator.stage_1_model_ledger.transformer()
 
-    sigmas = LTX2Scheduler().execute(
-        steps=extend_steps,
-        latent=extended_video_latent,
-        terminal=terminal,
-        stretch=True,
-    ).to(dtype=torch.float32, device=device)
+    # For distilled models, use stretch with terminal for smooth continuation
+    # For dev/full models, use standard schedule (stretch=False)
+    if args.distilled_checkpoint:
+        sigmas = LTX2Scheduler().execute(
+            steps=extend_steps,
+            latent=extended_video_latent,
+            terminal=terminal,
+            stretch=True,
+        ).to(dtype=torch.float32, device=device)
+    else:
+        sigmas = LTX2Scheduler().execute(
+            steps=extend_steps,
+            latent=extended_video_latent,
+            stretch=False,
+        ).to(dtype=torch.float32, device=device)
+        # Replace sigma=0 with small epsilon to avoid division error
+        sigmas = torch.where(sigmas == 0, torch.tensor(1e-5, device=device, dtype=sigmas.dtype), sigmas)
 
     # Initialize diffusion components
     generator_torch = torch.Generator(device=device).manual_seed(args.seed)
