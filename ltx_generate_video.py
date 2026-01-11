@@ -30,7 +30,13 @@ from tqdm import tqdm
 
 # Import LTX-2 components
 from ltx_core.components.diffusion_steps import EulerDiffusionStep
-from ltx_core.components.guiders import CFGGuider
+from ltx_core.components.guiders import CFGGuider, STGGuider
+from ltx_core.guidance.perturbations import (
+    BatchedPerturbationConfig,
+    Perturbation,
+    PerturbationConfig,
+    PerturbationType,
+)
 from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.components.schedulers import LTX2Scheduler
@@ -266,6 +272,129 @@ def build_anchor_image_tuples(
     # Generate frames: [interval, 2*interval, ...] (skip 0, that's handled by i2v)
     anchor_frames = list(range(anchor_interval, num_frames, anchor_interval))
     return [(anchor_path, frame_idx, anchor_strength) for frame_idx in anchor_frames]
+
+
+def build_stg_perturbation_config(
+    stg_scale: float,
+    stg_blocks: list[int],
+    stg_mode: str,
+) -> BatchedPerturbationConfig | None:
+    """
+    Build the perturbation config for STG based on the stg_mode.
+
+    Args:
+        stg_scale: STG guidance scale. If 0.0, returns None (STG disabled).
+        stg_blocks: List of transformer block indices to perturb.
+        stg_mode: Either "stg_av" (perturb both audio and video) or "stg_v" (video only).
+
+    Returns:
+        BatchedPerturbationConfig or None if STG is disabled.
+    """
+    if stg_scale == 0.0:
+        return None
+
+    # Always skip video self-attention for STG
+    perturbations: list[Perturbation] = [
+        Perturbation(type=PerturbationType.SKIP_VIDEO_SELF_ATTN, blocks=stg_blocks)
+    ]
+
+    # Optionally also skip audio self-attention (stg_av mode)
+    if stg_mode == "stg_av":
+        perturbations.append(
+            Perturbation(type=PerturbationType.SKIP_AUDIO_SELF_ATTN, blocks=stg_blocks)
+        )
+
+    perturbation_config = PerturbationConfig(perturbations=perturbations)
+    return BatchedPerturbationConfig(perturbations=[perturbation_config])
+
+
+def cfg_stg_denoising_func(
+    cfg_guider: CFGGuider,
+    stg_guider: STGGuider,
+    stg_perturbation_config: BatchedPerturbationConfig | None,
+    v_context_p: torch.Tensor,
+    v_context_n: torch.Tensor | None,
+    a_context_p: torch.Tensor,
+    a_context_n: torch.Tensor | None,
+    transformer,
+):
+    """
+    Create a denoising function that applies both CFG and STG guidance.
+
+    This is the combined guidance function that the source LTX-2 repository uses.
+    It performs up to 3 forward passes per step:
+    1. Positive pass (always)
+    2. Negative pass (if CFG enabled)
+    3. Perturbed pass (if STG enabled)
+
+    Args:
+        cfg_guider: CFGGuider instance for classifier-free guidance.
+        stg_guider: STGGuider instance for spatio-temporal guidance.
+        stg_perturbation_config: Perturbation config for STG (None if disabled).
+        v_context_p: Positive video context embeddings.
+        v_context_n: Negative video context embeddings (None if no CFG).
+        a_context_p: Positive audio context embeddings.
+        a_context_n: Negative audio context embeddings (None if no CFG).
+        transformer: The X0Model transformer.
+
+    Returns:
+        A denoising function compatible with euler_denoising_loop.
+    """
+    from ltx_core.model.transformer.modality import Modality
+
+    def modality_from_latent_state(state: LatentState, context: torch.Tensor, sigma: float) -> Modality:
+        """Create a Modality object from a LatentState."""
+        return Modality(
+            enabled=True,
+            latent=state.latent,
+            timesteps=sigma * state.denoise_mask,
+            positions=state.positions,
+            context=context,
+            context_mask=None,
+        )
+
+    def cfg_stg_denoising_step(
+        video_state: LatentState,
+        audio_state: LatentState,
+        sigmas: torch.Tensor,
+        step_index: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        sigma = sigmas[step_index]
+
+        # Create positive modalities
+        pos_video = modality_from_latent_state(video_state, v_context_p, sigma)
+        pos_audio = modality_from_latent_state(audio_state, a_context_p, sigma)
+
+        # Forward pass with positive conditioning
+        denoised_video, denoised_audio = transformer(
+            video=pos_video, audio=pos_audio, perturbations=None
+        )
+
+        # Apply CFG if enabled
+        if cfg_guider.enabled() and v_context_n is not None:
+            neg_video = modality_from_latent_state(video_state, v_context_n, sigma)
+            neg_audio = modality_from_latent_state(audio_state, a_context_n, sigma)
+
+            neg_denoised_video, neg_denoised_audio = transformer(
+                video=neg_video, audio=neg_audio, perturbations=None
+            )
+
+            denoised_video = denoised_video + cfg_guider.delta(denoised_video, neg_denoised_video)
+            denoised_audio = denoised_audio + cfg_guider.delta(denoised_audio, neg_denoised_audio)
+
+        # Apply STG if enabled
+        if stg_guider.enabled() and stg_perturbation_config is not None:
+            perturbed_video, perturbed_audio = transformer(
+                video=pos_video, audio=pos_audio, perturbations=stg_perturbation_config
+            )
+
+            denoised_video = denoised_video + stg_guider.delta(denoised_video, perturbed_video)
+            if perturbed_audio is not None:
+                denoised_audio = denoised_audio + stg_guider.delta(denoised_audio, perturbed_audio)
+
+        return denoised_video, denoised_audio
+
+    return cfg_stg_denoising_step
 
 
 class VideoConditionByMotionLatent:
@@ -745,6 +874,28 @@ Examples:
         type=float,
         default=DEFAULT_CFG_GUIDANCE_SCALE,
         help=f"CFG guidance scale (default: {DEFAULT_CFG_GUIDANCE_SCALE}).",
+    )
+    gen_group.add_argument(
+        "--stg-scale",
+        type=float,
+        default=1.0,
+        help="STG (Spatio-Temporal Guidance) scale. 0.0 disables STG. "
+             "Recommended: 1.0 for dev model. (default: 1.0)",
+    )
+    gen_group.add_argument(
+        "--stg-blocks",
+        type=int,
+        nargs="+",
+        default=[29],
+        help="Transformer block indices to perturb for STG. (default: 29)",
+    )
+    gen_group.add_argument(
+        "--stg-mode",
+        type=str,
+        choices=["stg_av", "stg_v"],
+        default="stg_av",
+        help="STG mode: 'stg_av' perturbs both audio and video self-attention, "
+             "'stg_v' perturbs video only. (default: stg_av)",
     )
 
     # ==========================================================================
@@ -1583,6 +1734,10 @@ class LTXVideoGeneratorWithOffloading:
         anchor_decay: str | None = None,
         audio: str | None = None,
         audio_strength: float = 1.0,
+        # STG (Spatio-Temporal Guidance) parameters
+        stg_scale: float = 1.0,
+        stg_blocks: list[int] | None = None,
+        stg_mode: str = "stg_av",
         # SVI Pro parameters
         _motion_latent: torch.Tensor | None = None,
         _num_motion_latent: int = 0,
@@ -1608,6 +1763,14 @@ class LTXVideoGeneratorWithOffloading:
         noiser = GaussianNoiser(generator=generator)
         stepper = EulerDiffusionStep()
         cfg_guider = CFGGuider(cfg_guidance_scale)
+        # Initialize STG (Spatio-Temporal Guidance) components
+        effective_stg_blocks = stg_blocks if stg_blocks is not None else [29]
+        stg_guider = STGGuider(stg_scale)
+        stg_perturbation_config = build_stg_perturbation_config(
+            stg_scale=stg_scale,
+            stg_blocks=effective_stg_blocks,
+            stg_mode=stg_mode,
+        )
         dtype = self.dtype
 
         start_time = time.time()
@@ -1917,12 +2080,13 @@ class LTXVideoGeneratorWithOffloading:
             print(f">>> Using {num_inference_steps} inference steps")
 
             # Define denoising function for stage 1
-            # Use CFG guidance if scale > 1 and we have negative context, otherwise simple denoising
+            # Use CFG+STG guidance if either is enabled, otherwise simple denoising
             use_cfg = cfg_guidance_scale > 1.0 and v_context_n is not None
+            use_stg = stg_guider.enabled() and stg_perturbation_config is not None
             # Convert anchor_decay "none" to None for the denoising loop
             effective_anchor_decay = anchor_decay if anchor_decay and anchor_decay != "none" else None
-            if use_cfg:
-                # CFG guidance with positive/negative prompts
+            if use_cfg or use_stg:
+                # CFG+STG guidance (handles both independently)
                 def first_stage_denoising_loop(
                     sigmas: torch.Tensor,
                     video_state: LatentState,
@@ -1934,12 +2098,14 @@ class LTXVideoGeneratorWithOffloading:
                         video_state=video_state,
                         audio_state=audio_state,
                         stepper=stepper,
-                        denoise_fn=guider_denoising_func(
-                            cfg_guider,
-                            v_context_p,
-                            v_context_n,
-                            a_context_p,
-                            a_context_n,
+                        denoise_fn=cfg_stg_denoising_func(
+                            cfg_guider=cfg_guider,
+                            stg_guider=stg_guider,
+                            stg_perturbation_config=stg_perturbation_config,
+                            v_context_p=v_context_p,
+                            v_context_n=v_context_n,
+                            a_context_p=a_context_p,
+                            a_context_n=a_context_n,
                             transformer=transformer,
                         ),
                         anchor_decay=effective_anchor_decay,
@@ -1947,7 +2113,7 @@ class LTXVideoGeneratorWithOffloading:
                         callback_interval=preview_callback_interval,
                     )
             else:
-                # No CFG guidance, single forward pass
+                # No guidance, single forward pass
                 def first_stage_denoising_loop(
                     sigmas: torch.Tensor,
                     video_state: LatentState,
@@ -2897,6 +3063,10 @@ def generate_svi_multi_clip(
                 anchor_decay=args.anchor_decay,
                 audio=args.audio,
                 audio_strength=args.audio_strength,
+                # STG parameters
+                stg_scale=args.stg_scale,
+                stg_blocks=args.stg_blocks,
+                stg_mode=args.stg_mode,
                 # SVI-specific parameters
                 _motion_latent=prev_motion_latent if clip_idx > 0 else None,
                 _num_motion_latent=num_motion_latent if clip_idx > 0 else 0,
@@ -3702,6 +3872,14 @@ def generate_av_extension(
     noiser = GaussianNoiser(generator=generator_torch)
     stepper = EulerDiffusionStep()
     cfg_guider = CFGGuider(args.cfg_guidance_scale)
+    # Initialize STG (Spatio-Temporal Guidance) components
+    effective_stg_blocks = args.stg_blocks if args.stg_blocks is not None else [29]
+    stg_guider = STGGuider(args.stg_scale)
+    stg_perturbation_config = build_stg_perturbation_config(
+        stg_scale=args.stg_scale,
+        stg_blocks=effective_stg_blocks,
+        stg_mode=args.stg_mode,
+    )
 
     # Create output shape
     output_shape = VideoPixelShape(
@@ -3718,12 +3896,19 @@ def generate_av_extension(
     # Run denoising loop
     print(f">>> Denoising with {len(sigmas) - 1} steps...")
 
-    # Create the denoise function
-    if args.cfg_guidance_scale > 1.0:
-        denoise_fn = guider_denoising_func(
-            cfg_guider,  # First argument is the guider
-            v_context_p, v_context_n, a_context_p, a_context_n,
-            transformer
+    # Create the denoise function (CFG + STG combined)
+    use_cfg = args.cfg_guidance_scale > 1.0 and v_context_n is not None
+    use_stg = stg_guider.enabled() and stg_perturbation_config is not None
+    if use_cfg or use_stg:
+        denoise_fn = cfg_stg_denoising_func(
+            cfg_guider=cfg_guider,
+            stg_guider=stg_guider,
+            stg_perturbation_config=stg_perturbation_config,
+            v_context_p=v_context_p,
+            v_context_n=v_context_n,
+            a_context_p=a_context_p,
+            a_context_n=a_context_n,
+            transformer=transformer,
         )
     else:
         denoise_fn = simple_denoising_func(v_context_p, a_context_p, transformer)
@@ -4704,6 +4889,10 @@ def sliding_window_generate(
             anchor_decay=args.anchor_decay,
             audio=args.audio,
             audio_strength=args.audio_strength,
+            # STG parameters
+            stg_scale=args.stg_scale,
+            stg_blocks=args.stg_blocks,
+            stg_mode=args.stg_mode,
             # Sliding window overlap conditioning
             _overlap_latent=overlap_latent,
             _num_overlap_latent=num_overlap_latent,
@@ -4870,7 +5059,9 @@ def main():
     print(f"Output: {args.output_path}")
     print(f"Resolution: {args.width}x{args.height}")
     print(f"Frames: {args.num_frames} ({args.num_frames / args.frame_rate:.1f}s at {args.frame_rate}fps)")
-    print(f"Steps: {args.num_inference_steps}, CFG: {args.cfg_guidance_scale}")
+    print(f"Steps: {args.num_inference_steps}, CFG: {args.cfg_guidance_scale}, STG: {args.stg_scale}")
+    if args.stg_scale > 0:
+        print(f"STG Blocks: {args.stg_blocks}, Mode: {args.stg_mode}")
     print(f"Seed: {args.seed}")
     print(f"Offload: {args.offload}")
     print(f"FP8: {args.enable_fp8}")
@@ -5101,6 +5292,10 @@ def main():
             anchor_decay=args.anchor_decay,
             audio=args.audio,
             audio_strength=args.audio_strength,
+            # STG parameters
+            stg_scale=args.stg_scale,
+            stg_blocks=args.stg_blocks,
+            stg_mode=args.stg_mode,
             preview_callback=preview_callback,
             preview_callback_interval=args.preview_interval,
         )
@@ -5135,6 +5330,9 @@ def main():
         "num_frames": args.num_frames,
         "frame_rate": args.frame_rate,
         "cfg_guidance_scale": args.cfg_guidance_scale,
+        "stg_scale": args.stg_scale,
+        "stg_blocks": args.stg_blocks if args.stg_scale > 0 else None,
+        "stg_mode": args.stg_mode if args.stg_scale > 0 else None,
         "num_inference_steps": args.num_inference_steps,
         "seed": args.seed,
         "offload": args.offload,
