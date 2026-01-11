@@ -345,19 +345,21 @@ def cfg_stg_denoising_func(
     def modality_from_latent_state(state: LatentState, context: torch.Tensor, sigma: float) -> Modality:
         """Create a Modality object from a LatentState.
 
-        When CFG is enabled, uses a minimum timestep (0.001) for preserved frames
-        to avoid the untrained t=0 regime. At t=0, the model expects no denoising
-        is needed, but CFG can produce unpredictable outputs that get amplified.
-        A tiny timestep keeps the model in its trained regime.
+        When CFG is enabled, uses a minimum timestep proportional to sigma for
+        preserved frames. This keeps preserved frames at 1% of the current noise
+        level rather than a fixed value, which better matches the model's training.
         """
         timesteps = sigma * state.denoise_mask
 
         # Only apply minimum timestep when CFG is enabled to avoid t=0 issues
         # Without CFG, t=0 works fine (distilled model case)
         if cfg_guider.enabled():
-            min_timestep = 0.001
-            # Add small timestep where mask is 0 (preserved frames)
-            timesteps = timesteps + min_timestep * (1.0 - state.denoise_mask)
+            # Use 1% of current sigma as minimum (not fixed 0.001)
+            # This keeps preserved frames proportional to current noise level
+            min_timestep_ratio = 0.01
+            min_timestep = sigma * min_timestep_ratio
+            # Clamp to ensure no timestep is below minimum
+            timesteps = torch.clamp(timesteps, min=min_timestep)
 
         return Modality(
             enabled=True,
@@ -398,9 +400,24 @@ def cfg_stg_denoising_func(
                 video=neg_video, audio=neg_audio, perturbations=None
             )
 
-            # Use original positive outputs for delta, mask to denoising regions
-            cfg_delta_video = cfg_guider.delta(pos_denoised_video, neg_denoised_video)
-            cfg_delta_audio = cfg_guider.delta(pos_denoised_audio, neg_denoised_audio)
+            # Calculate preserved frame ratio for CFG scale adjustment
+            preserved_ratio = (1.0 - video_state.denoise_mask).mean().item()
+
+            # Reduce effective CFG scale when many frames are preserved (>30%)
+            # This prevents CFG amplification from causing blur in extension mode
+            if preserved_ratio > 0.3:
+                # Scale down CFG proportionally: 50% preserved -> 50% of original CFG boost
+                effective_scale = 1.0 + (cfg_guider.scale - 1.0) * (1.0 - preserved_ratio)
+                if step_index == 0:  # Only log once at first step
+                    print(f"[AV Extension] Reducing CFG from {cfg_guider.scale:.1f} to {effective_scale:.2f} (preserved: {preserved_ratio:.1%})")
+                from ltx_core.components.guiders import CFGGuider
+                effective_guider = CFGGuider(effective_scale)
+                cfg_delta_video = effective_guider.delta(pos_denoised_video, neg_denoised_video)
+                cfg_delta_audio = effective_guider.delta(pos_denoised_audio, neg_denoised_audio)
+            else:
+                cfg_delta_video = cfg_guider.delta(pos_denoised_video, neg_denoised_video)
+                cfg_delta_audio = cfg_guider.delta(pos_denoised_audio, neg_denoised_audio)
+
             denoised_video = denoised_video + cfg_delta_video * video_state.denoise_mask
             denoised_audio = denoised_audio + cfg_delta_audio * audio_state.denoise_mask
 
