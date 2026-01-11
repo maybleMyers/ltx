@@ -1339,15 +1339,17 @@ def generate_depth_map(
         for line in iter(process.stdout.readline, ''):
             line = line.strip()
             if line:
-                # Parse progress
+                # Print to console
+                print(line, flush=True)
+                # Parse progress for GUI
                 if "Loading depth model" in line:
                     yield None, None, "Loading ZoeDepth model..."
                 elif "Estimating depth" in line:
-                    yield None, None, "Estimating depth..."
+                    yield None, None, line
                 elif "Saving" in line:
                     yield None, None, "Saving output..."
                 elif "%" in line:
-                    yield None, None, f"Processing: {line}"
+                    yield None, None, line
 
         process.wait()
 
@@ -2906,6 +2908,37 @@ Audio is synchronized with the video extension.
             fn=lambda x: x,
             inputs=[depth_output_video],
             outputs=[depth_output_path]
+        )
+
+        # Send depth map to generation tab
+        def send_depth_to_generation(img_path, vid_path):
+            """Send generated depth map to the Generation tab's depth control section."""
+            if vid_path:
+                return (
+                    gr.Tabs(selected="gen_tab"),
+                    gr.update(value=vid_path),  # depth_control_video
+                    gr.update(value=None),      # depth_control_image
+                    "Depth video sent to Generation tab"
+                )
+            elif img_path:
+                return (
+                    gr.Tabs(selected="gen_tab"),
+                    gr.update(value=None),      # depth_control_video
+                    gr.update(value=img_path),  # depth_control_image
+                    "Depth image sent to Generation tab"
+                )
+            else:
+                return (
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    "No depth map to send - generate one first"
+                )
+
+        depth_send_to_gen_btn.click(
+            fn=send_depth_to_generation,
+            inputs=[depth_output_image, depth_output_video],
+            outputs=[tabs, depth_control_video, depth_control_image, depth_status]
         )
 
         return demo

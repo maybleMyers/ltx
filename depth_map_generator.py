@@ -27,6 +27,11 @@ from PIL import Image
 from tqdm import tqdm
 
 
+def log(message: str):
+    """Print message and flush immediately for real-time output."""
+    print(message, flush=True)
+
+
 def get_device() -> torch.device:
     """Get the best available device."""
     if torch.cuda.is_available():
@@ -52,7 +57,7 @@ class DepthEstimator:
     def load(self):
         """Lazy-load ZoeDepth model from HuggingFace."""
         if self.model is None:
-            print(f">>> Loading depth model: {self.model_name}...")
+            log(f">>> Loading depth model: {self.model_name}...")
             try:
                 from transformers import pipeline
                 self.model = pipeline(
@@ -60,7 +65,7 @@ class DepthEstimator:
                     model=self.model_name,
                     device=0 if self.device.type == "cuda" else -1,
                 )
-                print(">>> Depth model loaded successfully")
+                log(">>> Depth model loaded successfully")
             except ImportError:
                 raise ImportError(
                     "Depth estimation requires transformers>=4.35.0. "
@@ -121,7 +126,7 @@ class DepthEstimator:
             self.model = None
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            print(">>> Depth model unloaded")
+            log(">>> Depth model unloaded")
 
 
 def load_video_frames(video_path: str, max_frames: int | None = None) -> list[Image.Image]:
@@ -148,7 +153,7 @@ def load_video_frames(video_path: str, max_frames: int | None = None) -> list[Im
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     total_frames = min(frame_count, max_frames) if max_frames else frame_count
 
-    print(f">>> Loading {total_frames} frames from video...")
+    log(f">>> Loading {total_frames} frames from video...")
     for _ in tqdm(range(total_frames), desc="Loading frames"):
         ret, frame = cap.read()
         if not ret:
@@ -221,7 +226,7 @@ def save_depth_video(
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
-    print(f">>> Saving depth video ({len(depth_frames)} frames)...")
+    log(f">>> Saving depth video ({len(depth_frames)} frames)...")
     for depth in tqdm(depth_frames, desc="Saving video"):
         if colorize:
             frame = cv2.applyColorMap(depth, cv2.COLORMAP_INFERNO)
@@ -231,7 +236,7 @@ def save_depth_video(
         out.write(frame)
 
     out.release()
-    print(f">>> Depth video saved: {output_path}")
+    log(f">>> Depth video saved: {output_path}")
 
 
 def generate_depth_from_image(
@@ -264,7 +269,7 @@ def generate_depth_from_image(
         if resize:
             image = image.resize(resize, Image.Resampling.LANCZOS)
 
-        print(f">>> Estimating depth for image: {input_path}")
+        log(f">>> Estimating depth for image: {input_path}")
         depth = estimator.estimate_pil(image)
 
         # Save as image or video
@@ -274,7 +279,7 @@ def generate_depth_from_image(
             save_depth_video(depth_frames, output_path, fps=fps, colorize=colorize)
         else:
             save_depth_image(depth, output_path, colorize=colorize)
-            print(f">>> Depth image saved: {output_path}")
+            log(f">>> Depth image saved: {output_path}")
 
         return output_path
 
@@ -314,11 +319,16 @@ def generate_depth_from_video(
             frames = [f.resize(resize, Image.Resampling.LANCZOS) for f in frames]
 
         # Estimate depth for each frame
-        print(f">>> Estimating depth for {len(frames)} frames...")
+        log(f">>> Estimating depth for {len(frames)} frames...")
         depth_frames = []
-        for frame in tqdm(frames, desc="Depth estimation"):
+        total_frames = len(frames)
+        for i, frame in enumerate(frames):
             depth = estimator.estimate_pil(frame)
             depth_frames.append(depth)
+            # Log progress every 10 frames or at the end
+            if (i + 1) % 10 == 0 or (i + 1) == total_frames:
+                pct = int((i + 1) / total_frames * 100)
+                log(f">>> Depth estimation: {pct}% ({i + 1}/{total_frames} frames)")
 
         # Save as video
         save_depth_video(depth_frames, output_path, fps=fps, colorize=colorize)
@@ -398,7 +408,7 @@ Examples:
 
     # Validate input
     if not os.path.exists(args.input):
-        print(f"Error: Input file not found: {args.input}")
+        log(f"Error: Input file not found: {args.input}")
         sys.exit(1)
 
     # Determine resize
@@ -409,6 +419,10 @@ Examples:
     # Determine input type by extension
     input_ext = Path(args.input).suffix.lower()
     video_extensions = {'.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv', '.wmv'}
+
+    log(f">>> Starting depth map generation")
+    log(f">>> Input: {args.input}")
+    log(f">>> Output: {args.output}")
 
     if input_ext in video_extensions:
         # Video input
@@ -430,7 +444,7 @@ Examples:
             resize=resize,
         )
 
-    print(">>> Done!")
+    log(">>> Done!")
 
 
 if __name__ == "__main__":
