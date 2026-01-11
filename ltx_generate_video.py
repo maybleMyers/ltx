@@ -365,12 +365,16 @@ def cfg_stg_denoising_func(
         pos_video = modality_from_latent_state(video_state, v_context_p, sigma)
         pos_audio = modality_from_latent_state(audio_state, a_context_p, sigma)
 
-        # Forward pass with positive conditioning
-        denoised_video, denoised_audio = transformer(
+        # Forward pass with positive conditioning - SAVE original outputs
+        # These are used as the baseline for all delta calculations (matching source)
+        pos_denoised_video, pos_denoised_audio = transformer(
             video=pos_video, audio=pos_audio, perturbations=None
         )
+        denoised_video = pos_denoised_video
+        denoised_audio = pos_denoised_audio
 
-        # Apply CFG if enabled
+        # Apply CFG if enabled - MASK delta to generated regions only
+        # This prevents artifacts from preserved frames (timesteps=0) bleeding into generation
         if cfg_guider.enabled() and v_context_n is not None:
             neg_video = modality_from_latent_state(video_state, v_context_n, sigma)
             neg_audio = modality_from_latent_state(audio_state, a_context_n, sigma)
@@ -379,18 +383,24 @@ def cfg_stg_denoising_func(
                 video=neg_video, audio=neg_audio, perturbations=None
             )
 
-            denoised_video = denoised_video + cfg_guider.delta(denoised_video, neg_denoised_video)
-            denoised_audio = denoised_audio + cfg_guider.delta(denoised_audio, neg_denoised_audio)
+            # Use original positive outputs for delta, mask to denoising regions
+            cfg_delta_video = cfg_guider.delta(pos_denoised_video, neg_denoised_video)
+            cfg_delta_audio = cfg_guider.delta(pos_denoised_audio, neg_denoised_audio)
+            denoised_video = denoised_video + cfg_delta_video * video_state.denoise_mask
+            denoised_audio = denoised_audio + cfg_delta_audio * audio_state.denoise_mask
 
-        # Apply STG if enabled
+        # Apply STG if enabled - MASK delta to generated regions only
         if stg_guider.enabled() and stg_perturbation_config is not None:
             perturbed_video, perturbed_audio = transformer(
                 video=pos_video, audio=pos_audio, perturbations=stg_perturbation_config
             )
 
-            denoised_video = denoised_video + stg_guider.delta(denoised_video, perturbed_video)
+            # Use original positive outputs for delta, mask to denoising regions
+            stg_delta_video = stg_guider.delta(pos_denoised_video, perturbed_video)
+            denoised_video = denoised_video + stg_delta_video * video_state.denoise_mask
             if perturbed_audio is not None:
-                denoised_audio = denoised_audio + stg_guider.delta(denoised_audio, perturbed_audio)
+                stg_delta_audio = stg_guider.delta(pos_denoised_audio, perturbed_audio)
+                denoised_audio = denoised_audio + stg_delta_audio * audio_state.denoise_mask
 
         return denoised_video, denoised_audio
 
