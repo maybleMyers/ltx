@@ -418,21 +418,22 @@ def cfg_stg_denoising_func(
                 cfg_delta_video = cfg_guider.delta(pos_denoised_video, neg_denoised_video)
                 cfg_delta_audio = cfg_guider.delta(pos_denoised_audio, neg_denoised_audio)
 
-            denoised_video = denoised_video + cfg_delta_video * video_state.denoise_mask
-            denoised_audio = denoised_audio + cfg_delta_audio * audio_state.denoise_mask
+            # Apply CFG delta WITHOUT masking (matching source LTX-2 behavior)
+            # post_process_latent will blend with clean_latent based on mask
+            denoised_video = denoised_video + cfg_delta_video
+            denoised_audio = denoised_audio + cfg_delta_audio
 
-        # Apply STG if enabled - MASK delta to generated regions only
+        # Apply STG if enabled - also without masking to match source
         if stg_guider.enabled() and stg_perturbation_config is not None:
             perturbed_video, perturbed_audio = transformer(
                 video=pos_video, audio=pos_audio, perturbations=stg_perturbation_config
             )
 
-            # Use original positive outputs for delta, mask to denoising regions
             stg_delta_video = stg_guider.delta(pos_denoised_video, perturbed_video)
-            denoised_video = denoised_video + stg_delta_video * video_state.denoise_mask
+            denoised_video = denoised_video + stg_delta_video
             if perturbed_audio is not None:
                 stg_delta_audio = stg_guider.delta(pos_denoised_audio, perturbed_audio)
-                denoised_audio = denoised_audio + stg_delta_audio * audio_state.denoise_mask
+                denoised_audio = denoised_audio + stg_delta_audio
 
         return denoised_video, denoised_audio
 
