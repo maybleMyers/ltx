@@ -3251,6 +3251,37 @@ def generate_av_extension(
     print("=" * 60)
 
     # =========================================================================
+    # Step 0: Trim input video to 8n+1 frames if needed (VAE requirement)
+    # =========================================================================
+    cap_check = cv2.VideoCapture(input_video_path)
+    if not cap_check.isOpened():
+        raise RuntimeError(f"Failed to open video: {input_video_path}")
+
+    raw_frames = int(cap_check.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap_check.release()
+
+    n = max(1, (raw_frames - 1) // 8)
+    valid_frames = 8 * n + 1
+
+    if valid_frames < raw_frames:
+        import tempfile
+        import subprocess
+        print(f">>> Trimming input video: {raw_frames} -> {valid_frames} frames (8*{n}+1) for VAE compatibility")
+
+        # Create trimmed video using ffmpeg
+        trimmed_path = tempfile.mktemp(suffix=".mp4")
+        cmd = [
+            "ffmpeg", "-y", "-i", input_video_path,
+            "-frames:v", str(valid_frames),
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+            "-c:a", "copy",
+            trimmed_path
+        ]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        input_video_path = trimmed_path
+        print(f">>> Trimmed video saved to temp file")
+
+    # =========================================================================
     # Step 1: Load and analyze input video
     # =========================================================================
     cap = cv2.VideoCapture(input_video_path)
@@ -3317,14 +3348,6 @@ def generate_av_extension(
     cap.release()
 
     print(f">>> Loaded {len(input_frames)} frames, resized to {stage1_width}x{stage1_height}")
-
-    # Trim to 8n+1 frames (required by VAE encoder)
-    num_loaded = len(input_frames)
-    n = max(1, (num_loaded - 1) // 8)  # At least 9 frames (8*1+1)
-    valid_frames = 8 * n + 1
-    if valid_frames < num_loaded:
-        input_frames = input_frames[:valid_frames]
-        print(f">>> Trimmed to {valid_frames} frames (8*{n}+1) for VAE compatibility")
 
     # Convert to tensor [F, H, W, C]
     import numpy as np
