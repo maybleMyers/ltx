@@ -483,6 +483,10 @@ def generate_ltx_video(
     num_inference_steps: int,
     stage2_steps: int,
     seed: int,
+    # STG parameters
+    stg_scale: float,
+    stg_blocks: str,
+    stg_mode: str,
     # Image conditioning (for I2V)
     input_image: str,
     image_frame_idx: int,
@@ -627,7 +631,17 @@ def generate_ltx_video(
             "--stage2-steps", str(int(stage2_steps)),
             "--seed", str(current_seed),
             "--output-path", output_filename,
+            # STG parameters (always pass, even when 0)
+            "--stg-scale", str(float(stg_scale)),
+            "--stg-mode", str(stg_mode),
         ]
+
+        # STG blocks (parse comma-separated string to list)
+        if stg_blocks and stg_blocks.strip():
+            for block in stg_blocks.split(","):
+                block = block.strip()
+                if block:
+                    command.extend(["--stg-blocks", block])
 
         # Pipeline selection
         if is_one_stage:
@@ -1346,24 +1360,30 @@ def create_interface():
                                 gr.Markdown("Set an ending frame to generate video that transitions from start to end image.")
                                 with gr.Row():
                                     end_image_strength = gr.Slider(minimum=0.0, maximum=1.0, value=0.9, step=0.05, label="End Image Strength")
-                            gr.Markdown("### Resolution Settings")
-                            scale_slider = gr.Slider(
-                                minimum=1, maximum=200, value=100, step=1,
-                                label="Scale % (adjusts resolution while maintaining aspect ratio)",
-                                info="Scale the input image dimensions. Works for I2V mode."
-                            )
-                            with gr.Row():
-                                width = gr.Number(label="Width", value=1024, step=64, info="Must be divisible by 64")
-                                calc_height_btn = gr.Button("→", size="sm", min_width=40)
-                                calc_width_btn = gr.Button("←", size="sm", min_width=40)
-                                height = gr.Number(label="Height", value=1024, step=64, info="Must be divisible by 64")
-                            with gr.Row():
-                                num_frames = gr.Slider(minimum=9, maximum=2001, step=8, value=121, label="Num Frames (8*K+1)", info="e.g., 121 = 5s @ 24fps")
-                                frame_rate = gr.Slider(minimum=12, maximum=60, value=24, step=1, label="Frame Rate")
-                            with gr.Row():
-                                cfg_guidance_scale = gr.Slider(minimum=1.0, maximum=15.0, value=4.0, step=0.5, label="CFG Scale")
-                                num_inference_steps = gr.Slider(minimum=1, maximum=60, value=40, step=1, label="Inference Steps")
-                                stage2_steps = gr.Slider(minimum=1, maximum=60, value=3, step=1, label="Stage 2 Steps")
+
+                        # Resolution Settings (always visible, outside accordions)
+                        gr.Markdown("### Resolution Settings")
+                        scale_slider = gr.Slider(
+                            minimum=1, maximum=200, value=100, step=1,
+                            label="Scale % (adjusts resolution while maintaining aspect ratio)",
+                            info="Scale the input image dimensions. Works for I2V mode."
+                        )
+                        with gr.Row():
+                            width = gr.Number(label="Width", value=1024, step=64, info="Must be divisible by 64")
+                            calc_height_btn = gr.Button("→", size="sm", min_width=40)
+                            calc_width_btn = gr.Button("←", size="sm", min_width=40)
+                            height = gr.Number(label="Height", value=1024, step=64, info="Must be divisible by 64")
+                        with gr.Row():
+                            num_frames = gr.Slider(minimum=9, maximum=2001, step=8, value=121, label="Num Frames (8*K+1)", info="e.g., 121 = 5s @ 24fps")
+                            frame_rate = gr.Slider(minimum=12, maximum=60, value=24, step=1, label="Frame Rate")
+                        with gr.Row():
+                            cfg_guidance_scale = gr.Slider(minimum=1.0, maximum=15.0, value=4.0, step=0.5, label="CFG Scale")
+                            num_inference_steps = gr.Slider(minimum=1, maximum=60, value=40, step=1, label="Inference Steps")
+                            stage2_steps = gr.Slider(minimum=1, maximum=60, value=3, step=1, label="Stage 2 Steps")
+                        with gr.Row():
+                            stg_scale = gr.Slider(minimum=0.0, maximum=2.0, value=0.0, step=0.1, label="STG Scale", info="Spatio-temporal guidance scale (0=disabled)")
+                            stg_blocks = gr.Textbox(label="STG Blocks", value="29", info="Comma-separated block indices, e.g., 29 or 20,21,22")
+                            stg_mode = gr.Dropdown(label="STG Mode", choices=["stg_av", "stg_v"], value="stg_av", info="stg_av=audio+video, stg_v=video only")
 
                         # Video Input (V2V / Refine)
                         with gr.Accordion("Video Input (V2V / Refine)", open=False) as v2v_section:
@@ -2000,6 +2020,7 @@ Audio is synchronized with the video extension.
                 distilled_lora_path, distilled_lora_strength,
                 mode, pipeline, enable_sliding_window, width, height, num_frames, frame_rate,
                 cfg_guidance_scale, num_inference_steps, stage2_steps, seed,
+                stg_scale, stg_blocks, stg_mode,
                 input_image, image_frame_idx, image_strength,
                 end_image, end_image_strength,
                 anchor_image, anchor_interval, anchor_strength, anchor_decay,
@@ -2037,7 +2058,7 @@ Audio is synchronized with the video extension.
         def send_to_generation_handler(metadata, first_frame):
             """Send loaded metadata to generation tab parameters and switch to Generation tab."""
             if not metadata:
-                return [gr.update()] * 38 + ["No metadata loaded - upload a video first"]
+                return [gr.update()] * 41 + ["No metadata loaded - upload a video first"]
 
             # Handle legacy metadata that used single enable_block_swap
             legacy_block_swap = metadata.get("enable_block_swap", True)
@@ -2075,6 +2096,10 @@ Audio is synchronized with the video extension.
                 gr.update(value=metadata.get("num_inference_steps", 40)),  # num_inference_steps
                 gr.update(value=metadata.get("stage2_steps", 3)),  # stage2_steps
                 gr.update(value=metadata.get("seed", -1)),  # seed
+                # STG parameters
+                gr.update(value=metadata.get("stg_scale", 0.0)),  # stg_scale
+                gr.update(value=metadata.get("stg_blocks", "29")),  # stg_blocks
+                gr.update(value=metadata.get("stg_mode", "stg_av")),  # stg_mode
                 # Image conditioning
                 gr.update(value=first_frame),  # input_image - use extracted first frame
                 gr.update(value=image_frame_idx),  # image_frame_idx
@@ -2115,6 +2140,8 @@ Audio is synchronized with the video extension.
                 prompt, negative_prompt, mode, pipeline,
                 width, height, num_frames, frame_rate,
                 cfg_guidance_scale, num_inference_steps, stage2_steps, seed,
+                # STG parameters
+                stg_scale, stg_blocks, stg_mode,
                 # Image conditioning
                 input_image, image_frame_idx, image_strength, end_image_strength,
                 # Anchor conditioning
@@ -2276,6 +2303,7 @@ Audio is synchronized with the video extension.
             # Generation parameters
             mode, pipeline, width, height, num_frames, frame_rate,
             cfg_guidance_scale, num_inference_steps, stage2_steps, seed,
+            stg_scale, stg_blocks, stg_mode,
             # Image conditioning (not input_image itself - that's a file upload)
             image_frame_idx, image_strength,
             end_image_strength,
@@ -2307,6 +2335,7 @@ Audio is synchronized with the video extension.
             # Generation parameters
             "mode", "pipeline", "width", "height", "num_frames", "frame_rate",
             "cfg_guidance_scale", "num_inference_steps", "stage2_steps", "seed",
+            "stg_scale", "stg_blocks", "stg_mode",
             # Image conditioning
             "image_frame_idx", "image_strength",
             "end_image_strength",
