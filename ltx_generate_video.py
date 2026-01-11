@@ -345,21 +345,11 @@ def cfg_stg_denoising_func(
     def modality_from_latent_state(state: LatentState, context: torch.Tensor, sigma: float) -> Modality:
         """Create a Modality object from a LatentState.
 
-        When CFG is enabled, uses a minimum timestep proportional to sigma for
-        preserved frames. This keeps preserved frames at 1% of the current noise
-        level rather than a fixed value, which better matches the model's training.
+        Matches official LTX-2 code (validation_sampler.py:504) - no timestep clamping.
+        Reference frames with denoise_mask=0 get timestep=0, which correctly signals
+        to the attention mechanism that these are clean conditioning tokens.
         """
         timesteps = sigma * state.denoise_mask
-
-        # Only apply minimum timestep when CFG is enabled to avoid t=0 issues
-        # Without CFG, t=0 works fine (distilled model case)
-        if cfg_guider.enabled():
-            # Use 1% of current sigma as minimum (not fixed 0.001)
-            # This keeps preserved frames proportional to current noise level
-            min_timestep_ratio = 0.01
-            min_timestep = sigma * min_timestep_ratio
-            # Clamp to ensure no timestep is below minimum
-            timesteps = torch.clamp(timesteps, min=min_timestep)
 
         return Modality(
             enabled=True,
