@@ -1471,9 +1471,8 @@ Audio is synchronized with the video extension.
                                 )
                             with gr.Row():
                                 av_extend_steps = gr.Slider(
-                                    minimum=4, maximum=30, value=8, step=1,
+                                    minimum=4, maximum=60, value=8, step=1,
                                     label="Extension Steps",
-                                    info="Denoising steps for extension (lower = faster, higher = better quality)"
                                 )
                                 av_extend_terminal = gr.Slider(
                                     minimum=0.0, maximum=0.5, value=0.1, step=0.01,
