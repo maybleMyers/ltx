@@ -716,6 +716,327 @@ def get_video_latent_blend_coefficients(
 
 
 # =============================================================================
+# Depth Control (IC-LoRA Support)
+# =============================================================================
+
+class DepthEstimator:
+    """
+    Depth estimation using ZoeDepth for IC-LoRA depth control.
+
+    Provides lazy-loading of the depth model to save memory when not needed.
+    Uses Intel/zoedepth-nyu-kitti for monocular depth estimation.
+    """
+
+    def __init__(self, device: torch.device):
+        self.device = device
+        self.model = None
+
+    def load(self):
+        """Lazy-load ZoeDepth model from HuggingFace."""
+        if self.model is None:
+            print(">>> Loading ZoeDepth model for depth estimation...")
+            try:
+                from transformers import pipeline
+                self.model = pipeline(
+                    "depth-estimation",
+                    model="Intel/zoedepth-nyu-kitti",
+                    device=0 if self.device.type == "cuda" else -1,
+                )
+                print(">>> ZoeDepth model loaded successfully")
+            except ImportError:
+                raise ImportError(
+                    "ZoeDepth requires transformers>=4.35.0. "
+                    "Install with: pip install transformers>=4.35.0"
+                )
+
+    def estimate_image(self, image: torch.Tensor) -> torch.Tensor:
+        """
+        Estimate depth from a single image tensor.
+
+        Args:
+            image: Image tensor [H, W, C] in range [0, 1] or [0, 255]
+
+        Returns:
+            Depth tensor [H, W] normalized to [0, 1]
+        """
+        from PIL import Image as PILImage
+        import numpy as np
+
+        self.load()
+
+        # Convert tensor to PIL Image
+        if image.max() <= 1.0:
+            image_np = (image.cpu().numpy() * 255).astype(np.uint8)
+        else:
+            image_np = image.cpu().numpy().astype(np.uint8)
+
+        pil_image = PILImage.fromarray(image_np)
+
+        # Run depth estimation
+        result = self.model(pil_image)
+        depth = result["depth"]
+
+        # Convert PIL depth to tensor and normalize
+        depth_np = np.array(depth).astype(np.float32)
+        depth_min, depth_max = depth_np.min(), depth_np.max()
+        if depth_max > depth_min:
+            depth_np = (depth_np - depth_min) / (depth_max - depth_min)
+        else:
+            depth_np = np.zeros_like(depth_np)
+
+        return torch.from_numpy(depth_np)
+
+    def estimate_video(
+        self,
+        frames: torch.Tensor,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> torch.Tensor:
+        """
+        Estimate depth for each frame in a video.
+
+        Args:
+            frames: Video tensor [1, C, F, H, W] in range [-1, 1]
+            progress_callback: Optional callback(current, total) for progress
+
+        Returns:
+            Depth tensor [1, 3, F, H, W] in range [0, 1] (RGB, same value in all channels)
+        """
+        self.load()
+
+        # Convert from [1, C, F, H, W] to list of [H, W, C] frames
+        frames = frames.squeeze(0)  # [C, F, H, W]
+        frames = (frames + 1.0) / 2.0  # [-1, 1] -> [0, 1]
+        frames = frames.permute(1, 2, 3, 0)  # [F, H, W, C]
+
+        num_frames = frames.shape[0]
+        depth_frames = []
+
+        for i in range(num_frames):
+            frame = frames[i]  # [H, W, C]
+            depth = self.estimate_image(frame)  # [H, W]
+
+            # Replicate to 3 channels for VAE encoding (expects RGB)
+            depth_rgb = depth.unsqueeze(-1).repeat(1, 1, 3)  # [H, W, 3]
+            depth_frames.append(depth_rgb)
+
+            if progress_callback:
+                progress_callback(i + 1, num_frames)
+
+        # Stack and convert back to [1, C, F, H, W]
+        depth_video = torch.stack(depth_frames, dim=0)  # [F, H, W, C]
+        depth_video = depth_video.permute(3, 0, 1, 2).unsqueeze(0)  # [1, C, F, H, W]
+
+        return depth_video
+
+    def unload(self):
+        """Free model memory."""
+        if self.model is not None:
+            del self.model
+            self.model = None
+            torch.cuda.empty_cache()
+            print(">>> ZoeDepth model unloaded")
+
+
+def load_or_estimate_depth(
+    depth_video: str | None,
+    depth_image: str | None,
+    estimate_depth: bool,
+    source_video: str | None,
+    source_image: str | None,
+    num_frames: int,
+    height: int,
+    width: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor | None:
+    """
+    Load pre-generated depth maps OR estimate depth from source.
+
+    Priority:
+    1. depth_video - load pre-generated depth video
+    2. depth_image - load single depth image and repeat for all frames
+    3. estimate_depth - estimate from source_video or source_image
+
+    Args:
+        depth_video: Path to pre-generated depth map video
+        depth_image: Path to single depth map image
+        estimate_depth: Whether to auto-estimate depth
+        source_video: Path to source video for depth estimation
+        source_image: Path to source image for depth estimation
+        num_frames: Number of frames to generate
+        height: Output height (pixel space)
+        width: Output width (pixel space)
+        device: Target device
+        dtype: Target dtype
+
+    Returns:
+        Depth tensor [1, 3, F, H, W] normalized to [0, 1], or None if no depth source
+    """
+    import torch.nn.functional as F
+
+    if depth_video:
+        # Load pre-generated depth video
+        print(f">>> Loading depth video: {depth_video}")
+        depth_tensor = load_video_conditioning(
+            video_path=depth_video,
+            height=height,
+            width=width,
+            frame_cap=num_frames,
+            dtype=dtype,
+            device=torch.device("cpu"),
+        )
+        # Normalize to [0, 1] if needed (load_video_conditioning returns [-1, 1])
+        depth_tensor = (depth_tensor + 1.0) / 2.0
+        return depth_tensor
+
+    elif depth_image:
+        # Load single depth image and repeat for all frames
+        print(f">>> Loading depth image: {depth_image}")
+        from PIL import Image as PILImage
+        import numpy as np
+
+        img = PILImage.open(depth_image).convert("RGB")
+        img = img.resize((width, height), PILImage.Resampling.LANCZOS)
+        img_np = np.array(img).astype(np.float32) / 255.0  # [H, W, C]
+
+        # Convert to tensor [1, C, 1, H, W]
+        depth_tensor = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).unsqueeze(2)
+
+        # Repeat for all frames
+        depth_tensor = depth_tensor.repeat(1, 1, num_frames, 1, 1)
+
+        return depth_tensor.to(dtype=dtype)
+
+    elif estimate_depth:
+        # Estimate depth from source video or image
+        estimator = DepthEstimator(device)
+
+        if source_video:
+            print(f">>> Estimating depth from video: {source_video}")
+            # Load source video
+            source_tensor = load_video_conditioning(
+                video_path=source_video,
+                height=height,
+                width=width,
+                frame_cap=num_frames,
+                dtype=dtype,
+                device=torch.device("cpu"),
+            )
+            # Estimate depth for each frame
+            depth_tensor = estimator.estimate_video(
+                source_tensor,
+                progress_callback=lambda c, t: print(f">>> Depth estimation: {c}/{t} frames", end="\r") if c % 10 == 0 or c == t else None,
+            )
+            print()  # Newline after progress
+
+        elif source_image:
+            print(f">>> Estimating depth from image: {source_image}")
+            from PIL import Image as PILImage
+            import numpy as np
+
+            img = PILImage.open(source_image).convert("RGB")
+            img = img.resize((width, height), PILImage.Resampling.LANCZOS)
+            img_np = np.array(img).astype(np.float32) / 255.0
+
+            img_tensor = torch.from_numpy(img_np)  # [H, W, C]
+            depth_frame = estimator.estimate_image(img_tensor)  # [H, W]
+
+            # Replicate to RGB and all frames
+            depth_rgb = depth_frame.unsqueeze(-1).repeat(1, 1, 3)  # [H, W, 3]
+            depth_tensor = depth_rgb.permute(2, 0, 1).unsqueeze(0).unsqueeze(2)  # [1, C, 1, H, W]
+            depth_tensor = depth_tensor.repeat(1, 1, num_frames, 1, 1)  # [1, C, F, H, W]
+
+        else:
+            print(">>> Warning: --estimate-depth requires --image or --input-video")
+            estimator.unload()
+            return None
+
+        estimator.unload()
+        return depth_tensor.to(dtype=dtype)
+
+    return None
+
+
+def encode_depth_conditioning(
+    depth_tensor: torch.Tensor,
+    video_encoder,
+    num_frames: int,
+    strength: float,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> list:
+    """
+    Encode depth tensor to guiding latent conditioning.
+
+    Uses tiled encoding (same pattern as V2V) to handle long videos without OOM.
+
+    Args:
+        depth_tensor: Depth maps [1, 3, F, H, W] in range [0, 1]
+        video_encoder: LTX video encoder instance
+        num_frames: Total pixel frames in the video
+        strength: Conditioning strength (1.0 = full conditioning)
+        device: Target device
+        dtype: Target dtype
+
+    Returns:
+        List of VideoConditionByKeyframeIndex for in-context conditioning
+    """
+    from ltx_core.conditioning import VideoConditionByKeyframeIndex
+
+    conditionings = []
+
+    # Convert depth to [-1, 1] range for VAE encoding
+    depth_for_encoding = depth_tensor * 2.0 - 1.0
+
+    # Tiled encoding parameters (matching V2V pattern)
+    tile_size = 17  # 2 latent frames + 1
+    tile_overlap = 8
+    tile_stride = tile_size - tile_overlap
+
+    actual_frames = depth_for_encoding.shape[2]
+    frame_idx = 0
+
+    while frame_idx < actual_frames:
+        # Calculate chunk bounds
+        chunk_end = min(frame_idx + tile_size, actual_frames)
+        chunk_frames = chunk_end - frame_idx
+
+        # Ensure valid frame count (8k+1) for VAE
+        valid_frames = ((chunk_frames - 1) // 8) * 8 + 1
+        if valid_frames < 9:
+            break
+        chunk_end = frame_idx + valid_frames
+
+        # Extract chunk and encode
+        chunk = depth_for_encoding[:, :, frame_idx:chunk_end, :, :].to(device=device, dtype=dtype)
+        with torch.no_grad():
+            encoded_chunk = video_encoder(chunk)
+        del chunk
+        torch.cuda.empty_cache()
+
+        # Move to CPU to save memory
+        encoded_chunk_cpu = encoded_chunk.cpu()
+        del encoded_chunk
+        torch.cuda.empty_cache()
+
+        # Add as keyframe conditioning
+        conditionings.append(
+            VideoConditionByKeyframeIndex(
+                keyframes=encoded_chunk_cpu,
+                frame_idx=frame_idx,
+                strength=strength,
+            )
+        )
+
+        # Move to next tile
+        frame_idx += tile_stride
+        if frame_idx >= actual_frames - 8:
+            break
+
+    return conditionings
+
+
+# =============================================================================
 # Argument Parser
 # =============================================================================
 
@@ -999,6 +1320,39 @@ Examples:
         metavar=("PATH", "STRENGTH"),
         default=[],
         help="User LoRA for stage 2 (refinement) only: path and optional strength. Can be repeated.",
+    )
+
+    # ==========================================================================
+    # Depth Control (IC-LoRA)
+    # ==========================================================================
+    depth_group = parser.add_argument_group("Depth Control (IC-LoRA)")
+    depth_group.add_argument(
+        "--depth-video",
+        type=resolve_path,
+        default=None,
+        help="Pre-generated depth map video (grayscale or RGB depth visualization).",
+    )
+    depth_group.add_argument(
+        "--depth-image",
+        type=resolve_path,
+        default=None,
+        help="Depth map image to apply uniformly across all frames.",
+    )
+    depth_group.add_argument(
+        "--estimate-depth",
+        action="store_true",
+        help="Auto-estimate depth from --image or --input-video using ZoeDepth.",
+    )
+    depth_group.add_argument(
+        "--depth-strength",
+        type=float,
+        default=1.0,
+        help="Strength of depth conditioning (default: 1.0).",
+    )
+    depth_group.add_argument(
+        "--depth-stage2",
+        action="store_true",
+        help="Also apply depth conditioning to stage 2 refinement (default: stage 1 only).",
     )
 
     # ==========================================================================
@@ -1781,6 +2135,12 @@ class LTXVideoGeneratorWithOffloading:
         # Preview callback
         preview_callback: Callable | None = None,
         preview_callback_interval: int = 1,
+        # Depth Control (IC-LoRA) parameters
+        depth_video: str | None = None,
+        depth_image: str | None = None,
+        estimate_depth: bool = False,
+        depth_strength: float = 1.0,
+        depth_stage2: bool = False,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor | None, str | None]:
         """
         Generate video with optional audio.
@@ -2342,6 +2702,34 @@ class LTXVideoGeneratorWithOffloading:
                 else:
                     v2v_audio_latent = None
 
+            # Depth Control: Add depth conditioning for IC-LoRA
+            depth_tensor = None
+            if depth_video or depth_image or estimate_depth:
+                print(f">>> Depth Control: {'Estimating' if estimate_depth else 'Loading'} depth maps...")
+                depth_tensor = load_or_estimate_depth(
+                    depth_video=depth_video,
+                    depth_image=depth_image,
+                    estimate_depth=estimate_depth,
+                    source_video=input_video,
+                    source_image=images[0][0] if images else None,
+                    num_frames=num_frames,
+                    height=stage_1_output_shape.height,
+                    width=stage_1_output_shape.width,
+                    device=self.device,
+                    dtype=dtype,
+                )
+                if depth_tensor is not None:
+                    depth_conditionings = encode_depth_conditioning(
+                        depth_tensor=depth_tensor,
+                        video_encoder=video_encoder,
+                        num_frames=num_frames,
+                        strength=depth_strength,
+                        device=self.device,
+                        dtype=dtype,
+                    )
+                    stage_1_conditionings = stage_1_conditionings + depth_conditionings
+                    print(f">>> Depth Control: Added {len(depth_conditionings)} depth conditioning chunks (strength={depth_strength})")
+
             # SVI Pro: Add motion latent conditionings
             if _motion_latent is not None and _num_motion_latent > 0:
                 motion_cond = VideoConditionByMotionLatent(
@@ -2769,6 +3157,31 @@ class LTXVideoGeneratorWithOffloading:
             )
             stage_2_conditionings = stage_2_conditionings + motion_conditionings
 
+        # Depth Control: Add depth conditioning for stage 2 (optional)
+        if depth_tensor is not None and depth_stage2:
+            import torch.nn.functional as F
+            print(">>> Depth Control: Adding depth conditioning to stage 2...")
+            # Upscale depth to stage 2 resolution
+            depth_tensor_s2 = F.interpolate(
+                depth_tensor,
+                size=(num_frames, stage_2_output_shape.height, stage_2_output_shape.width),
+                mode='trilinear',
+                align_corners=False,
+            )
+            # Load video encoder for stage 2 if needed
+            if stage_2_video_encoder is None:
+                stage_2_video_encoder = self.stage_1_model_ledger.video_encoder()
+            depth_conditionings_s2 = encode_depth_conditioning(
+                depth_tensor=depth_tensor_s2,
+                video_encoder=stage_2_video_encoder,
+                num_frames=num_frames,
+                strength=depth_strength,
+                device=self.device,
+                dtype=dtype,
+            )
+            stage_2_conditionings = stage_2_conditionings + depth_conditionings_s2
+            print(f">>> Depth Control: Added {len(depth_conditionings_s2)} depth conditioning chunks to stage 2")
+
         # Refine-only mode: Add keyframe conditionings from input video
         # This uses every 8th frame as conditioning with strength=1.0
         # to guide generation while avoiding chunked encoding glitches
@@ -3105,6 +3518,12 @@ def generate_svi_multi_clip(
                 _num_motion_latent=num_motion_latent if clip_idx > 0 else 0,
                 preview_callback=preview_callback,
                 preview_callback_interval=args.preview_interval,
+                # Depth Control (IC-LoRA) parameters
+                depth_video=args.depth_video,
+                depth_image=args.depth_image,
+                estimate_depth=args.estimate_depth,
+                depth_strength=args.depth_strength,
+                depth_stage2=args.depth_stage2,
             )
 
             # Collect video frames from iterator
@@ -5045,6 +5464,12 @@ def sliding_window_generate(
             _overlap_strength=0.95,
             preview_callback=preview_callback,
             preview_callback_interval=args.preview_interval,
+            # Depth Control (IC-LoRA) parameters
+            depth_video=args.depth_video,
+            depth_image=args.depth_image,
+            estimate_depth=args.estimate_depth,
+            depth_strength=args.depth_strength,
+            depth_stage2=args.depth_stage2,
         )
 
         # Collect video frames from iterator
@@ -5444,6 +5869,12 @@ def main():
             stg_mode=args.stg_mode,
             preview_callback=preview_callback,
             preview_callback_interval=args.preview_interval,
+            # Depth Control (IC-LoRA) parameters
+            depth_video=args.depth_video,
+            depth_image=args.depth_image,
+            estimate_depth=args.estimate_depth,
+            depth_strength=args.depth_strength,
+            depth_stage2=args.depth_stage2,
         )
 
     # Encode and save video
@@ -5523,6 +5954,12 @@ def main():
         # Preview metadata
         "preview_dir": args.preview_dir,
         "preview_interval": args.preview_interval if args.preview_dir else None,
+        # Depth Control (IC-LoRA) metadata
+        "depth_video": args.depth_video,
+        "depth_image": args.depth_image,
+        "estimate_depth": args.estimate_depth,
+        "depth_strength": args.depth_strength if (args.depth_video or args.depth_image or args.estimate_depth) else None,
+        "depth_stage2": args.depth_stage2 if (args.depth_video or args.depth_image or args.estimate_depth) else None,
         # Video continuation metadata
         "freeze_frames": args.freeze_frames if args.freeze_frames > 0 else None,
         "freeze_transition": args.freeze_transition if args.freeze_frames > 0 else None,

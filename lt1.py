@@ -544,6 +544,12 @@ def generate_ltx_video(
     av_extend_terminal: float,
     av_slope_len: int,
     av_no_stage2: bool,
+    # Depth Control (IC-LoRA)
+    depth_control_video: str,
+    depth_control_image: str,
+    estimate_depth: bool,
+    depth_strength: float,
+    depth_stage2: bool,
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     """
     Generate video using LTX-2 pipeline.
@@ -685,6 +691,23 @@ def generate_ltx_video(
             command.extend(["--anchor-strength", str(float(anchor_strength))])
             if anchor_decay and anchor_decay != "none":
                 command.extend(["--anchor-decay", str(anchor_decay)])
+
+        # Depth Control (IC-LoRA)
+        if depth_control_video and os.path.exists(depth_control_video):
+            command.extend(["--depth-video", str(depth_control_video)])
+            command.extend(["--depth-strength", str(float(depth_strength))])
+            if depth_stage2:
+                command.append("--depth-stage2")
+        elif depth_control_image and os.path.exists(depth_control_image):
+            command.extend(["--depth-image", str(depth_control_image)])
+            command.extend(["--depth-strength", str(float(depth_strength))])
+            if depth_stage2:
+                command.append("--depth-stage2")
+        elif estimate_depth:
+            command.append("--estimate-depth")
+            command.extend(["--depth-strength", str(float(depth_strength))])
+            if depth_stage2:
+                command.append("--depth-stage2")
 
         # User LoRA - apply to selected stage(s)
         if user_lora and user_lora != "None" and lora_folder:
@@ -1229,6 +1252,120 @@ def generate_svi_ltx_video(
 
 
 # =============================================================================
+# Depth Map Generation
+# =============================================================================
+
+def generate_depth_map(
+    input_type: str,
+    input_image: str,
+    input_video: str,
+    output_type: str,
+    colorize: bool,
+    num_frames: int,
+    fps: float,
+    max_frames: int,
+    width: int,
+    height: int,
+) -> Generator[Tuple[Optional[str], Optional[str], str], None, None]:
+    """
+    Generate depth map from image or video using ZoeDepth.
+
+    Yields:
+        (image_output, video_output, status)
+    """
+    import tempfile
+
+    # Validate input
+    input_path = input_image if input_type == "Image" else input_video
+    if not input_path:
+        yield None, None, "Error: No input file provided"
+        return
+
+    if not os.path.exists(input_path):
+        yield None, None, f"Error: Input file not found: {input_path}"
+        return
+
+    yield None, None, "Loading depth model..."
+
+    # Determine output path
+    output_dir = tempfile.gettempdir()
+    timestamp = int(time.time())
+
+    if output_type == "Video" or (input_type == "Video" and output_type != "Image"):
+        output_path = os.path.join(output_dir, f"depth_{timestamp}.mp4")
+    else:
+        output_path = os.path.join(output_dir, f"depth_{timestamp}.png")
+
+    # Build command
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    command = [
+        sys.executable,
+        os.path.join(script_dir, "depth_map_generator.py"),
+        "--input", input_path,
+        "--output", output_path,
+    ]
+
+    if colorize:
+        command.append("--colorize")
+
+    if input_type == "Image" and output_type == "Video":
+        command.extend(["--num-frames", str(int(num_frames))])
+        command.extend(["--fps", str(fps)])
+
+    if input_type == "Video" and max_frames > 0:
+        command.extend(["--max-frames", str(int(max_frames))])
+
+    if width > 0 and height > 0:
+        command.extend(["--width", str(int(width))])
+        command.extend(["--height", str(int(height))])
+
+    yield None, None, "Generating depth map..."
+
+    try:
+        # Run the depth generation script
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            cwd=script_dir,
+            env=env
+        )
+
+        # Read output for progress
+        for line in iter(process.stdout.readline, ''):
+            line = line.strip()
+            if line:
+                # Parse progress
+                if "Loading depth model" in line:
+                    yield None, None, "Loading ZoeDepth model..."
+                elif "Estimating depth" in line:
+                    yield None, None, "Estimating depth..."
+                elif "Saving" in line:
+                    yield None, None, "Saving output..."
+                elif "%" in line:
+                    yield None, None, f"Processing: {line}"
+
+        process.wait()
+
+        if process.returncode != 0:
+            yield None, None, f"Error: Depth generation failed (exit code {process.returncode})"
+            return
+
+        # Return appropriate output
+        if output_path.endswith(".mp4"):
+            yield None, output_path, f"Depth video saved: {output_path}"
+        else:
+            yield output_path, None, f"Depth image saved: {output_path}"
+
+    except Exception as e:
+        yield None, None, f"Error: {str(e)}"
+
+
+# =============================================================================
 # Gradio Interface
 # =============================================================================
 
@@ -1404,6 +1541,39 @@ def create_interface():
                                     minimum=1, maximum=30, value=10, step=1,
                                     label="Refine Steps",
                                     info="Number of refinement denoising steps"
+                                )
+
+                        # Depth Control (IC-LoRA)
+                        with gr.Accordion("Depth Control (IC-LoRA)", open=False):
+                            gr.Markdown("""
+                            **Depth-guided video generation using IC-LoRA.**
+                            Load the depth control LoRA and provide depth maps to guide video structure.
+                            Generate depth maps in the **Depth Map** tab.
+                            """)
+                            with gr.Row():
+                                depth_control_video = gr.Video(
+                                    label="Depth Map Video (pre-generated)",
+                                    sources=["upload"]
+                                )
+                                depth_control_image = gr.Image(
+                                    label="Depth Map Image (applied to all frames)",
+                                    type="filepath"
+                                )
+                            with gr.Row():
+                                estimate_depth = gr.Checkbox(
+                                    label="Auto-estimate Depth",
+                                    value=False,
+                                    info="Estimate depth from input image/video using ZoeDepth"
+                                )
+                                depth_strength = gr.Slider(
+                                    minimum=0.0, maximum=1.0, value=1.0, step=0.05,
+                                    label="Depth Strength",
+                                    info="Conditioning strength (1.0 = full)"
+                                )
+                                depth_stage2 = gr.Checkbox(
+                                    label="Apply to Stage 2",
+                                    value=False,
+                                    info="Also apply depth to refinement stage"
                                 )
 
                         # Audio Conditioning
@@ -1865,6 +2035,90 @@ Audio is synchronized with the video extension.
                     svi_load_defaults_btn = gr.Button("📂 Load Defaults")
 
             # =================================================================
+            # Depth Map Tab
+            # =================================================================
+            with gr.Tab("Depth Map", id="depth_tab"):
+                gr.Markdown("""
+                ## Depth Map Generator
+                Generate depth maps from images or videos for use with LTX-2 IC-LoRA depth control.
+                **Uses:** ZoeDepth (Intel/zoedepth-nyu-kitti) for monocular depth estimation.
+                """)
+
+                with gr.Row():
+                    with gr.Column(scale=2):
+                        # Input Section
+                        with gr.Accordion("Input", open=True):
+                            depth_input_type = gr.Radio(
+                                label="Input Type",
+                                choices=["Image", "Video"],
+                                value="Image"
+                            )
+                            depth_input_image = gr.Image(
+                                label="Input Image",
+                                type="filepath",
+                                visible=True
+                            )
+                            depth_input_video = gr.Video(
+                                label="Input Video",
+                                visible=False
+                            )
+
+                        # Output Settings
+                        with gr.Accordion("Output Settings", open=True):
+                            depth_output_type = gr.Radio(
+                                label="Output Type",
+                                choices=["Image", "Video"],
+                                value="Image"
+                            )
+                            with gr.Row():
+                                depth_colorize = gr.Checkbox(
+                                    label="Colorize",
+                                    value=False,
+                                    info="Apply INFERNO colormap visualization"
+                                )
+                            with gr.Row():
+                                depth_num_frames = gr.Number(
+                                    label="Video Frames",
+                                    value=121,
+                                    visible=False,
+                                    info="Number of frames for video output (Image→Video mode)"
+                                )
+                                depth_fps = gr.Number(
+                                    label="FPS",
+                                    value=24,
+                                    visible=False
+                                )
+                            with gr.Row():
+                                depth_max_frames = gr.Number(
+                                    label="Max Frames",
+                                    value=0,
+                                    visible=False,
+                                    info="Limit video frames (0 = all frames)"
+                                )
+
+                        # Resolution Settings
+                        with gr.Accordion("Resolution (Optional)", open=False):
+                            gr.Markdown("Leave at 0 to keep original resolution")
+                            with gr.Row():
+                                depth_width = gr.Number(label="Width", value=0, minimum=0, step=64)
+                                depth_height = gr.Number(label="Height", value=0, minimum=0, step=64)
+
+                        # Generate Button
+                        with gr.Row():
+                            depth_generate_btn = gr.Button("🗺️ Generate Depth Map", variant="primary")
+
+                        # Status
+                        depth_status = gr.Textbox(label="Status", interactive=False, value="Ready")
+
+                    # Output Column
+                    with gr.Column(scale=2):
+                        depth_output_image = gr.Image(label="Depth Map Preview", visible=True)
+                        depth_output_video = gr.Video(label="Depth Map Video", visible=False)
+
+                        with gr.Row():
+                            depth_send_to_gen_btn = gr.Button("📤 Send to Generation Tab", variant="secondary")
+
+            # =================================================================
             # Help Tab
             # =================================================================
             with gr.Tab("Help"):
@@ -2042,6 +2296,9 @@ Audio is synchronized with the video extension.
                 # AV Extension (Time-Based Audio-Video Continuation)
                 av_extend_video, av_extend_start_time, av_extend_end_time,
                 av_extend_steps, av_extend_terminal, av_slope_len, av_no_stage2,
+                # Depth Control (IC-LoRA)
+                depth_control_video, depth_control_image, estimate_depth,
+                depth_strength, depth_stage2,
             ],
             outputs=[output_gallery, preview_gallery, status_text, progress_text]
         )
@@ -2567,6 +2824,88 @@ Audio is synchronized with the video extension.
             fn=initial_load_svi_ltx_defaults,
             inputs=None,
             outputs=svi_ltx_ui_default_components_ORDERED_LIST
+        )
+
+        # =================================================================
+        # Depth Map Tab Event Handlers
+        # =================================================================
+
+        # Toggle input visibility based on input type
+        def update_depth_input_visibility(input_type):
+            return (
+                gr.update(visible=(input_type == "Image")),
+                gr.update(visible=(input_type == "Video")),
+            )
+
+        depth_input_type.change(
+            fn=update_depth_input_visibility,
+            inputs=[depth_input_type],
+            outputs=[depth_input_image, depth_input_video]
+        )
+
+        # Toggle output options visibility based on input/output type
+        def update_depth_output_visibility(input_type, output_type):
+            # Show num_frames/fps only when converting image to video
+            show_video_options = (input_type == "Image" and output_type == "Video")
+            # Show max_frames only when processing video
+            show_max_frames = (input_type == "Video")
+            # Show video output preview when output is video
+            show_video_output = (output_type == "Video" or (input_type == "Video" and output_type != "Image"))
+            show_image_output = not show_video_output
+
+            return (
+                gr.update(visible=show_video_options),  # num_frames
+                gr.update(visible=show_video_options),  # fps
+                gr.update(visible=show_max_frames),     # max_frames
+                gr.update(visible=show_image_output),   # image output
+                gr.update(visible=show_video_output),   # video output
+            )
+
+        depth_input_type.change(
+            fn=lambda i, o: update_depth_output_visibility(i, o),
+            inputs=[depth_input_type, depth_output_type],
+            outputs=[depth_num_frames, depth_fps, depth_max_frames, depth_output_image, depth_output_video]
+        )
+        depth_output_type.change(
+            fn=lambda i, o: update_depth_output_visibility(i, o),
+            inputs=[depth_input_type, depth_output_type],
+            outputs=[depth_num_frames, depth_fps, depth_max_frames, depth_output_image, depth_output_video]
+        )
+
+        # Generate depth map
+        depth_generate_btn.click(
+            fn=generate_depth_map,
+            inputs=[
+                depth_input_type,
+                depth_input_image,
+                depth_input_video,
+                depth_output_type,
+                depth_colorize,
+                depth_num_frames,
+                depth_fps,
+                depth_max_frames,
+                depth_width,
+                depth_height,
+            ],
+            outputs=[depth_output_image, depth_output_video, depth_status]
+        )
+
+        # Store depth map output path for sending to generation tab
+        depth_output_path = gr.State(value=None)
+
+        # Update stored path when output changes
+        def store_depth_path(img_path, vid_path):
+            return img_path if img_path else vid_path
+
+        depth_output_image.change(
+            fn=lambda x: x,
+            inputs=[depth_output_image],
+            outputs=[depth_output_path]
+        )
+        depth_output_video.change(
+            fn=lambda x: x,
+            inputs=[depth_output_video],
+            outputs=[depth_output_path]
         )
 
         return demo
