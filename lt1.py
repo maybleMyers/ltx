@@ -97,6 +97,21 @@ def parse_ltx_progress_line(line: str) -> Optional[str]:
         return "Decoding audio..."
     if ">>> Encoding video" in line:
         return "Encoding video to MP4..."
+    # AV Extension mode
+    if "AV Extension Mode" in line:
+        return "AV Extension: Starting..."
+    if "[AV Extension] Video mask" in line:
+        return "AV Extension: Creating video mask..."
+    if "[AV Extension] Audio mask" in line:
+        return "AV Extension: Creating audio mask..."
+    if ">>> Running masked denoising" in line:
+        return "AV Extension: Masked denoising..."
+    if ">>> Creating extended latent" in line:
+        return "AV Extension: Creating extended latent space..."
+    if ">>> Extracting audio from input" in line:
+        return "AV Extension: Extracting audio..."
+    if ">>> Encoding video to latent" in line:
+        return "AV Extension: Encoding video to latent..."
     if ">>> Done!" in line:
         return "Generation complete!"
     if ">>> Total generation time" in line:
@@ -468,6 +483,10 @@ def generate_ltx_video(
     num_inference_steps: int,
     stage2_steps: int,
     seed: int,
+    # STG parameters
+    stg_scale: float,
+    stg_blocks: str,
+    stg_mode: str,
     # Image conditioning (for I2V)
     input_image: str,
     image_frame_idx: int,
@@ -517,6 +536,14 @@ def generate_ltx_video(
     sliding_window_overlap: int,
     sliding_window_overlap_noise: float,
     sliding_window_color_correction: float,
+    # AV Extension (Time-Based Audio-Video Continuation)
+    av_extend_video: str,
+    av_extend_start_time: float,
+    av_extend_end_time: float,
+    av_extend_steps: int,
+    av_extend_terminal: float,
+    av_slope_len: int,
+    av_no_stage2: bool,
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     """
     Generate video using LTX-2 pipeline.
@@ -604,7 +631,17 @@ def generate_ltx_video(
             "--stage2-steps", str(int(stage2_steps)),
             "--seed", str(current_seed),
             "--output-path", output_filename,
+            # STG parameters (always pass, even when 0)
+            "--stg-scale", str(float(stg_scale)),
+            "--stg-mode", str(stg_mode),
         ]
+
+        # STG blocks (parse comma-separated string to list)
+        if stg_blocks and stg_blocks.strip():
+            for block in stg_blocks.split(","):
+                block = block.strip()
+                if block:
+                    command.extend(["--stg-blocks", block])
 
         # Pipeline selection
         if is_one_stage:
@@ -713,6 +750,19 @@ def generate_ltx_video(
                 command.extend(["--sliding-window-overlap-noise", str(float(sliding_window_overlap_noise))])
             if sliding_window_color_correction and float(sliding_window_color_correction) > 0:
                 command.extend(["--sliding-window-color-correction", str(float(sliding_window_color_correction))])
+
+        # AV Extension (time-based audio-video continuation)
+        if av_extend_video and os.path.exists(av_extend_video):
+            command.extend(["--av-extend-from", str(av_extend_video)])
+            if av_extend_start_time and float(av_extend_start_time) > 0:
+                command.extend(["--av-extend-start-time", str(float(av_extend_start_time))])
+            if av_extend_end_time and float(av_extend_end_time) > 0:
+                command.extend(["--av-extend-end-time", str(float(av_extend_end_time))])
+            command.extend(["--av-extend-steps", str(int(av_extend_steps))])
+            command.extend(["--av-extend-terminal", str(float(av_extend_terminal))])
+            command.extend(["--av-slope-len", str(int(av_slope_len))])
+            if av_no_stage2:
+                command.append("--av-no-stage2")
 
         # Print command for debugging
         print("\n" + "=" * 80)
@@ -1310,24 +1360,30 @@ def create_interface():
                                 gr.Markdown("Set an ending frame to generate video that transitions from start to end image.")
                                 with gr.Row():
                                     end_image_strength = gr.Slider(minimum=0.0, maximum=1.0, value=0.9, step=0.05, label="End Image Strength")
-                            gr.Markdown("### Resolution Settings")
-                            scale_slider = gr.Slider(
-                                minimum=1, maximum=200, value=100, step=1,
-                                label="Scale % (adjusts resolution while maintaining aspect ratio)",
-                                info="Scale the input image dimensions. Works for I2V mode."
-                            )
-                            with gr.Row():
-                                width = gr.Number(label="Width", value=1024, step=64, info="Must be divisible by 64")
-                                calc_height_btn = gr.Button("→", size="sm", min_width=40)
-                                calc_width_btn = gr.Button("←", size="sm", min_width=40)
-                                height = gr.Number(label="Height", value=1024, step=64, info="Must be divisible by 64")
-                            with gr.Row():
-                                num_frames = gr.Slider(minimum=9, maximum=2001, step=8, value=121, label="Num Frames (8*K+1)", info="e.g., 121 = 5s @ 24fps")
-                                frame_rate = gr.Slider(minimum=12, maximum=60, value=24, step=1, label="Frame Rate")
-                            with gr.Row():
-                                cfg_guidance_scale = gr.Slider(minimum=1.0, maximum=15.0, value=4.0, step=0.5, label="CFG Scale")
-                                num_inference_steps = gr.Slider(minimum=1, maximum=60, value=40, step=1, label="Inference Steps")
-                                stage2_steps = gr.Slider(minimum=1, maximum=60, value=3, step=1, label="Stage 2 Steps")
+
+                        # Resolution Settings (always visible, outside accordions)
+                        gr.Markdown("### Resolution Settings")
+                        scale_slider = gr.Slider(
+                            minimum=1, maximum=200, value=100, step=1,
+                            label="Scale % (adjusts resolution while maintaining aspect ratio)",
+                            info="Scale the input image dimensions. Works for I2V mode."
+                        )
+                        with gr.Row():
+                            width = gr.Number(label="Width", value=1024, step=64, info="Must be divisible by 64")
+                            calc_height_btn = gr.Button("→", size="sm", min_width=40)
+                            calc_width_btn = gr.Button("←", size="sm", min_width=40)
+                            height = gr.Number(label="Height", value=1024, step=64, info="Must be divisible by 64")
+                        with gr.Row():
+                            num_frames = gr.Slider(minimum=9, maximum=2001, step=8, value=121, label="Num Frames (8*K+1)", info="e.g., 121 = 5s @ 24fps")
+                            frame_rate = gr.Slider(minimum=12, maximum=60, value=24, step=1, label="Frame Rate")
+                        with gr.Row():
+                            cfg_guidance_scale = gr.Slider(minimum=1.0, maximum=15.0, value=4.0, step=0.5, label="CFG Scale")
+                            num_inference_steps = gr.Slider(minimum=1, maximum=60, value=40, step=1, label="Inference Steps")
+                            stage2_steps = gr.Slider(minimum=1, maximum=60, value=3, step=1, label="Stage 2 Steps")
+                        with gr.Row():
+                            stg_scale = gr.Slider(minimum=0.0, maximum=2.0, value=0.0, step=0.1, label="STG Scale", info="Spatio-temporal guidance scale (0=disabled)")
+                            stg_blocks = gr.Textbox(label="STG Blocks", value="29", info="Comma-separated block indices, e.g., 29 or 20,21,22")
+                            stg_mode = gr.Dropdown(label="STG Mode", choices=["stg_av", "stg_v"], value="stg_av", info="stg_av=audio+video, stg_v=video only")
 
                         # Video Input (V2V / Refine)
                         with gr.Accordion("Video Input (V2V / Refine)", open=False) as v2v_section:
@@ -1403,6 +1459,56 @@ def create_interface():
                                     minimum=0.0, maximum=1.0, value=0.0, step=0.1,
                                     label="Color Correction",
                                     info="LAB color correction strength between windows"
+                                )
+
+                        # AV Extension (Time-Based Audio-Video Continuation)
+                        with gr.Accordion("AV Extension (Audio-Video Continuation)", open=False):
+                            gr.Markdown("""
+**Time-based audio-video continuation** - Extends a video by preserving the beginning and generating new content from a specific time point.
+Unlike SVI Pro (which uses motion latents), this method uses noise masking to preserve the original content exactly while generating seamless continuations.
+Audio is synchronized with the video extension.
+                            """)
+                            with gr.Row():
+                                av_extend_video = gr.File(
+                                    label="Input Video to Extend",
+                                    file_types=["video"],
+                                    type="filepath"
+                                )
+                            with gr.Row():
+                                av_extend_start_time = gr.Number(
+                                    label="Start Time (seconds)",
+                                    value=0,
+                                    minimum=0,
+                                    maximum=300,
+                                    info="Time to start generating new content. 0 = auto (end of video)"
+                                )
+                                av_extend_end_time = gr.Number(
+                                    label="End Time (seconds)",
+                                    value=0,
+                                    minimum=0,
+                                    maximum=300,
+                                    info="Time to stop generation. 0 = auto (start + 5 seconds)"
+                                )
+                            with gr.Row():
+                                av_extend_steps = gr.Slider(
+                                    minimum=4, maximum=60, value=8, step=1,
+                                    label="Extension Steps",
+                                )
+                                av_extend_terminal = gr.Slider(
+                                    minimum=0.0, maximum=0.5, value=0.1, step=0.01,
+                                    label="Terminal Sigma",
+                                    info="Smaller = smoother continuation, larger = more creative"
+                                )
+                            with gr.Row():
+                                av_slope_len = gr.Slider(
+                                    minimum=1, maximum=16, value=3, step=1,
+                                    label="Transition Length",
+                                    info="Smoothness at mask boundaries (latent frames)"
+                                )
+                                av_no_stage2 = gr.Checkbox(
+                                    label="Skip Stage 2 Refinement",
+                                    value=False,
+                                    info="Faster but lower quality"
                                 )
 
 
@@ -1914,6 +2020,7 @@ def create_interface():
                 distilled_lora_path, distilled_lora_strength,
                 mode, pipeline, enable_sliding_window, width, height, num_frames, frame_rate,
                 cfg_guidance_scale, num_inference_steps, stage2_steps, seed,
+                stg_scale, stg_blocks, stg_mode,
                 input_image, image_frame_idx, image_strength,
                 end_image, end_image_strength,
                 anchor_image, anchor_interval, anchor_strength, anchor_decay,
@@ -1932,6 +2039,9 @@ def create_interface():
                 # Sliding Window (Long Video)
                 sliding_window_size, sliding_window_overlap,
                 sliding_window_overlap_noise, sliding_window_color_correction,
+                # AV Extension (Time-Based Audio-Video Continuation)
+                av_extend_video, av_extend_start_time, av_extend_end_time,
+                av_extend_steps, av_extend_terminal, av_slope_len, av_no_stage2,
             ],
             outputs=[output_gallery, preview_gallery, status_text, progress_text]
         )
@@ -1948,7 +2058,7 @@ def create_interface():
         def send_to_generation_handler(metadata, first_frame):
             """Send loaded metadata to generation tab parameters and switch to Generation tab."""
             if not metadata:
-                return [gr.update()] * 38 + ["No metadata loaded - upload a video first"]
+                return [gr.update()] * 41 + ["No metadata loaded - upload a video first"]
 
             # Handle legacy metadata that used single enable_block_swap
             legacy_block_swap = metadata.get("enable_block_swap", True)
@@ -1986,6 +2096,10 @@ def create_interface():
                 gr.update(value=metadata.get("num_inference_steps", 40)),  # num_inference_steps
                 gr.update(value=metadata.get("stage2_steps", 3)),  # stage2_steps
                 gr.update(value=metadata.get("seed", -1)),  # seed
+                # STG parameters
+                gr.update(value=metadata.get("stg_scale", 0.0)),  # stg_scale
+                gr.update(value=metadata.get("stg_blocks", "29")),  # stg_blocks
+                gr.update(value=metadata.get("stg_mode", "stg_av")),  # stg_mode
                 # Image conditioning
                 gr.update(value=first_frame),  # input_image - use extracted first frame
                 gr.update(value=image_frame_idx),  # image_frame_idx
@@ -2026,6 +2140,8 @@ def create_interface():
                 prompt, negative_prompt, mode, pipeline,
                 width, height, num_frames, frame_rate,
                 cfg_guidance_scale, num_inference_steps, stage2_steps, seed,
+                # STG parameters
+                stg_scale, stg_blocks, stg_mode,
                 # Image conditioning
                 input_image, image_frame_idx, image_strength, end_image_strength,
                 # Anchor conditioning
@@ -2187,6 +2303,7 @@ def create_interface():
             # Generation parameters
             mode, pipeline, width, height, num_frames, frame_rate,
             cfg_guidance_scale, num_inference_steps, stage2_steps, seed,
+            stg_scale, stg_blocks, stg_mode,
             # Image conditioning (not input_image itself - that's a file upload)
             image_frame_idx, image_strength,
             end_image_strength,
@@ -2218,6 +2335,7 @@ def create_interface():
             # Generation parameters
             "mode", "pipeline", "width", "height", "num_frames", "frame_rate",
             "cfg_guidance_scale", "num_inference_steps", "stage2_steps", "seed",
+            "stg_scale", "stg_blocks", "stg_mode",
             # Image conditioning
             "image_frame_idx", "image_strength",
             "end_image_strength",
