@@ -343,11 +343,24 @@ def cfg_stg_denoising_func(
     from ltx_core.model.transformer.modality import Modality
 
     def modality_from_latent_state(state: LatentState, context: torch.Tensor, sigma: float) -> Modality:
-        """Create a Modality object from a LatentState."""
+        """Create a Modality object from a LatentState.
+
+        Uses a minimum timestep (0.001) for preserved frames to avoid the untrained
+        t=0 regime. At t=0, the model expects no denoising is needed, but CFG/STG
+        can produce unpredictable outputs. A tiny timestep keeps the model in its
+        trained regime while still treating preserved frames as nearly clean.
+        """
+        # Use minimum timestep for preserved regions to avoid t=0 untrained regime
+        # This is similar to how i2v with strength=0.99 keeps a small timestep
+        min_timestep = 0.001
+        timesteps = sigma * state.denoise_mask
+        # Add small timestep where mask is 0 (preserved frames)
+        timesteps = timesteps + min_timestep * (1.0 - state.denoise_mask)
+
         return Modality(
             enabled=True,
             latent=state.latent,
-            timesteps=sigma * state.denoise_mask,
+            timesteps=timesteps,
             positions=state.positions,
             context=context,
             context_mask=None,
