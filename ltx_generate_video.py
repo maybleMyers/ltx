@@ -3959,8 +3959,105 @@ def generate_av_extension(
     from ltx_core.types import VideoLatentShape, AudioLatentShape
     from ltx_core.tools import VideoLatentTools, AudioLatentTools
     from ltx_pipelines.utils.helpers import euler_denoising_loop
+    from ltx_core.components.patchifiers import get_pixel_coords
 
-    # Create video latent tools
+    # =========================================================================
+    # V2V-STYLE EXTENSION: Separate reference (preserved) and target (generated)
+    # This matches the training regime where reference tokens are prepended
+    # with their own positions, rather than sharing positions with mixed timesteps.
+    # =========================================================================
+
+    # Calculate the split point in latent frames
+    video_start_idx = time_to_video_latent_idx(
+        start_time, output_fps, time_scale_factor, extended_video_latent.shape[2]
+    )
+
+    # Split the extended latent into reference (preserved) and target (generated)
+    # Reference: frames [0, video_start_idx) - the preserved input video
+    # Target: frames [video_start_idx, total) - the frames to generate
+    reference_latent = extended_video_latent[:, :, :video_start_idx, :, :]
+    target_latent = extended_video_latent[:, :, video_start_idx:, :, :]
+
+    print(f">>> V2V-style extension: {reference_latent.shape[2]} reference frames + {target_latent.shape[2]} target frames")
+
+    # Create VideoLatentTools for reference and target separately
+    ref_pixel_frames = (reference_latent.shape[2] - 1) * time_scale_factor + 1
+    target_pixel_frames = (target_latent.shape[2] - 1) * time_scale_factor + 1
+
+    ref_shape = VideoPixelShape(
+        batch=1, frames=ref_pixel_frames,
+        height=stage1_height, width=stage1_width, fps=output_fps,
+    )
+    ref_latent_shape = VideoLatentShape.from_pixel_shape(
+        shape=ref_shape,
+        latent_channels=components.video_latent_channels,
+        scale_factors=components.video_scale_factors,
+    )
+    ref_tools = VideoLatentTools(
+        patchifier=components.video_patchifier,
+        target_shape=ref_latent_shape,
+        fps=output_fps,
+    )
+
+    target_shape_ext = VideoPixelShape(
+        batch=1, frames=target_pixel_frames,
+        height=stage1_height, width=stage1_width, fps=output_fps,
+    )
+    target_latent_shape = VideoLatentShape.from_pixel_shape(
+        shape=target_shape_ext,
+        latent_channels=components.video_latent_channels,
+        scale_factors=components.video_scale_factors,
+    )
+    target_tools = VideoLatentTools(
+        patchifier=components.video_patchifier,
+        target_shape=target_latent_shape,
+        fps=output_fps,
+    )
+
+    # Create reference state (preserved frames, timestep=0, no noise)
+    ref_state = ref_tools.create_initial_state(device, dtype, reference_latent)
+    # Set mask to 0 for reference (no denoising - they're conditioning tokens)
+    ref_state = dataclass_replace(
+        ref_state,
+        denoise_mask=torch.zeros_like(ref_state.denoise_mask),
+    )
+    # Reference doesn't get noise (mask=0 means clean latent)
+
+    # Create target state (generated frames, timestep=sigma, full noise)
+    target_state = target_tools.create_initial_state(device, dtype, target_latent)
+    # Set mask to 1 for target (full denoising)
+    target_state = dataclass_replace(
+        target_state,
+        denoise_mask=torch.ones_like(target_state.denoise_mask),
+    )
+    # Add noise to target
+    target_state = noiser(target_state, noise_scale=1.0)
+
+    # Offset target positions by the reference duration for temporal continuity
+    # Target positions should start after the reference video ends
+    target_positions = target_state.positions.clone()
+    # Position tensor shape is [B, 3, seq_len, 2] where dim 1 is (time, height, width)
+    # and dim 3 is (start, end) bounds. We offset the time dimension.
+    # Note: ref_pixel_frames is in PIXEL frames, so dividing by fps gives seconds
+    time_offset = ref_pixel_frames / output_fps  # Reference duration in seconds
+    target_positions[:, 0, :, :] += time_offset
+    print(f">>> Target position offset: {time_offset:.3f}s (ref has {ref_pixel_frames} pixel frames)")
+
+    target_state = dataclass_replace(target_state, positions=target_positions)
+
+    # Concatenate reference and target: [reference_tokens, target_tokens]
+    # This matches v2v training order where reference comes first
+    video_state = LatentState(
+        latent=torch.cat([ref_state.latent, target_state.latent], dim=1),
+        denoise_mask=torch.cat([ref_state.denoise_mask, target_state.denoise_mask], dim=1),
+        positions=torch.cat([ref_state.positions, target_state.positions], dim=2),
+        clean_latent=torch.cat([ref_state.clean_latent, target_state.clean_latent], dim=1),
+    )
+
+    # Store reference sequence length for extraction after denoising
+    ref_seq_len = ref_state.latent.shape[1]
+
+    # Also create tools for the full combined latent (for unpatchifying later)
     video_latent_shape = VideoLatentShape.from_pixel_shape(
         shape=output_shape,
         latent_channels=components.video_latent_channels,
@@ -3971,21 +4068,6 @@ def generate_av_extension(
         target_shape=video_latent_shape,
         fps=output_fps,
     )
-
-    # Create initial state (this creates all-ones mask and patchifies everything)
-    video_state = video_tools.create_initial_state(device, dtype, extended_video_latent)
-
-    # Patchify our custom mask to match the state's mask shape
-    # video_mask is [B, 1, F, H, W] -> patchified becomes [B, num_patches, 1]
-    patchified_video_mask = video_tools.patchifier.patchify(video_mask.to(device=device))
-
-    # Replace the all-ones mask with our custom mask BEFORE noising
-    video_state = dataclass_replace(
-        video_state,
-        denoise_mask=patchified_video_mask.to(dtype=torch.float32),
-    )
-
-    video_state = noiser(video_state, noise_scale=1.0)
 
     if extended_audio_latent is not None:
         audio_latent_shape = AudioLatentShape.from_torch_shape(extended_audio_latent.shape)
@@ -4022,10 +4104,42 @@ def generate_av_extension(
         denoise_fn=denoise_fn,
     )
 
-    # Clear conditioning and unpatchify
-    final_video_state = video_tools.clear_conditioning(final_video_state)
-    final_video_state = video_tools.unpatchify(final_video_state)
+    # =========================================================================
+    # V2V-STYLE POST-PROCESSING: Extract target tokens and reconstruct full video
+    # =========================================================================
+    # After denoising, final_video_state has [ref_tokens, target_tokens] concatenated.
+    # We only need the target tokens (the generated frames).
+    # Reference tokens were at timestep=0 throughout, so they're essentially unchanged.
+    # We reconstruct the full video by concatenating original preserved frames with generated.
 
+    print(f">>> Extracting target tokens (skip first {ref_seq_len} reference tokens)...")
+
+    # Extract only target portion from final_video_state
+    target_final_state = LatentState(
+        latent=final_video_state.latent[:, ref_seq_len:, :],
+        denoise_mask=final_video_state.denoise_mask[:, ref_seq_len:, :],
+        positions=final_video_state.positions[:, :, ref_seq_len:, :],
+        clean_latent=final_video_state.clean_latent[:, ref_seq_len:, :] if final_video_state.clean_latent is not None else None,
+    )
+
+    # Clear conditioning and unpatchify only the target
+    target_final_state = target_tools.clear_conditioning(target_final_state)
+    target_final_state = target_tools.unpatchify(target_final_state)
+
+    # Get the original preserved video (reference) in 5D latent format
+    # This is the clean input video, not the model output
+    reference_video_latent = extended_video_latent[:, :, :video_start_idx, :, :]
+
+    # Get the generated target video in 5D latent format
+    generated_video_latent = target_final_state.latent
+
+    print(f">>> Reference latent: {reference_video_latent.shape}, Generated latent: {generated_video_latent.shape}")
+
+    # Concatenate to get full video: [preserved_frames, generated_frames]
+    denoised_video_latent = torch.cat([reference_video_latent, generated_video_latent], dim=2)
+    print(f">>> Full denoised video latent: {denoised_video_latent.shape}")
+
+    # Handle audio (still using original mask-based approach)
     if extended_audio_latent is not None:
         final_audio_state = audio_tools.clear_conditioning(final_audio_state)
         final_audio_state = audio_tools.unpatchify(final_audio_state)
@@ -4034,7 +4148,6 @@ def generate_av_extension(
     # Step 8: Get denoised latents
     # =========================================================================
     print(">>> Denoising complete...")
-    denoised_video_latent = final_video_state.latent
 
     denoised_audio_latent = None
     if extended_audio_latent is not None:
