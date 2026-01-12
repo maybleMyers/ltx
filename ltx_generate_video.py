@@ -1409,6 +1409,14 @@ Examples:
         default=22,
         help="Number of refiner transformer blocks to keep in GPU (default: 22).",
     )
+    # FFN chunking for long sequences
+    mem_group.add_argument(
+        "--ffn-chunk-size",
+        type=int,
+        default=None,
+        help="Enable FFN chunking for long sequences (reduces peak memory). "
+             "Recommended: 4096 for 1000+ frame videos. Default: None (disabled).",
+    )
 
     # ==========================================================================
     # Audio Control
@@ -1788,6 +1796,63 @@ def reconfigure_block_swap(
     return new_offloader, new_blocks_in_memory
 
 
+def set_ffn_chunk_size(transformer: torch.nn.Module, chunk_size: int | None) -> None:
+    """
+    Set FFN chunk size on all transformer blocks for memory-efficient inference.
+
+    FFN chunking processes the feed-forward network in smaller chunks along the
+    sequence dimension, reducing peak memory for long videos (1000+ frames).
+    This is mathematically equivalent to non-chunked processing.
+
+    Args:
+        transformer: The transformer model (X0Model wrapper or velocity_model)
+        chunk_size: Chunk size in tokens (e.g., 4096). None to disable.
+    """
+    # Handle X0Model wrapper
+    model = transformer.velocity_model if hasattr(transformer, 'velocity_model') else transformer
+
+    # Find and configure all BasicAVTransformerBlock instances
+    count = 0
+    for module in model.modules():
+        if hasattr(module, 'ffn_chunk_size'):
+            module.ffn_chunk_size = chunk_size
+            count += 1
+
+    if count > 0 and chunk_size is not None:
+        print(f">>> FFN chunking enabled: {count} blocks with chunk_size={chunk_size}")
+
+
+def phase_barrier(phase_name: str, models_to_offload: list = None, verbose: bool = True) -> None:
+    """
+    Ensure complete cleanup between major phases to prevent memory fragmentation.
+
+    This function should be called at key transition points in the pipeline:
+    - After text encoding (before stage 1)
+    - After stage 1 denoising (before upsampling)
+    - After stage 2 denoising (before VAE decoding)
+    - After video decoding (before audio decoding)
+
+    Args:
+        phase_name: Description of the completed phase (for logging)
+        models_to_offload: Optional list of models to move to CPU
+        verbose: If True, print memory statistics
+    """
+    if models_to_offload:
+        for model in models_to_offload:
+            if model is not None:
+                model.to("cpu")
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+    if verbose and torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        print(f">>> Phase complete: {phase_name} | GPU: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+
+
 def apply_loras_chunked_gpu(
     model: torch.nn.Module,
     lora_state_dicts: list,
@@ -2049,6 +2114,7 @@ class LTXVideoGeneratorWithOffloading:
         refine_only: bool = False,
         distilled_checkpoint: bool = False,
         stage2_checkpoint: str | None = None,
+        ffn_chunk_size: int | None = None,
     ):
         self.device = device or get_device()
         self.dtype = torch.bfloat16
@@ -2064,6 +2130,7 @@ class LTXVideoGeneratorWithOffloading:
         self.refine_only = refine_only
         self.distilled_checkpoint = distilled_checkpoint
         self.stage2_checkpoint = stage2_checkpoint
+        self.ffn_chunk_size = ffn_chunk_size
 
         # Create model ledger for stage 1
         self.stage_1_model_ledger = ModelLedger(
@@ -2227,7 +2294,17 @@ class LTXVideoGeneratorWithOffloading:
         del text_encoder
         synchronize_and_cleanup()
 
+        # Move text embeddings to CPU - they'll be moved back to GPU when needed for denoising
+        # This frees GPU memory during model loading phases
+        v_context_p = v_context_p.cpu()
+        a_context_p = a_context_p.cpu()
+        if v_context_n is not None:
+            v_context_n = v_context_n.cpu()
+        if a_context_n is not None:
+            a_context_n = a_context_n.cpu()
+
         print(f">>> Text encoding completed in {time.time() - start_time:.1f}s")
+        phase_barrier("text_encoding")
 
         # Initialize audio_latent for use in stage 2
         # Will be set by refine-only mode if encoding audio from input video
@@ -2468,12 +2545,24 @@ class LTXVideoGeneratorWithOffloading:
             else:
                 transformer = self.stage_1_model_ledger.transformer()
 
+            # Enable FFN chunking for long sequences if configured
+            if self.ffn_chunk_size is not None:
+                set_ffn_chunk_size(transformer, self.ffn_chunk_size)
+
             # Create diffusion schedule
             # Both distilled and standard checkpoints use configurable LTX2Scheduler
             sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(
                 dtype=torch.float32, device=self.device
             )
             print(f">>> Using {num_inference_steps} inference steps")
+
+            # Move text embeddings to GPU for stage 1 denoising
+            v_context_p = v_context_p.to(self.device)
+            a_context_p = a_context_p.to(self.device)
+            if v_context_n is not None:
+                v_context_n = v_context_n.to(self.device)
+            if a_context_n is not None:
+                a_context_n = a_context_n.to(self.device)
 
             # Define denoising function for stage 1
             # Use CFG+STG guidance if either is enabled, otherwise simple denoising
@@ -2842,29 +2931,50 @@ class LTXVideoGeneratorWithOffloading:
             transformer = None
             cleanup_memory()
 
+            # Move text embeddings to CPU to free GPU memory during upsampling and stage 2 model loading
+            v_context_p = v_context_p.cpu()
+            a_context_p = a_context_p.cpu()
+            if v_context_n is not None:
+                v_context_n = v_context_n.cpu()
+            if a_context_n is not None:
+                a_context_n = a_context_n.cpu()
+
             # For one-stage, skip upsampling and stage 2 refinement
             if self.one_stage:
                 # Cleanup video encoder
                 video_encoder = None
                 cleanup_memory()
 
-                # Skip directly to VAE decoding
+                # Skip directly to VAE decoding (sequential loading to minimize peak memory)
                 print(">>> Decoding video...")
                 decode_start = time.time()
 
+                # Load video decoder, decode, then offload
+                video_decoder = self.stage_1_model_ledger.video_decoder()
                 decoded_video = vae_decode_video(
                     video_state.latent,
-                    self.stage_1_model_ledger.video_decoder(),
+                    video_decoder,
                     tiling_config,
                 )
+                video_decoder.to("cpu")
+                del video_decoder
+                synchronize_and_cleanup()
+                phase_barrier("video_decoding_one_stage")
 
                 if not disable_audio:
                     print(">>> Decoding audio...")
+                    # Load audio models only after video decoder is offloaded
+                    audio_decoder = self.stage_1_model_ledger.audio_decoder()
+                    vocoder = self.stage_1_model_ledger.vocoder()
                     decoded_audio = vae_decode_audio(
                         audio_state.latent,
-                        self.stage_1_model_ledger.audio_decoder(),
-                        self.stage_1_model_ledger.vocoder(),
+                        audio_decoder,
+                        vocoder,
                     )
+                    audio_decoder.to("cpu")
+                    vocoder.to("cpu")
+                    del audio_decoder, vocoder
+                    synchronize_and_cleanup()
                 else:
                     decoded_audio = None
 
@@ -3024,6 +3134,10 @@ class LTXVideoGeneratorWithOffloading:
             )
             transformer = stage_2_ledger.transformer()
 
+        # Enable FFN chunking for stage 2 transformer if configured
+        if self.ffn_chunk_size is not None:
+            set_ffn_chunk_size(transformer, self.ffn_chunk_size)
+
         # For refine-only mode, use the configurable refine_steps with strength scaling
         # For normal two-stage, use stage2_steps (default 3)
         if self.refine_only and input_video:
@@ -3064,6 +3178,10 @@ class LTXVideoGeneratorWithOffloading:
                         distilled_sigmas[i] = tuned[idx-1] * (1 - t) + tuned[idx] * t
                 distilled_sigmas = distilled_sigmas.to(self.device)
                 print(f">>> Stage 2 using {stage2_steps} steps (interpolated from tuned schedule)")
+
+        # Move text embeddings to GPU for stage 2 denoising
+        v_context_p = v_context_p.to(self.device)
+        a_context_p = a_context_p.to(self.device)
 
         # Define denoising function for stage 2 (no CFG, just positive)
         # Convert anchor_decay "none" to None for the denoising loop (if not already done in stage 1)
@@ -3336,6 +3454,10 @@ class LTXVideoGeneratorWithOffloading:
 
         print(f">>> Stage 2 completed in {time.time() - stage2_start:.1f}s")
 
+        # Clear closure references BEFORE transformer cleanup to break reference cycle
+        # The denoising_loop closure captures transformer, preventing garbage collection
+        second_stage_denoising_loop = None
+
         # Cleanup stage 2 models
         if block_swap_manager:
             offload_all_blocks(transformer)
@@ -3350,30 +3472,60 @@ class LTXVideoGeneratorWithOffloading:
             if hasattr(transformer, '_blocks_ref'):
                 transformer._blocks_ref = None
             block_swap_manager = None
-        torch.cuda.synchronize()
+
+        # Move transformer to CPU before deletion to ensure GPU memory is freed
+        if transformer is not None:
+            transformer.to("cpu")
         transformer = None
         video_encoder = None
+
+        # Clear stage 2 conditioning tensors to free GPU memory
+        del stage_2_conditionings
+        if 'upscaled_video_latent' in dir() and upscaled_video_latent is not None:
+            del upscaled_video_latent
+
+        # Move text embeddings to CPU (no longer needed on GPU)
+        v_context_p = v_context_p.cpu()
+        a_context_p = a_context_p.cpu()
+
+        torch.cuda.synchronize()
         cleanup_memory()
+        phase_barrier("stage_2_denoising")
 
         # =====================================================================
-        # Phase 5: VAE Decoding
+        # Phase 5: VAE Decoding (Sequential loading to minimize peak memory)
         # =====================================================================
         print(">>> Decoding video...")
         decode_start = time.time()
 
+        # Load video decoder, decode, then offload to free memory before audio
+        video_decoder = self.stage_2_model_ledger.video_decoder()
         decoded_video = vae_decode_video(
             video_state.latent,
-            self.stage_2_model_ledger.video_decoder(),
+            video_decoder,
             tiling_config,
         )
+        # Offload video decoder before loading audio models
+        video_decoder.to("cpu")
+        del video_decoder
+        synchronize_and_cleanup()
+        phase_barrier("video_decoding_two_stage")
 
         if not disable_audio:
             print(">>> Decoding audio...")
+            # Load audio models only after video decoder is offloaded
+            audio_decoder = self.stage_2_model_ledger.audio_decoder()
+            vocoder = self.stage_2_model_ledger.vocoder()
             decoded_audio = vae_decode_audio(
                 audio_state.latent,
-                self.stage_2_model_ledger.audio_decoder(),
-                self.stage_2_model_ledger.vocoder(),
+                audio_decoder,
+                vocoder,
             )
+            # Offload audio models
+            audio_decoder.to("cpu")
+            vocoder.to("cpu")
+            del audio_decoder, vocoder
+            synchronize_and_cleanup()
         else:
             decoded_audio = None
 
@@ -3536,15 +3688,19 @@ def generate_svi_multi_clip(
                 depth_stage2=args.depth_stage2,
             )
 
-            # Collect video frames from iterator
+            # Collect video frames from iterator - move to CPU immediately to save GPU memory
             video_frames = []
             for chunk in video_iterator:
-                video_frames.append(chunk)
-            video_tensor = torch.cat(video_frames, dim=0)  # [F, H, W, C]
+                video_frames.append(chunk.cpu())  # Move to CPU immediately
+                del chunk  # Free GPU memory
+            # Concatenate on CPU (downstream ops handle device: _encode_frames_to_latent, .cpu().numpy())
+            video_tensor = torch.cat(video_frames, dim=0)  # [F, H, W, C] on CPU
             print(f">>> Clip {clip_idx + 1} generated: {video_tensor.shape}")
 
             # Free video_frames list immediately - chunks are now in video_tensor
             del video_frames
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             # Extract motion latent for next clip
             if clip_idx < num_clips - 1 and num_motion_latent > 0:
@@ -3575,20 +3731,19 @@ def generate_svi_multi_clip(
 
                 # Extract motion frame for next clip input
                 frame_idx = -min(num_motion_frame, video_tensor.shape[0])
-                motion_frame = video_tensor[frame_idx].cpu().numpy().astype("uint8")  # [H, W, C]
+                motion_frame = video_tensor[frame_idx].numpy().astype("uint8")  # [H, W, C] - already on CPU
 
                 temp_image_path = os.path.join(temp_dir, f"clip_{clip_idx}_motion.png")
                 Image.fromarray(motion_frame).save(temp_image_path)
                 current_input_image = temp_image_path
                 print(f">>> Saved motion frame to: {temp_image_path}")
 
-            # Store clip on CPU (skip overlap frames for non-first clips)
-            # Use .cpu() to prevent GPU memory accumulation across clips
-            # Use .clone() for slices to avoid keeping original tensor alive via view
+            # Store clip (skip overlap frames for non-first clips)
+            # video_tensor is already on CPU from earlier collection
             if clip_idx == 0:
-                all_video_chunks.append(video_tensor.cpu())
+                all_video_chunks.append(video_tensor)
             else:
-                all_video_chunks.append(video_tensor[overlap_frames:].clone().cpu())
+                all_video_chunks.append(video_tensor[overlap_frames:].clone())
 
             if audio is not None:
                 # Calculate corresponding audio samples to skip
@@ -4580,6 +4735,7 @@ def generate_av_extension(
         block_swap_manager = None
     del transformer
     cleanup_memory()
+    phase_barrier("stage_1_denoising")
 
     # =========================================================================
     # Step 9: Stage 2 Refinement (if enabled) - operates on LATENTS, not pixels
@@ -4918,12 +5074,16 @@ def generate_av_extension(
         video_decoder = generator.stage_1_model_ledger.video_decoder()
 
     tiling_config = TilingConfig.default()
-    decoded_video_chunks = list(vae_decode_video(
+    # Collect decoded chunks on CPU immediately to save GPU memory during tiled decoding
+    decoded_video_chunks = []
+    for chunk in vae_decode_video(
         denoised_video_latent,  # Pass directly, decoder handles dtype
         video_decoder,
         tiling_config,
-    ))
-    decoded_video = torch.cat(decoded_video_chunks, dim=0)  # [F, H, W, C]
+    ):
+        decoded_video_chunks.append(chunk.cpu())  # Move to CPU immediately
+        del chunk
+    decoded_video = torch.cat(decoded_video_chunks, dim=0)  # [F, H, W, C] on CPU
 
     del video_decoder, decoded_video_chunks
     cleanup_memory()
@@ -5482,12 +5642,16 @@ def sliding_window_generate(
             depth_stage2=args.depth_stage2,
         )
 
-        # Collect video frames from iterator
+        # Collect video frames from iterator - move to CPU immediately to save GPU memory
         video_frames = []
         for chunk in video_iterator:
-            video_frames.append(chunk)
-        video_tensor = torch.cat(video_frames, dim=0)  # [F, H, W, C]
+            video_frames.append(chunk.cpu())  # Move to CPU immediately
+            del chunk  # Free GPU memory
+        # Concatenate on CPU (all downstream ops work on CPU: color correction uses numpy, overlap extraction uses cv2)
+        video_tensor = torch.cat(video_frames, dim=0)  # [F, H, W, C] on CPU
         del video_frames  # Free list memory after concatenation
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         print(f">>> Window {window_idx + 1} generated: {video_tensor.shape}")
 
         # Extract ending latent for next window (if not last window)
@@ -5536,16 +5700,13 @@ def sliding_window_generate(
         prev_window_pixels = video_tensor[-overlap:] if overlap > 0 else video_tensor[-8:]
 
         # Store chunk (strip overlap from non-first windows)
-        # Move to CPU to prevent GPU memory accumulation across windows
+        # video_tensor is already on CPU from earlier collection
         if window_idx == 0:
-            all_video_chunks.append(video_tensor.cpu())
+            all_video_chunks.append(video_tensor)
         else:
-            all_video_chunks.append(video_tensor[overlap:].clone().cpu())
+            all_video_chunks.append(video_tensor[overlap:].clone())
 
-        # Cleanup GPU memory after storing chunk
         del video_tensor
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
         if audio is not None:
             samples_per_frame = int(AUDIO_SAMPLE_RATE / args.frame_rate)
@@ -5703,6 +5864,7 @@ def main():
         refine_only=args.refine_only,
         distilled_checkpoint=args.distilled_checkpoint,
         stage2_checkpoint=args.stage2_checkpoint,
+        ffn_chunk_size=args.ffn_chunk_size,
     )
 
     # Set up tiling config for VAE

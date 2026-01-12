@@ -517,6 +517,7 @@ def generate_ltx_video(
     text_encoder_blocks_in_memory: int,
     enable_refiner_block_swap: bool,
     refiner_blocks_in_memory: int,
+    ffn_chunk_size: int,
     # LoRA
     lora_folder: str,
     user_lora: str,
@@ -747,6 +748,8 @@ def generate_ltx_video(
         if enable_refiner_block_swap:
             command.append("--enable-refiner-block-swap")
             command.extend(["--refiner-blocks-in-memory", str(int(refiner_blocks_in_memory))])
+        if ffn_chunk_size and int(ffn_chunk_size) > 0:
+            command.extend(["--ffn-chunk-size", str(int(ffn_chunk_size))])
 
         # Preview generation
         unique_preview_suffix = f"ltx_{run_id}"
@@ -985,6 +988,7 @@ def generate_svi_ltx_video(
     text_encoder_blocks_in_memory: int,
     enable_refiner_block_swap: bool,
     refiner_blocks_in_memory: int,
+    ffn_chunk_size: int,
     # LoRA
     lora_folder: str,
     user_lora: str,
@@ -1138,6 +1142,8 @@ def generate_svi_ltx_video(
         if enable_refiner_block_swap:
             command.append("--enable-refiner-block-swap")
             command.extend(["--refiner-blocks-in-memory", str(int(refiner_blocks_in_memory))])
+        if ffn_chunk_size and int(ffn_chunk_size) > 0:
+            command.extend(["--ffn-chunk-size", str(int(ffn_chunk_size))])
 
         # User LoRA
         if user_lora and user_lora != "None" and lora_folder:
@@ -1442,29 +1448,10 @@ def create_interface():
                 with gr.Row():
                     # Left column - Parameters
                     with gr.Column():
-                        # Generation Parameters
-                        with gr.Accordion("Generation Parameters", open=True):
-                            with gr.Row():
-                                mode = gr.Dropdown(
-                                    label="Mode",
-                                    choices=["t2v", "i2v", "v2v"],
-                                    value="t2v",
-                                    info="t2v = text-to-video, i2v = image-to-video, v2v = video-to-video (refine)"
-                                )
-                                pipeline = gr.Dropdown(
-                                    label="Pipeline",
-                                    choices=["two-stage", "one-stage", "refine-only"],
-                                    value="two-stage",
-                                    info="two-stage = higher quality, one-stage = faster, refine-only = stage 2 only on input video"
-                                )
-                                enable_sliding_window = gr.Checkbox(
-                                    label="Sliding Window",
-                                    value=False,
-                                    info="Enable for long videos (>129 frames)"
-                                )
-                            # Hidden state for original image/video dimensions
-                            original_dims = gr.State(value="")
-                        # Image Conditioning (I2V)
+                        # Hidden state for original image/video dimensions
+                        original_dims = gr.State(value="")
+
+                        # Image Conditioning (I2V) - moved above Resolution Settings
                         with gr.Accordion("Image Conditioning (I2V)", open=True) as i2v_section:
                             input_image = gr.Image(label="Start Image", type="filepath")
                             with gr.Row():
@@ -1502,6 +1489,19 @@ def create_interface():
 
                         # Resolution Settings (always visible, outside accordions)
                         gr.Markdown("### Resolution Settings")
+                        with gr.Row():
+                            mode = gr.Dropdown(
+                                label="Mode",
+                                choices=["t2v", "i2v", "v2v"],
+                                value="t2v",
+                                info="t2v = text-to-video, i2v = image-to-video, v2v = video-to-video (refine)"
+                            )
+                            pipeline = gr.Dropdown(
+                                label="Pipeline",
+                                choices=["two-stage", "one-stage", "refine-only"],
+                                value="two-stage",
+                                info="two-stage = higher quality, one-stage = faster, refine-only = stage 2 only on input video"
+                            )
                         scale_slider = gr.Slider(
                             minimum=1, maximum=200, value=100, step=1,
                             label="Scale % (adjusts resolution while maintaining aspect ratio)",
@@ -1609,6 +1609,11 @@ def create_interface():
 
                         # Sliding Window (Long Video)
                         with gr.Accordion("Sliding Window (Long Video)", open=False):
+                            enable_sliding_window = gr.Checkbox(
+                                label="Enable Sliding Window",
+                                value=False,
+                                info="Enable for long videos (>129 frames)"
+                            )
                             gr.Markdown("Generate videos longer than the model's context window by overlapping windows.")
                             with gr.Row():
                                 sliding_window_size = gr.Slider(
@@ -1747,6 +1752,12 @@ Audio is synchronized with the video extension.
                             with gr.Row():
                                 enable_refiner_block_swap = gr.Checkbox(label="Refiner Block Swap", value=True, info="Stage 2 refiner transformer")
                                 refiner_blocks_in_memory = gr.Slider(minimum=1, maximum=47, value=22, step=1, label="Refiner Blocks in GPU", visible=True)
+                            with gr.Row():
+                                ffn_chunk_size = gr.Slider(
+                                    minimum=0, maximum=16384, value=0, step=512,
+                                    label="FFN Chunk Size",
+                                    info="Process FFN in chunks for long videos (0 = disabled, try 4096 for 1000+ frames)"
+                                )
                             with gr.Row():
                                 disable_audio = gr.Checkbox(label="Disable Audio", value=False, info="Generate video only (no audio)")
                                 enhance_prompt = gr.Checkbox(label="Enhance Prompt", value=False, info="Use Gemma to improve prompt")
@@ -2015,6 +2026,12 @@ Audio is synchronized with the video extension.
                     with gr.Row():
                         svi_enable_refiner_block_swap = gr.Checkbox(label="Refiner Block Swap", value=True)
                         svi_refiner_blocks_in_memory = gr.Number(label="Refiner Blocks in Memory", value=22, visible=True)
+                    with gr.Row():
+                        svi_ffn_chunk_size = gr.Slider(
+                            minimum=0, maximum=16384, value=0, step=512,
+                            label="FFN Chunk Size",
+                            info="Process FFN in chunks for long videos (0 = disabled)"
+                        )
 
                     with gr.Row():
                         svi_output_path = gr.Textbox(
@@ -2286,6 +2303,7 @@ Audio is synchronized with the video extension.
                 enable_dit_block_swap, dit_blocks_in_memory,
                 enable_text_encoder_block_swap, text_encoder_blocks_in_memory,
                 enable_refiner_block_swap, refiner_blocks_in_memory,
+                ffn_chunk_size,
                 lora_folder, user_lora, user_lora_strength, user_lora_stage,
                 save_path, batch_size,
                 # Preview Generation
@@ -2453,6 +2471,7 @@ Audio is synchronized with the video extension.
                 svi_enable_dit_block_swap, svi_dit_blocks_in_memory,
                 svi_enable_text_encoder_block_swap, svi_text_encoder_blocks_in_memory,
                 svi_enable_refiner_block_swap, svi_refiner_blocks_in_memory,
+                svi_ffn_chunk_size,
                 # LoRA
                 svi_lora_folder, svi_lora_dropdown, svi_lora_strength,
                 # Output
@@ -2577,6 +2596,7 @@ Audio is synchronized with the video extension.
             enable_dit_block_swap, dit_blocks_in_memory,
             enable_text_encoder_block_swap, text_encoder_blocks_in_memory,
             enable_refiner_block_swap, refiner_blocks_in_memory,
+            ffn_chunk_size,
             # LoRA
             lora_folder, user_lora, user_lora_strength, user_lora_stage,
             # Output
@@ -2609,6 +2629,7 @@ Audio is synchronized with the video extension.
             "enable_dit_block_swap", "dit_blocks_in_memory",
             "enable_text_encoder_block_swap", "text_encoder_blocks_in_memory",
             "enable_refiner_block_swap", "refiner_blocks_in_memory",
+            "ffn_chunk_size",
             # LoRA
             "lora_folder", "user_lora", "user_lora_strength", "user_lora_stage",
             # Output
@@ -2715,6 +2736,7 @@ Audio is synchronized with the video extension.
             svi_enable_dit_block_swap, svi_dit_blocks_in_memory,
             svi_enable_text_encoder_block_swap, svi_text_encoder_blocks_in_memory,
             svi_enable_refiner_block_swap, svi_refiner_blocks_in_memory,
+            svi_ffn_chunk_size,
             # LoRA
             svi_lora_folder, svi_lora_dropdown, svi_lora_strength,
             # Output
@@ -2746,6 +2768,7 @@ Audio is synchronized with the video extension.
             "svi_enable_dit_block_swap", "svi_dit_blocks_in_memory",
             "svi_enable_text_encoder_block_swap", "svi_text_encoder_blocks_in_memory",
             "svi_enable_refiner_block_swap", "svi_refiner_blocks_in_memory",
+            "svi_ffn_chunk_size",
             # LoRA
             "svi_lora_folder", "svi_lora_dropdown", "svi_lora_strength",
             # Output

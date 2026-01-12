@@ -105,9 +105,7 @@ class ModelLedger:
         self.gemma_root_path = gemma_root_path
         self.spatial_upsampler_path = spatial_upsampler_path
         self.loras = loras or ()
-        # Use StateDictRegistry by default for caching state dicts across model loads
-        # This avoids re-reading checkpoint from disk when loading same model type multiple times
-        self.registry = registry or StateDictRegistry()
+        self.registry = registry or DummyRegistry()
         self.fp8transformer = fp8transformer
         self.build_model_builders()
 

@@ -19,6 +19,9 @@ class TransformerConfig:
 
 
 class BasicAVTransformerBlock(torch.nn.Module):
+    # FFN chunk size for memory optimization (None = disabled, set during inference for long sequences)
+    ffn_chunk_size: int | None = None
+
     def __init__(
         self,
         idx: int,
@@ -258,7 +261,11 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 self.scale_shift_table, vx.shape[0], video.timesteps, slice(3, None)
             )
             vx_scaled = rms_norm(vx, eps=self.norm_eps) * (1 + vscale_mlp) + vshift_mlp
-            vx = vx + self.ff(vx_scaled) * vgate_mlp
+            # Use chunked FFN for long sequences to reduce peak memory (only during inference)
+            if not self.training and self.ffn_chunk_size is not None:
+                vx = vx + self.ff.forward_chunked(vx_scaled, self.ffn_chunk_size) * vgate_mlp
+            else:
+                vx = vx + self.ff(vx_scaled) * vgate_mlp
 
             del vshift_mlp, vscale_mlp, vgate_mlp
 
@@ -267,7 +274,11 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slice(3, None)
             )
             ax_scaled = rms_norm(ax, eps=self.norm_eps) * (1 + ascale_mlp) + ashift_mlp
-            ax = ax + self.audio_ff(ax_scaled) * agate_mlp
+            # Use chunked FFN for long sequences to reduce peak memory (only during inference)
+            if not self.training and self.ffn_chunk_size is not None:
+                ax = ax + self.audio_ff.forward_chunked(ax_scaled, self.ffn_chunk_size) * agate_mlp
+            else:
+                ax = ax + self.audio_ff(ax_scaled) * agate_mlp
 
             del ashift_mlp, ascale_mlp, agate_mlp
 
