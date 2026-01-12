@@ -10,6 +10,40 @@ from ltx_core.model.transformer.transformer_args import TransformerArgs
 from ltx_core.utils import rms_norm
 
 
+# Helper functions for positional embeddings (which are tuples of (cos, sin) tensors)
+def _pe_to_cpu(pe: tuple[torch.Tensor, torch.Tensor] | None) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Move positional embedding tuple to CPU."""
+    if pe is None:
+        return None
+    return (pe[0].cpu(), pe[1].cpu())
+
+
+def _pe_to_device(pe: tuple[torch.Tensor, torch.Tensor] | None, device: torch.device | str) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Move positional embedding tuple to device."""
+    if pe is None:
+        return None
+    return (pe[0].to(device, non_blocking=True), pe[1].to(device, non_blocking=True))
+
+
+def _pe_slice(pe: tuple[torch.Tensor, torch.Tensor] | None, start: int, end: int) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Slice positional embedding tuple along token dimension.
+
+    For interleaved rope (3D tensors: B, T, D), slices dim 1.
+    For split rope (4D tensors: B, H, T, D), slices dim 2.
+    """
+    if pe is None:
+        return None
+    # Auto-detect dimension based on tensor shape
+    if pe[0].ndim == 3:
+        # Interleaved rope: (B, T, D) - slice dim 1
+        return (pe[0][:, start:end], pe[1][:, start:end])
+    elif pe[0].ndim == 4:
+        # Split rope: (B, H, T, D) - slice dim 2
+        return (pe[0][:, :, start:end], pe[1][:, :, start:end])
+    else:
+        raise ValueError(f"Unsupported positional embedding shape: {pe[0].shape}")
+
+
 @dataclass
 class TransformerConfig:
     dim: int
@@ -351,7 +385,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 del norm_vx_chunks
 
                 # Chunked self-attention (streaming K/V from CPU)
-                pe = video.positional_embeddings.cpu() if video.positional_embeddings is not None else None
+                pe = _pe_to_cpu(video.positional_embeddings)
                 attn_out = self.attn1.forward_chunked(norm_vx, pe, chunk_size, device)
                 del norm_vx, pe
 
@@ -402,7 +436,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 a_mask = perturbations.mask_like(PerturbationType.SKIP_AUDIO_SELF_ATTN, self.idx, ax)
                 ax = ax + self.audio_attn1(
                     norm_ax,
-                    pe=audio.positional_embeddings.to(device) if audio.positional_embeddings is not None else None
+                    pe=_pe_to_device(audio.positional_embeddings, device)
                 ) * agate_msa * a_mask
 
             ax = ax + self.audio_attn2(
@@ -454,12 +488,12 @@ class BasicAVTransformerBlock(torch.nn.Module):
                     vx_scaled_chunk = vx_norm_chunk * (1 + scale_ca_video_a2v) + shift_ca_video_a2v
 
                     # Cross-attention: video queries attend to audio
-                    v_pe_chunk = video.cross_positional_embeddings[:, start:end].to(device) if video.cross_positional_embeddings is not None else None
+                    v_pe_chunk = _pe_to_device(_pe_slice(video.cross_positional_embeddings, start, end), device)
                     a2v_chunk = self.audio_to_video_attn(
                         vx_scaled_chunk,
                         context=ax_scaled_a2v,
                         pe=v_pe_chunk,
-                        k_pe=audio.cross_positional_embeddings.to(device) if audio.cross_positional_embeddings is not None else None,
+                        k_pe=_pe_to_device(audio.cross_positional_embeddings, device),
                     )
                     a2v_out_chunks.append((vx_chunk + a2v_chunk * gate_out_a2v * a2v_mask).cpu())
                     del vx_chunk, vx_norm_chunk, vx_scaled_chunk, a2v_chunk, v_pe_chunk
@@ -486,8 +520,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 v2a_out = self.video_to_audio_attn.forward_chunked_cross(
                     x=ax_scaled_v2a.cpu(),
                     context=vx_scaled_full,
-                    pe=audio.cross_positional_embeddings.cpu() if audio.cross_positional_embeddings is not None else None,
-                    k_pe=video.cross_positional_embeddings.cpu() if video.cross_positional_embeddings is not None else None,
+                    pe=_pe_to_cpu(audio.cross_positional_embeddings),
+                    k_pe=_pe_to_cpu(video.cross_positional_embeddings),
                     chunk_size=chunk_size,
                     device=device,
                 ).to(device)

@@ -19,6 +19,33 @@ except ImportError:
     flash_attn_interface = None
 
 
+# Type alias for positional embeddings (tuple of cos, sin tensors)
+PETuple = tuple[torch.Tensor, torch.Tensor] | None
+
+
+def _pe_to_device(pe: PETuple, device: torch.device | str) -> PETuple:
+    """Move positional embedding tuple to device."""
+    if pe is None:
+        return None
+    return (pe[0].to(device, non_blocking=True), pe[1].to(device, non_blocking=True))
+
+
+def _pe_slice(pe: PETuple, start: int, end: int) -> PETuple:
+    """Slice positional embedding tuple along token dimension.
+
+    For interleaved rope (3D tensors: B, T, D), slices dim 1.
+    For split rope (4D tensors: B, H, T, D), slices dim 2.
+    """
+    if pe is None:
+        return None
+    if pe[0].ndim == 3:
+        return (pe[0][:, start:end], pe[1][:, start:end])
+    elif pe[0].ndim == 4:
+        return (pe[0][:, :, start:end], pe[1][:, :, start:end])
+    else:
+        raise ValueError(f"Unsupported positional embedding shape: {pe[0].shape}")
+
+
 class AttentionCallable(Protocol):
     def __call__(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int, mask: torch.Tensor | None = None
@@ -227,7 +254,7 @@ class Attention(torch.nn.Module):
         for start in range(0, N, chunk_size):
             end = min(start + chunk_size, N)
             x_chunk = x[:, start:end].to(device, non_blocking=True)
-            pe_chunk = pe[:, start:end].to(device, non_blocking=True) if pe is not None else None
+            pe_chunk = _pe_to_device(_pe_slice(pe, start, end), device)
 
             # Compute K, V for this chunk
             k = self.k_norm(self.to_k(x_chunk))
@@ -249,7 +276,7 @@ class Attention(torch.nn.Module):
         for q_start in range(0, N, chunk_size):
             q_end = min(q_start + chunk_size, N)
             x_chunk = x[:, q_start:q_end].to(device, non_blocking=True)
-            pe_chunk = pe[:, q_start:q_end].to(device, non_blocking=True) if pe is not None else None
+            pe_chunk = _pe_to_device(_pe_slice(pe, q_start, q_end), device)
 
             # Compute Q for this chunk
             q = self.q_norm(self.to_q(x_chunk))
@@ -307,8 +334,8 @@ class Attention(torch.nn.Module):
         k = self.k_norm(self.to_k(context_gpu))
         v = self.to_v(context_gpu)
 
-        if k_pe is not None:
-            k_pe_gpu = k_pe.to(device, non_blocking=True)
+        k_pe_gpu = _pe_to_device(k_pe, device)
+        if k_pe_gpu is not None:
             k = apply_rotary_emb(k, k_pe_gpu, self.rope_type)
 
         # Process Q in chunks
@@ -317,7 +344,7 @@ class Attention(torch.nn.Module):
         for q_start in range(0, N, chunk_size):
             q_end = min(q_start + chunk_size, N)
             x_chunk = x[:, q_start:q_end].to(device, non_blocking=True)
-            pe_chunk = pe[:, q_start:q_end].to(device, non_blocking=True) if pe is not None else None
+            pe_chunk = _pe_to_device(_pe_slice(pe, q_start, q_end), device)
 
             q = self.q_norm(self.to_q(x_chunk))
             if pe_chunk is not None:
