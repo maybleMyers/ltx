@@ -51,6 +51,7 @@ from ltx_core.types import LatentState, VideoPixelShape
 from ltx_pipelines.utils import ModelLedger
 from ltx_pipelines.utils.block_swap import (
     enable_block_swap,
+    enable_block_swap_with_activation_offload,
     offload_all_blocks,
     enable_text_encoder_block_swap,
     offload_all_text_encoder_blocks,
@@ -1417,6 +1418,14 @@ Examples:
         help="Enable FFN chunking for long sequences (reduces peak memory). "
              "Recommended: 4096 for 1000+ frame videos. Default: None (disabled).",
     )
+    # Activation offloading for extreme memory savings
+    mem_group.add_argument(
+        "--enable-activation-offload",
+        action="store_true",
+        help="Offload activations to CPU between transformer blocks. "
+             "Enables processing very long videos that wouldn't fit in VRAM. "
+             "Trade-off: ~10-20x slower but uses minimal GPU memory.",
+    )
 
     # ==========================================================================
     # Audio Control
@@ -2110,6 +2119,7 @@ class LTXVideoGeneratorWithOffloading:
         text_encoder_blocks_in_memory: int = 6,
         enable_refiner_block_swap: bool = False,
         refiner_blocks_in_memory: int = 22,
+        enable_activation_offload: bool = False,
         one_stage: bool = False,
         refine_only: bool = False,
         distilled_checkpoint: bool = False,
@@ -2126,6 +2136,7 @@ class LTXVideoGeneratorWithOffloading:
         self.text_encoder_blocks_in_memory = text_encoder_blocks_in_memory
         self.enable_refiner_block_swap = enable_refiner_block_swap
         self.refiner_blocks_in_memory = refiner_blocks_in_memory
+        self.enable_activation_offload = enable_activation_offload
         self.one_stage = one_stage
         self.refine_only = refine_only
         self.distilled_checkpoint = distilled_checkpoint
@@ -2537,11 +2548,20 @@ class LTXVideoGeneratorWithOffloading:
                 if hasattr(transformer.velocity_model, "av_ca_v2a_gate_adaln_single"):
                     transformer.velocity_model.av_ca_v2a_gate_adaln_single.to(self.device)
 
-                block_swap_manager = enable_block_swap(
-                    transformer,
-                    blocks_in_memory=self.dit_blocks_in_memory,
-                    device=self.device,
-                )
+                # Use activation offload for extreme memory savings (moves activations to CPU between blocks)
+                if self.enable_activation_offload:
+                    block_swap_manager = enable_block_swap_with_activation_offload(
+                        transformer,
+                        blocks_in_memory=self.dit_blocks_in_memory,
+                        device=self.device,
+                        verbose=True,
+                    )
+                else:
+                    block_swap_manager = enable_block_swap(
+                        transformer,
+                        blocks_in_memory=self.dit_blocks_in_memory,
+                        device=self.device,
+                    )
             else:
                 transformer = self.stage_1_model_ledger.transformer()
 
@@ -3103,11 +3123,20 @@ class LTXVideoGeneratorWithOffloading:
             min_blocks = 1
             while current_blocks >= min_blocks:
                 try:
-                    block_swap_manager = enable_block_swap(
-                        transformer,
-                        blocks_in_memory=current_blocks,
-                        device=self.device,
-                    )
+                    # Use activation offload for extreme memory savings (moves activations to CPU between blocks)
+                    if self.enable_activation_offload:
+                        block_swap_manager = enable_block_swap_with_activation_offload(
+                            transformer,
+                            blocks_in_memory=current_blocks,
+                            device=self.device,
+                            verbose=True,
+                        )
+                    else:
+                        block_swap_manager = enable_block_swap(
+                            transformer,
+                            blocks_in_memory=current_blocks,
+                            device=self.device,
+                        )
                     # Update instance variable for later retry logic
                     self.refiner_blocks_in_memory = current_blocks
                     break
@@ -4469,11 +4498,20 @@ def generate_av_extension(
         if hasattr(transformer.velocity_model, "av_ca_v2a_gate_adaln_single"):
             transformer.velocity_model.av_ca_v2a_gate_adaln_single.to(device)
 
-        block_swap_manager = enable_block_swap(
-            transformer,
-            blocks_in_memory=generator.dit_blocks_in_memory,
-            device=device,
-        )
+        # Use activation offload for extreme memory savings (moves activations to CPU between blocks)
+        if getattr(generator, 'enable_activation_offload', False):
+            block_swap_manager = enable_block_swap_with_activation_offload(
+                transformer,
+                blocks_in_memory=generator.dit_blocks_in_memory,
+                device=device,
+                verbose=True,
+            )
+        else:
+            block_swap_manager = enable_block_swap(
+                transformer,
+                blocks_in_memory=generator.dit_blocks_in_memory,
+                device=device,
+            )
     else:
         transformer = generator.stage_1_model_ledger.transformer()
 
@@ -4922,11 +4960,20 @@ def generate_av_extension(
             if hasattr(stage2_transformer.velocity_model, "av_ca_v2a_gate_adaln_single"):
                 stage2_transformer.velocity_model.av_ca_v2a_gate_adaln_single.to(device)
 
-            stage2_block_swap_manager = enable_block_swap(
-                stage2_transformer,
-                blocks_in_memory=generator.refiner_blocks_in_memory,
-                device=device,
-            )
+            # Use activation offload for extreme memory savings
+            if getattr(generator, 'enable_activation_offload', False):
+                stage2_block_swap_manager = enable_block_swap_with_activation_offload(
+                    stage2_transformer,
+                    blocks_in_memory=generator.refiner_blocks_in_memory,
+                    device=device,
+                    verbose=True,
+                )
+            else:
+                stage2_block_swap_manager = enable_block_swap(
+                    stage2_transformer,
+                    blocks_in_memory=generator.refiner_blocks_in_memory,
+                    device=device,
+                )
         else:
             stage2_transformer = generator.stage_2_model_ledger.transformer()
 
@@ -5860,6 +5907,7 @@ def main():
         text_encoder_blocks_in_memory=args.text_encoder_blocks_in_memory,
         enable_refiner_block_swap=args.enable_refiner_block_swap,
         refiner_blocks_in_memory=args.refiner_blocks_in_memory,
+        enable_activation_offload=args.enable_activation_offload,
         one_stage=args.one_stage,
         refine_only=args.refine_only,
         distilled_checkpoint=args.distilled_checkpoint,

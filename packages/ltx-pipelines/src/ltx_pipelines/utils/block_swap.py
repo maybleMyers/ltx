@@ -18,6 +18,14 @@ from ltx_core.model.transformer.model import LTXModel, X0Model
 from .custom_offloading_utils import ModelOffloader, clean_memory_on_device, weighs_to_device
 
 
+def log_memory(label: str) -> None:
+    """Log current GPU memory usage."""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        print(f"[MEM] {label}: {allocated:.2f}GB alloc, {reserved:.2f}GB reserved")
+
+
 def enable_block_swap(
     model: X0Model | LTXModel,
     blocks_in_memory: int = 6,
@@ -113,6 +121,171 @@ def enable_block_swap(
     ltx_model._process_transformer_blocks = types.MethodType(block_swap_process_transformer_blocks, ltx_model)
 
     print(f"[BlockSwap] Enabled: {blocks_in_memory}/{num_blocks} blocks in GPU, {blocks_to_swap} swapping")
+    return offloader
+
+
+def enable_block_swap_with_activation_offload(
+    model: X0Model | LTXModel,
+    blocks_in_memory: int = 1,
+    device: torch.device | str = "cuda",
+    verbose: bool = False,
+) -> ModelOffloader:
+    """
+    Enable block swapping WITH activation offloading for extreme memory savings.
+
+    Unlike regular block swapping which only moves weights to CPU, this also
+    moves activations (vx, ax) to CPU between blocks. This allows processing
+    arbitrarily long sequences that wouldn't fit in VRAM otherwise.
+
+    Trade-off: ~10-20x slower due to CPU-GPU transfers per block, but uses
+    minimal GPU memory regardless of sequence length.
+
+    Args:
+        model: X0Model (wraps LTXModel) or LTXModel directly.
+        blocks_in_memory: Number of transformer blocks to keep in GPU (default: 1).
+        device: Target GPU device.
+        verbose: If True, log memory at each block.
+
+    Returns:
+        ModelOffloader instance for controlling the swapping behavior.
+    """
+    from dataclasses import replace
+
+    # Get the underlying LTXModel
+    if isinstance(model, X0Model):
+        ltx_model = model.velocity_model
+    else:
+        ltx_model = model
+
+    device = torch.device(device) if isinstance(device, str) else device
+    num_blocks = len(ltx_model.transformer_blocks)
+    blocks_to_swap = num_blocks - blocks_in_memory
+
+    if blocks_to_swap <= 0:
+        print(f"[BlockSwap+ActOffload] blocks_in_memory ({blocks_in_memory}) >= num_blocks ({num_blocks}), no swapping needed")
+        return None
+
+    # Get reference to the actual blocks
+    blocks = ltx_model.transformer_blocks
+
+    # Create offloader with ThreadPoolExecutor for async transfers
+    offloader = ModelOffloader(
+        block_type="ltx_transformer_block",
+        blocks=blocks,
+        num_blocks=num_blocks,
+        blocks_to_swap=blocks_to_swap,
+        supports_backward=False,
+        device=device,
+    )
+
+    # Store on model for access in forward pass
+    ltx_model._block_swap_offloader = offloader
+    ltx_model._blocks_to_swap = blocks_to_swap
+    ltx_model._blocks_ref = blocks
+    ltx_model._activation_offload_verbose = verbose
+    if isinstance(model, X0Model):
+        model._block_swap_offloader = offloader
+        model._blocks_to_swap = blocks_to_swap
+        model._blocks_ref = blocks
+
+    # Prepare block positions: first (num_blocks - blocks_to_swap) on GPU, rest on CPU
+    offloader.prepare_block_devices_before_forward(blocks)
+
+    # Store original method for potential restoration
+    ltx_model._original_process_transformer_blocks = ltx_model._process_transformer_blocks
+
+    # Create replacement method with activation offloading
+    def block_swap_process_transformer_blocks_with_activation_offload(self, video, audio, perturbations):
+        """Process transformer blocks with block AND activation offloading."""
+        offloader = self._block_swap_offloader
+        blocks = self._blocks_ref
+        verbose = getattr(self, '_activation_offload_verbose', False)
+        device = offloader.device
+
+        # Extract activations - start on CPU
+        vx = video.x.cpu() if video is not None and video.x is not None else None
+        ax = audio.x.cpu() if audio is not None and audio.x is not None else None
+
+        if verbose:
+            log_memory("Before block loop")
+
+        for block_idx, block in enumerate(self.transformer_blocks):
+            # Wait for block weights to be ready
+            offloader.wait_for_block(block_idx)
+
+            # Move activations to GPU for this block
+            if vx is not None:
+                vx_gpu = vx.to(device, non_blocking=True)
+            else:
+                vx_gpu = None
+
+            if ax is not None:
+                ax_gpu = ax.to(device, non_blocking=True)
+            else:
+                ax_gpu = None
+
+            # Sync to ensure activations are on GPU
+            torch.cuda.synchronize()
+
+            # Create video/audio args with GPU activations
+            video_gpu = replace(video, x=vx_gpu) if video is not None else None
+            audio_gpu = replace(audio, x=ax_gpu) if audio is not None else None
+
+            if verbose and block_idx % 10 == 0:
+                log_memory(f"Block {block_idx} (before)")
+
+            # Process the block
+            video_out, audio_out = block(
+                video=video_gpu,
+                audio=audio_gpu,
+                perturbations=perturbations,
+            )
+
+            # Extract results
+            vx_result = video_out.x if video_out is not None else None
+            ax_result = audio_out.x if audio_out is not None else None
+
+            # Move activations back to CPU immediately
+            if vx_result is not None:
+                vx = vx_result.cpu()
+                del vx_result
+            if ax_result is not None:
+                ax = ax_result.cpu()
+                del ax_result
+
+            # Clean up GPU tensors
+            del vx_gpu, ax_gpu, video_gpu, audio_gpu, video_out, audio_out
+
+            # Submit swap for next block's weights
+            offloader.submit_move_blocks_forward(blocks, block_idx)
+
+            # Clear GPU cache to actually free memory
+            torch.cuda.empty_cache()
+
+            if verbose and block_idx % 10 == 0:
+                log_memory(f"Block {block_idx} (after)")
+
+        # Final move back to GPU for output
+        if vx is not None:
+            vx = vx.to(device)
+        if ax is not None:
+            ax = ax.to(device)
+
+        if verbose:
+            log_memory("After block loop")
+
+        # Return with final activations
+        video_final = replace(video, x=vx) if video is not None else None
+        audio_final = replace(audio, x=ax) if audio is not None else None
+
+        return video_final, audio_final
+
+    # Monkey-patch the method
+    ltx_model._process_transformer_blocks = types.MethodType(
+        block_swap_process_transformer_blocks_with_activation_offload, ltx_model
+    )
+
+    print(f"[BlockSwap+ActOffload] Enabled: {blocks_in_memory}/{num_blocks} blocks in GPU, {blocks_to_swap} swapping, activations offloaded")
     return offloader
 
 

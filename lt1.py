@@ -518,6 +518,7 @@ def generate_ltx_video(
     enable_refiner_block_swap: bool,
     refiner_blocks_in_memory: int,
     ffn_chunk_size: int,
+    enable_activation_offload: bool,
     # LoRA
     lora_folder: str,
     user_lora: str,
@@ -750,6 +751,8 @@ def generate_ltx_video(
             command.extend(["--refiner-blocks-in-memory", str(int(refiner_blocks_in_memory))])
         if ffn_chunk_size and int(ffn_chunk_size) > 0:
             command.extend(["--ffn-chunk-size", str(int(ffn_chunk_size))])
+        if enable_activation_offload:
+            command.append("--enable-activation-offload")
 
         # Preview generation
         unique_preview_suffix = f"ltx_{run_id}"
@@ -989,6 +992,7 @@ def generate_svi_ltx_video(
     enable_refiner_block_swap: bool,
     refiner_blocks_in_memory: int,
     ffn_chunk_size: int,
+    enable_activation_offload: bool,
     # LoRA
     lora_folder: str,
     user_lora: str,
@@ -1759,6 +1763,7 @@ Audio is synchronized with the video extension.
                                     info="Process FFN in chunks for long videos (0 = disabled, try 4096 for 1000+ frames)"
                                 )
                             with gr.Row():
+                                enable_activation_offload = gr.Checkbox(label="Activation Offload", value=False, info="Offload activations to CPU (slower but lower VRAM)")
                                 disable_audio = gr.Checkbox(label="Disable Audio", value=False, info="Generate video only (no audio)")
                                 enhance_prompt = gr.Checkbox(label="Enhance Prompt", value=False, info="Use Gemma to improve prompt")
                             with gr.Row():
@@ -2034,12 +2039,14 @@ Audio is synchronized with the video extension.
                         )
 
                     with gr.Row():
+                        svi_enable_activation_offload = gr.Checkbox(label="Activation Offload", value=False, info="Offload activations to CPU (slower but lower VRAM)")
+                        svi_disable_audio = gr.Checkbox(label="Disable Audio", value=False, info="Skip audio generation")
+                    with gr.Row():
                         svi_output_path = gr.Textbox(
                             label="Output Path",
                             value="outputs",
                             info="Directory for generated videos"
                         )
-                        svi_disable_audio = gr.Checkbox(label="Disable Audio", value=False, info="Skip audio generation")
 
                     # Preview Generation (SVI)
                     with gr.Accordion("Latent Preview (During Generation)", open=True):
@@ -2303,7 +2310,7 @@ Audio is synchronized with the video extension.
                 enable_dit_block_swap, dit_blocks_in_memory,
                 enable_text_encoder_block_swap, text_encoder_blocks_in_memory,
                 enable_refiner_block_swap, refiner_blocks_in_memory,
-                ffn_chunk_size,
+                ffn_chunk_size, enable_activation_offload,
                 lora_folder, user_lora, user_lora_strength, user_lora_stage,
                 save_path, batch_size,
                 # Preview Generation
@@ -2471,7 +2478,7 @@ Audio is synchronized with the video extension.
                 svi_enable_dit_block_swap, svi_dit_blocks_in_memory,
                 svi_enable_text_encoder_block_swap, svi_text_encoder_blocks_in_memory,
                 svi_enable_refiner_block_swap, svi_refiner_blocks_in_memory,
-                svi_ffn_chunk_size,
+                svi_ffn_chunk_size, svi_enable_activation_offload,
                 # LoRA
                 svi_lora_folder, svi_lora_dropdown, svi_lora_strength,
                 # Output
@@ -2596,7 +2603,7 @@ Audio is synchronized with the video extension.
             enable_dit_block_swap, dit_blocks_in_memory,
             enable_text_encoder_block_swap, text_encoder_blocks_in_memory,
             enable_refiner_block_swap, refiner_blocks_in_memory,
-            ffn_chunk_size,
+            ffn_chunk_size, enable_activation_offload,
             # LoRA
             lora_folder, user_lora, user_lora_strength, user_lora_stage,
             # Output
@@ -2629,7 +2636,7 @@ Audio is synchronized with the video extension.
             "enable_dit_block_swap", "dit_blocks_in_memory",
             "enable_text_encoder_block_swap", "text_encoder_blocks_in_memory",
             "enable_refiner_block_swap", "refiner_blocks_in_memory",
-            "ffn_chunk_size",
+            "ffn_chunk_size", "enable_activation_offload",
             # LoRA
             "lora_folder", "user_lora", "user_lora_strength", "user_lora_stage",
             # Output
@@ -2736,7 +2743,7 @@ Audio is synchronized with the video extension.
             svi_enable_dit_block_swap, svi_dit_blocks_in_memory,
             svi_enable_text_encoder_block_swap, svi_text_encoder_blocks_in_memory,
             svi_enable_refiner_block_swap, svi_refiner_blocks_in_memory,
-            svi_ffn_chunk_size,
+            svi_ffn_chunk_size, svi_enable_activation_offload,
             # LoRA
             svi_lora_folder, svi_lora_dropdown, svi_lora_strength,
             # Output
@@ -2768,7 +2775,7 @@ Audio is synchronized with the video extension.
             "svi_enable_dit_block_swap", "svi_dit_blocks_in_memory",
             "svi_enable_text_encoder_block_swap", "svi_text_encoder_blocks_in_memory",
             "svi_enable_refiner_block_swap", "svi_refiner_blocks_in_memory",
-            "svi_ffn_chunk_size",
+            "svi_ffn_chunk_size", "svi_enable_activation_offload",
             # LoRA
             "svi_lora_folder", "svi_lora_dropdown", "svi_lora_strength",
             # Output
