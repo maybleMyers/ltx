@@ -129,6 +129,7 @@ def enable_block_swap_with_activation_offload(
     blocks_in_memory: int = 1,
     device: torch.device | str = "cuda",
     verbose: bool = False,
+    temporal_chunk_size: int = 0,
 ) -> ModelOffloader:
     """
     Enable block swapping WITH activation offloading for extreme memory savings.
@@ -145,6 +146,8 @@ def enable_block_swap_with_activation_offload(
         blocks_in_memory: Number of transformer blocks to keep in GPU (default: 1).
         device: Target GPU device.
         verbose: If True, log memory at each block.
+        temporal_chunk_size: If > 0, process video in chunks of this many tokens.
+            This allows processing very long videos by streaming K/V from CPU.
 
     Returns:
         ModelOffloader instance for controlling the swapping behavior.
@@ -183,10 +186,12 @@ def enable_block_swap_with_activation_offload(
     ltx_model._blocks_to_swap = blocks_to_swap
     ltx_model._blocks_ref = blocks
     ltx_model._activation_offload_verbose = verbose
+    ltx_model._temporal_chunk_size = temporal_chunk_size
     if isinstance(model, X0Model):
         model._block_swap_offloader = offloader
         model._blocks_to_swap = blocks_to_swap
         model._blocks_ref = blocks
+        model._temporal_chunk_size = temporal_chunk_size
 
     # Prepare block positions: first (num_blocks - blocks_to_swap) on GPU, rest on CPU
     offloader.prepare_block_devices_before_forward(blocks)
@@ -200,6 +205,7 @@ def enable_block_swap_with_activation_offload(
         offloader = self._block_swap_offloader
         blocks = self._blocks_ref
         verbose = getattr(self, '_activation_offload_verbose', False)
+        temporal_chunk_size = getattr(self, '_temporal_chunk_size', 0)
         device = offloader.device
 
         # Extract activations - start on CPU
@@ -209,52 +215,78 @@ def enable_block_swap_with_activation_offload(
         if verbose:
             log_memory("Before block loop")
 
+        use_temporal_chunking = temporal_chunk_size > 0 and vx is not None
+
         for block_idx, block in enumerate(self.transformer_blocks):
             # Wait for block weights to be ready
             offloader.wait_for_block(block_idx)
 
-            # Move activations to GPU for this block
-            if vx is not None:
-                vx_gpu = vx.to(device, non_blocking=True)
+            if use_temporal_chunking:
+                # Use temporal chunking - keeps vx/ax on CPU, processes in chunks
+                # Create video/audio args with CPU activations
+                video_cpu = replace(video, x=vx) if video is not None else None
+                audio_cpu = replace(audio, x=ax) if audio is not None else None
+
+                if verbose and block_idx % 10 == 0:
+                    log_memory(f"Block {block_idx} (before, chunked)")
+
+                # Process using chunked forward (handles its own GPU transfers)
+                video_out, audio_out = block.forward_chunked(
+                    video=video_cpu,
+                    audio=audio_cpu,
+                    perturbations=perturbations,
+                    chunk_size=temporal_chunk_size,
+                    device=device,
+                )
+
+                # Results are already on CPU from forward_chunked
+                vx = video_out.x if video_out is not None else None
+                ax = audio_out.x if audio_out is not None else None
+
+                del video_cpu, audio_cpu, video_out, audio_out
             else:
-                vx_gpu = None
+                # Original path - move full activations to GPU
+                if vx is not None:
+                    vx_gpu = vx.to(device, non_blocking=True)
+                else:
+                    vx_gpu = None
 
-            if ax is not None:
-                ax_gpu = ax.to(device, non_blocking=True)
-            else:
-                ax_gpu = None
+                if ax is not None:
+                    ax_gpu = ax.to(device, non_blocking=True)
+                else:
+                    ax_gpu = None
 
-            # Sync to ensure activations are on GPU
-            torch.cuda.synchronize()
+                # Sync to ensure activations are on GPU
+                torch.cuda.synchronize()
 
-            # Create video/audio args with GPU activations
-            video_gpu = replace(video, x=vx_gpu) if video is not None else None
-            audio_gpu = replace(audio, x=ax_gpu) if audio is not None else None
+                # Create video/audio args with GPU activations
+                video_gpu = replace(video, x=vx_gpu) if video is not None else None
+                audio_gpu = replace(audio, x=ax_gpu) if audio is not None else None
 
-            if verbose and block_idx % 10 == 0:
-                log_memory(f"Block {block_idx} (before)")
+                if verbose and block_idx % 10 == 0:
+                    log_memory(f"Block {block_idx} (before)")
 
-            # Process the block
-            video_out, audio_out = block(
-                video=video_gpu,
-                audio=audio_gpu,
-                perturbations=perturbations,
-            )
+                # Process the block
+                video_out, audio_out = block(
+                    video=video_gpu,
+                    audio=audio_gpu,
+                    perturbations=perturbations,
+                )
 
-            # Extract results
-            vx_result = video_out.x if video_out is not None else None
-            ax_result = audio_out.x if audio_out is not None else None
+                # Extract results
+                vx_result = video_out.x if video_out is not None else None
+                ax_result = audio_out.x if audio_out is not None else None
 
-            # Move activations back to CPU immediately
-            if vx_result is not None:
-                vx = vx_result.cpu()
-                del vx_result
-            if ax_result is not None:
-                ax = ax_result.cpu()
-                del ax_result
+                # Move activations back to CPU immediately
+                if vx_result is not None:
+                    vx = vx_result.cpu()
+                    del vx_result
+                if ax_result is not None:
+                    ax = ax_result.cpu()
+                    del ax_result
 
-            # Clean up GPU tensors
-            del vx_gpu, ax_gpu, video_gpu, audio_gpu, video_out, audio_out
+                # Clean up GPU tensors
+                del vx_gpu, ax_gpu, video_gpu, audio_gpu, video_out, audio_out
 
             # Submit swap for next block's weights
             offloader.submit_move_blocks_forward(blocks, block_idx)

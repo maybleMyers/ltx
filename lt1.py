@@ -519,6 +519,7 @@ def generate_ltx_video(
     refiner_blocks_in_memory: int,
     ffn_chunk_size: int,
     enable_activation_offload: bool,
+    temporal_chunk_size: int,
     # LoRA
     lora_folder: str,
     user_lora: str,
@@ -753,6 +754,8 @@ def generate_ltx_video(
             command.extend(["--ffn-chunk-size", str(int(ffn_chunk_size))])
         if enable_activation_offload:
             command.append("--enable-activation-offload")
+        if temporal_chunk_size and int(temporal_chunk_size) > 0:
+            command.extend(["--temporal-chunk-size", str(int(temporal_chunk_size))])
 
         # Preview generation
         unique_preview_suffix = f"ltx_{run_id}"
@@ -993,6 +996,7 @@ def generate_svi_ltx_video(
     refiner_blocks_in_memory: int,
     ffn_chunk_size: int,
     enable_activation_offload: bool,
+    temporal_chunk_size: int,
     # LoRA
     lora_folder: str,
     user_lora: str,
@@ -1764,6 +1768,12 @@ Audio is synchronized with the video extension.
                                 )
                             with gr.Row():
                                 enable_activation_offload = gr.Checkbox(label="Activation Offload", value=False, info="Offload activations to CPU (slower but lower VRAM)")
+                                temporal_chunk_size = gr.Slider(
+                                    minimum=0, maximum=500000, value=0, step=50000,
+                                    label="Temporal Chunk Size",
+                                    info="Process video in chunks (0 = disabled, try 400000 for very long videos)"
+                                )
+                            with gr.Row():
                                 disable_audio = gr.Checkbox(label="Disable Audio", value=False, info="Generate video only (no audio)")
                                 enhance_prompt = gr.Checkbox(label="Enhance Prompt", value=False, info="Use Gemma to improve prompt")
                             with gr.Row():
@@ -2040,6 +2050,12 @@ Audio is synchronized with the video extension.
 
                     with gr.Row():
                         svi_enable_activation_offload = gr.Checkbox(label="Activation Offload", value=False, info="Offload activations to CPU (slower but lower VRAM)")
+                        svi_temporal_chunk_size = gr.Slider(
+                            minimum=0, maximum=500000, value=0, step=50000,
+                            label="Temporal Chunk Size",
+                            info="Process video in chunks (0 = disabled)"
+                        )
+                    with gr.Row():
                         svi_disable_audio = gr.Checkbox(label="Disable Audio", value=False, info="Skip audio generation")
                     with gr.Row():
                         svi_output_path = gr.Textbox(
@@ -2310,7 +2326,7 @@ Audio is synchronized with the video extension.
                 enable_dit_block_swap, dit_blocks_in_memory,
                 enable_text_encoder_block_swap, text_encoder_blocks_in_memory,
                 enable_refiner_block_swap, refiner_blocks_in_memory,
-                ffn_chunk_size, enable_activation_offload,
+                ffn_chunk_size, enable_activation_offload, temporal_chunk_size,
                 lora_folder, user_lora, user_lora_strength, user_lora_stage,
                 save_path, batch_size,
                 # Preview Generation
@@ -2478,7 +2494,7 @@ Audio is synchronized with the video extension.
                 svi_enable_dit_block_swap, svi_dit_blocks_in_memory,
                 svi_enable_text_encoder_block_swap, svi_text_encoder_blocks_in_memory,
                 svi_enable_refiner_block_swap, svi_refiner_blocks_in_memory,
-                svi_ffn_chunk_size, svi_enable_activation_offload,
+                svi_ffn_chunk_size, svi_enable_activation_offload, svi_temporal_chunk_size,
                 # LoRA
                 svi_lora_folder, svi_lora_dropdown, svi_lora_strength,
                 # Output
@@ -2603,7 +2619,7 @@ Audio is synchronized with the video extension.
             enable_dit_block_swap, dit_blocks_in_memory,
             enable_text_encoder_block_swap, text_encoder_blocks_in_memory,
             enable_refiner_block_swap, refiner_blocks_in_memory,
-            ffn_chunk_size, enable_activation_offload,
+            ffn_chunk_size, enable_activation_offload, temporal_chunk_size,
             # LoRA
             lora_folder, user_lora, user_lora_strength, user_lora_stage,
             # Output
@@ -2636,7 +2652,7 @@ Audio is synchronized with the video extension.
             "enable_dit_block_swap", "dit_blocks_in_memory",
             "enable_text_encoder_block_swap", "text_encoder_blocks_in_memory",
             "enable_refiner_block_swap", "refiner_blocks_in_memory",
-            "ffn_chunk_size", "enable_activation_offload",
+            "ffn_chunk_size", "enable_activation_offload", "temporal_chunk_size",
             # LoRA
             "lora_folder", "user_lora", "user_lora_strength", "user_lora_stage",
             # Output
@@ -2743,7 +2759,7 @@ Audio is synchronized with the video extension.
             svi_enable_dit_block_swap, svi_dit_blocks_in_memory,
             svi_enable_text_encoder_block_swap, svi_text_encoder_blocks_in_memory,
             svi_enable_refiner_block_swap, svi_refiner_blocks_in_memory,
-            svi_ffn_chunk_size, svi_enable_activation_offload,
+            svi_ffn_chunk_size, svi_enable_activation_offload, svi_temporal_chunk_size,
             # LoRA
             svi_lora_folder, svi_lora_dropdown, svi_lora_strength,
             # Output
@@ -2775,7 +2791,7 @@ Audio is synchronized with the video extension.
             "svi_enable_dit_block_swap", "svi_dit_blocks_in_memory",
             "svi_enable_text_encoder_block_swap", "svi_text_encoder_blocks_in_memory",
             "svi_enable_refiner_block_swap", "svi_refiner_blocks_in_memory",
-            "svi_ffn_chunk_size", "svi_enable_activation_offload",
+            "svi_ffn_chunk_size", "svi_enable_activation_offload", "svi_temporal_chunk_size",
             # LoRA
             "svi_lora_folder", "svi_lora_dropdown", "svi_lora_strength",
             # Output

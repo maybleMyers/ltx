@@ -1426,6 +1426,16 @@ Examples:
              "Enables processing very long videos that wouldn't fit in VRAM. "
              "Trade-off: ~10-20x slower but uses minimal GPU memory.",
     )
+    # Temporal chunking for very long videos
+    mem_group.add_argument(
+        "--temporal-chunk-size",
+        type=int,
+        default=0,
+        help="Process video in temporal chunks of this many tokens. "
+             "0 = disabled, try 400000 for very long videos. "
+             "Requires --enable-activation-offload. Maintains full attention context "
+             "by streaming K/V from CPU. Much slower but uses minimal GPU memory.",
+    )
 
     # ==========================================================================
     # Audio Control
@@ -1717,6 +1727,7 @@ def reconfigure_block_swap(
     new_blocks_in_memory: int,
     device: torch.device,
     enable_activation_offload: bool = False,
+    temporal_chunk_size: int = 0,
 ) -> tuple:
     """
     Reconfigure block swapping with fewer blocks in GPU after an OOM.
@@ -1726,6 +1737,7 @@ def reconfigure_block_swap(
         new_blocks_in_memory: New (reduced) number of blocks to keep in GPU
         device: Target GPU device
         enable_activation_offload: If True, use activation offloading (moves activations to CPU between blocks)
+        temporal_chunk_size: If > 0, process video in temporal chunks
 
     Returns:
         Tuple of (new_offloader, new_blocks_in_memory) or (None, 0) if at minimum
@@ -1804,6 +1816,7 @@ def reconfigure_block_swap(
             blocks_in_memory=new_blocks_in_memory,
             device=device,
             verbose=True,
+            temporal_chunk_size=temporal_chunk_size,
         )
     else:
         new_offloader = enable_block_swap(
@@ -2130,6 +2143,7 @@ class LTXVideoGeneratorWithOffloading:
         enable_refiner_block_swap: bool = False,
         refiner_blocks_in_memory: int = 22,
         enable_activation_offload: bool = False,
+        temporal_chunk_size: int = 0,
         one_stage: bool = False,
         refine_only: bool = False,
         distilled_checkpoint: bool = False,
@@ -2147,6 +2161,7 @@ class LTXVideoGeneratorWithOffloading:
         self.enable_refiner_block_swap = enable_refiner_block_swap
         self.refiner_blocks_in_memory = refiner_blocks_in_memory
         self.enable_activation_offload = enable_activation_offload
+        self.temporal_chunk_size = temporal_chunk_size
         self.one_stage = one_stage
         self.refine_only = refine_only
         self.distilled_checkpoint = distilled_checkpoint
@@ -2565,6 +2580,7 @@ class LTXVideoGeneratorWithOffloading:
                         blocks_in_memory=self.dit_blocks_in_memory,
                         device=self.device,
                         verbose=True,
+                        temporal_chunk_size=self.temporal_chunk_size,
                     )
                 else:
                     block_swap_manager = enable_block_swap(
@@ -3140,6 +3156,7 @@ class LTXVideoGeneratorWithOffloading:
                             blocks_in_memory=current_blocks,
                             device=self.device,
                             verbose=True,
+                            temporal_chunk_size=self.temporal_chunk_size,
                         )
                     else:
                         block_swap_manager = enable_block_swap(
@@ -3478,6 +3495,7 @@ class LTXVideoGeneratorWithOffloading:
                     new_blocks_in_memory=current_blocks,
                     device=torch.device(self.device),
                     enable_activation_offload=self.enable_activation_offload,
+                    temporal_chunk_size=self.temporal_chunk_size,
                 )
 
                 if block_swap_manager is None:
@@ -4516,6 +4534,7 @@ def generate_av_extension(
                 blocks_in_memory=generator.dit_blocks_in_memory,
                 device=device,
                 verbose=True,
+                temporal_chunk_size=getattr(generator, 'temporal_chunk_size', 0),
             )
         else:
             block_swap_manager = enable_block_swap(
@@ -4978,6 +4997,7 @@ def generate_av_extension(
                     blocks_in_memory=generator.refiner_blocks_in_memory,
                     device=device,
                     verbose=True,
+                    temporal_chunk_size=getattr(generator, 'temporal_chunk_size', 0),
                 )
             else:
                 stage2_block_swap_manager = enable_block_swap(
@@ -5919,6 +5939,7 @@ def main():
         enable_refiner_block_swap=args.enable_refiner_block_swap,
         refiner_blocks_in_memory=args.refiner_blocks_in_memory,
         enable_activation_offload=args.enable_activation_offload,
+        temporal_chunk_size=args.temporal_chunk_size,
         one_stage=args.one_stage,
         refine_only=args.refine_only,
         distilled_checkpoint=args.distilled_checkpoint,
