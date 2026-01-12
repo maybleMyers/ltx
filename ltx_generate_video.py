@@ -1716,6 +1716,7 @@ def reconfigure_block_swap(
     transformer,
     new_blocks_in_memory: int,
     device: torch.device,
+    enable_activation_offload: bool = False,
 ) -> tuple:
     """
     Reconfigure block swapping with fewer blocks in GPU after an OOM.
@@ -1724,6 +1725,7 @@ def reconfigure_block_swap(
         transformer: The transformer model with block swap enabled
         new_blocks_in_memory: New (reduced) number of blocks to keep in GPU
         device: Target GPU device
+        enable_activation_offload: If True, use activation offloading (moves activations to CPU between blocks)
 
     Returns:
         Tuple of (new_offloader, new_blocks_in_memory) or (None, 0) if at minimum
@@ -1796,11 +1798,19 @@ def reconfigure_block_swap(
             del transformer._blocks_ref
 
     # Re-enable block swap with new configuration
-    new_offloader = enable_block_swap(
-        transformer,
-        blocks_in_memory=new_blocks_in_memory,
-        device=device,
-    )
+    if enable_activation_offload:
+        new_offloader = enable_block_swap_with_activation_offload(
+            transformer,
+            blocks_in_memory=new_blocks_in_memory,
+            device=device,
+            verbose=True,
+        )
+    else:
+        new_offloader = enable_block_swap(
+            transformer,
+            blocks_in_memory=new_blocks_in_memory,
+            device=device,
+        )
 
     return new_offloader, new_blocks_in_memory
 
@@ -3467,6 +3477,7 @@ class LTXVideoGeneratorWithOffloading:
                     transformer,
                     new_blocks_in_memory=current_blocks,
                     device=torch.device(self.device),
+                    enable_activation_offload=self.enable_activation_offload,
                 )
 
                 if block_swap_manager is None:
