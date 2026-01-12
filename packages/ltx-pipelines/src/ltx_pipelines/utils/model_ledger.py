@@ -2,8 +2,10 @@ from dataclasses import replace
 
 import torch
 
+import gc
+
 from ltx_core.loader.primitives import LoraPathStrengthAndSDOps
-from ltx_core.loader.registry import DummyRegistry, Registry
+from ltx_core.loader.registry import DummyRegistry, Registry, StateDictRegistry
 from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder as Builder
 from ltx_core.model.audio_vae import (
     AUDIO_VAE_DECODER_COMFY_KEYS_FILTER,
@@ -103,7 +105,9 @@ class ModelLedger:
         self.gemma_root_path = gemma_root_path
         self.spatial_upsampler_path = spatial_upsampler_path
         self.loras = loras or ()
-        self.registry = registry or DummyRegistry()
+        # Use StateDictRegistry by default for caching state dicts across model loads
+        # This avoids re-reading checkpoint from disk when loading same model type multiple times
+        self.registry = registry or StateDictRegistry()
         self.fp8transformer = fp8transformer
         self.build_model_builders()
 
@@ -260,3 +264,15 @@ class ModelLedger:
             raise ValueError("Upsampler not initialized. Please provide upsampler path to the ModelLedger constructor.")
 
         return self.upsampler_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device).eval()
+
+    def clear_state_dict_cache(self) -> None:
+        """
+        Clear the state dict cache to free memory.
+
+        Call this after all models have been built and you no longer need to
+        load additional models from this ledger. This releases cached state
+        dictionaries that were kept to speed up repeated model loading.
+        """
+        if hasattr(self.registry, "clear"):
+            self.registry.clear()
+        gc.collect()

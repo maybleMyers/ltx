@@ -816,7 +816,8 @@ class DepthEstimator:
             depth = self.estimate_image(frame)  # [H, W]
 
             # Replicate to 3 channels for VAE encoding (expects RGB)
-            depth_rgb = depth.unsqueeze(-1).repeat(1, 1, 3)  # [H, W, 3]
+            # Use expand() instead of repeat() - creates view without memory allocation
+            depth_rgb = depth.unsqueeze(-1).expand(-1, -1, 3).contiguous()  # [H, W, 3]
             depth_frames.append(depth_rgb)
 
             if progress_callback:
@@ -902,8 +903,9 @@ def load_or_estimate_depth(
         # Convert to tensor [1, C, 1, H, W]
         depth_tensor = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).unsqueeze(2)
 
-        # Repeat for all frames
-        depth_tensor = depth_tensor.repeat(1, 1, num_frames, 1, 1)
+        # Expand for all frames - creates view without memory allocation
+        # Note: expand() creates a view with stride 0, downstream ops handle this correctly
+        depth_tensor = depth_tensor.expand(1, 1, num_frames, -1, -1).contiguous()
 
         return depth_tensor.to(dtype=dtype)
 
@@ -942,9 +944,10 @@ def load_or_estimate_depth(
             depth_frame = estimator.estimate_image(img_tensor)  # [H, W]
 
             # Replicate to RGB and all frames
-            depth_rgb = depth_frame.unsqueeze(-1).repeat(1, 1, 3)  # [H, W, 3]
+            # Use expand() instead of repeat() - creates view without memory allocation
+            depth_rgb = depth_frame.unsqueeze(-1).expand(-1, -1, 3).contiguous()  # [H, W, 3]
             depth_tensor = depth_rgb.permute(2, 0, 1).unsqueeze(0).unsqueeze(2)  # [1, C, 1, H, W]
-            depth_tensor = depth_tensor.repeat(1, 1, num_frames, 1, 1)  # [1, C, F, H, W]
+            depth_tensor = depth_tensor.expand(1, 1, num_frames, -1, -1).contiguous()  # [1, C, F, H, W]
 
         else:
             print(">>> Warning: --estimate-depth requires --image or --input-video")
@@ -3181,6 +3184,13 @@ class LTXVideoGeneratorWithOffloading:
             )
             stage_2_conditionings = stage_2_conditionings + depth_conditionings_s2
             print(f">>> Depth Control: Added {len(depth_conditionings_s2)} depth conditioning chunks to stage 2")
+
+        # Cleanup stage_2_video_encoder if it was loaded separately (not reusing video_encoder)
+        if stage_2_video_encoder is not None and stage_2_video_encoder is not video_encoder:
+            stage_2_video_encoder.to("cpu")
+            del stage_2_video_encoder
+            synchronize_and_cleanup()
+        stage_2_video_encoder = None
 
         # Refine-only mode: Add keyframe conditionings from input video
         # This uses every 8th frame as conditioning with strength=1.0
@@ -5477,6 +5487,7 @@ def sliding_window_generate(
         for chunk in video_iterator:
             video_frames.append(chunk)
         video_tensor = torch.cat(video_frames, dim=0)  # [F, H, W, C]
+        del video_frames  # Free list memory after concatenation
         print(f">>> Window {window_idx + 1} generated: {video_tensor.shape}")
 
         # Extract ending latent for next window (if not last window)
@@ -5525,10 +5536,16 @@ def sliding_window_generate(
         prev_window_pixels = video_tensor[-overlap:] if overlap > 0 else video_tensor[-8:]
 
         # Store chunk (strip overlap from non-first windows)
+        # Move to CPU to prevent GPU memory accumulation across windows
         if window_idx == 0:
-            all_video_chunks.append(video_tensor)
+            all_video_chunks.append(video_tensor.cpu())
         else:
-            all_video_chunks.append(video_tensor[overlap:])
+            all_video_chunks.append(video_tensor[overlap:].clone().cpu())
+
+        # Cleanup GPU memory after storing chunk
+        del video_tensor
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         if audio is not None:
             samples_per_frame = int(AUDIO_SAMPLE_RATE / args.frame_rate)
