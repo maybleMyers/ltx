@@ -390,7 +390,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 del norm_vx, pe
 
                 # Apply gate and residual in chunks
-                v_mask = perturbations.mask_like(PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx, vx[:, :1].to(device)).cpu()
+                v_mask = perturbations.mask_like(PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx, vx[:, :1].to(device))
                 vx_new_chunks = []
                 for start in range(0, N_video, chunk_size):
                     end = min(start + chunk_size, N_video)
@@ -479,7 +479,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
             if run_a2v:
                 # Audio-to-video: video queries, audio K/V (audio is small, fits on GPU)
                 a2v_out_chunks = []
-                a2v_mask = perturbations.mask_like(PerturbationType.SKIP_A2V_CROSS_ATTN, self.idx, vx[:, :1].to(device)).cpu()
+                a2v_mask = perturbations.mask_like(PerturbationType.SKIP_A2V_CROSS_ATTN, self.idx, vx[:, :1].to(device))
 
                 for start in range(0, N_video, chunk_size):
                     end = min(start + chunk_size, N_video)
