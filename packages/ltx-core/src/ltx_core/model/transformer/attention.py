@@ -227,6 +227,7 @@ class Attention(torch.nn.Module):
         pe: torch.Tensor | None,
         chunk_size: int,
         device: torch.device | str,
+        attention_chunk_size: int = 4096,
     ) -> torch.Tensor:
         """
         Chunked self-attention that maintains full global context.
@@ -237,9 +238,10 @@ class Attention(torch.nn.Module):
 
         Args:
             x: [B, N, D] input tensor (can be on CPU)
-            pe: [B, N, pe_dim] positional embeddings (can be on CPU)
-            chunk_size: number of tokens per chunk
+            pe: positional embeddings tuple (cos, sin) (can be on CPU)
+            chunk_size: number of tokens per chunk for outer operations
             device: GPU device to use for computation
+            attention_chunk_size: smaller chunk size for attention computation (default 4096)
 
         Returns:
             [B, N, D] attention output (on CPU)
@@ -247,12 +249,16 @@ class Attention(torch.nn.Module):
         B, N, D = x.shape
         device = torch.device(device) if isinstance(device, str) else device
 
-        # Phase 1: Compute K, V for all tokens in chunks, store on CPU
+        # Use smaller chunks for attention to avoid huge score matrices
+        # With 4096 Q and 4096 K: scores = [B, H, 4096, 4096] ≈ 2GB at fp32
+        attn_chunk = min(attention_chunk_size, chunk_size)
+
+        # Phase 1: Compute K, V for all tokens in small chunks, store on CPU
         K_chunks = []
         V_chunks = []
 
-        for start in range(0, N, chunk_size):
-            end = min(start + chunk_size, N)
+        for start in range(0, N, attn_chunk):
+            end = min(start + attn_chunk, N)
             x_chunk = x[:, start:end].to(device, non_blocking=True)
             pe_chunk = _pe_to_device(_pe_slice(pe, start, end), device)
 
@@ -273,8 +279,8 @@ class Attention(torch.nn.Module):
         # Phase 2: For each Q chunk, attend to ALL K/V via streaming
         output_chunks = []
 
-        for q_start in range(0, N, chunk_size):
-            q_end = min(q_start + chunk_size, N)
+        for q_start in range(0, N, attn_chunk):
+            q_end = min(q_start + attn_chunk, N)
             x_chunk = x[:, q_start:q_end].to(device, non_blocking=True)
             pe_chunk = _pe_to_device(_pe_slice(pe, q_start, q_end), device)
 
@@ -307,6 +313,7 @@ class Attention(torch.nn.Module):
         chunk_size: int,
         device: torch.device | str,
         mask: torch.Tensor | None = None,
+        attention_chunk_size: int = 4096,
     ) -> torch.Tensor:
         """
         Chunked cross-attention where context (K/V source) fits in memory.
@@ -319,15 +326,19 @@ class Attention(torch.nn.Module):
             context: [B, M, D] context for K/V (should fit on GPU)
             pe: positional embeddings for Q
             k_pe: positional embeddings for K
-            chunk_size: number of query tokens per chunk
+            chunk_size: number of query tokens per chunk (outer operations)
             device: GPU device
             mask: optional attention mask
+            attention_chunk_size: smaller chunk size for attention computation (default 4096)
 
         Returns:
             [B, N, D] attention output (on CPU)
         """
         B, N, D = x.shape
         device = torch.device(device) if isinstance(device, str) else device
+
+        # Use smaller chunks for attention to avoid huge score matrices
+        attn_chunk = min(attention_chunk_size, chunk_size)
 
         # Move context to GPU and compute K, V once
         context_gpu = context.to(device, non_blocking=True)
@@ -338,11 +349,11 @@ class Attention(torch.nn.Module):
         if k_pe_gpu is not None:
             k = apply_rotary_emb(k, k_pe_gpu, self.rope_type)
 
-        # Process Q in chunks
+        # Process Q in small chunks for memory efficiency
         output_chunks = []
 
-        for q_start in range(0, N, chunk_size):
-            q_end = min(q_start + chunk_size, N)
+        for q_start in range(0, N, attn_chunk):
+            q_end = min(q_start + attn_chunk, N)
             x_chunk = x[:, q_start:q_end].to(device, non_blocking=True)
             pe_chunk = _pe_to_device(_pe_slice(pe, q_start, q_end), device)
 
