@@ -105,15 +105,16 @@ def enable_block_swap(
             # Wait for this block to be ready BEFORE using it
             offloader.wait_for_block(block_idx)
 
-            # Submit swap immediately after block is loaded - gives max overlap with compute
-            offloader.submit_move_blocks_forward(blocks, block_idx)
-
             # Process the block
             video, audio = block(
                 video=video,
                 audio=audio,
                 perturbations=perturbations,
             )
+
+            # Submit swap for next iteration AFTER using block
+            # (moves current block to CPU, loads next needed block to GPU)
+            offloader.submit_move_blocks_forward(blocks, block_idx)
 
         return video, audio
 
@@ -243,10 +244,6 @@ def enable_block_swap_with_activation_offload(
             # Wait for block weights to be ready
             offloader.wait_for_block(block_idx)
 
-            # Submit weight swap immediately after block is loaded (overlaps with compute)
-            # This gives maximum time for the swap to complete before we need the next block
-            offloader.submit_move_blocks_forward(blocks, block_idx)
-
             if use_temporal_chunking:
                 # Wait for any pending transfer from previous block
                 if pending_transfer:
@@ -322,6 +319,10 @@ def enable_block_swap_with_activation_offload(
                 # Clean up GPU tensors (can happen while transfer runs)
                 del vx_gpu, ax_gpu, video_gpu, audio_gpu, video_out, audio_out
                 del vx_result, ax_result
+
+            # Submit swap for next block's weights AFTER using current block
+            # (moves current block to CPU, loads next needed block to GPU)
+            offloader.submit_move_blocks_forward(blocks, block_idx)
 
             # Clear GPU cache periodically (every 10 blocks) to balance memory vs overhead
             if block_idx % 10 == 9:
