@@ -75,3 +75,22 @@ VAE_ENCODER_COMFY_KEYS_FILTER = (
     .with_replacement("vae.encoder.", "")
     .with_replacement("vae.per_channel_statistics.", "per_channel_statistics.")
 )
+
+# Filters for loading from separate VAE files (keys without 'vae.' prefix)
+VAE_DECODER_SEPARATE_KEYS_FILTER = (
+    SDOps("VAE_DECODER_SEPARATE_KEYS_FILTER")
+    .with_matching(prefix="decoder.")
+    .with_matching(prefix="latents_")
+    .with_replacement("decoder.", "")
+    .with_replacement("latents_mean", "per_channel_statistics.mean")
+    .with_replacement("latents_std", "per_channel_statistics.std")
+)
+
+VAE_ENCODER_SEPARATE_KEYS_FILTER = (
+    SDOps("VAE_ENCODER_SEPARATE_KEYS_FILTER")
+    .with_matching(prefix="encoder.")
+    .with_matching(prefix="latents_")
+    .with_replacement("encoder.", "")
+    .with_replacement("latents_mean", "per_channel_statistics.mean")
+    .with_replacement("latents_std", "per_channel_statistics.std")
+)

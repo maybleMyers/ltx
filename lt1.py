@@ -469,6 +469,7 @@ def generate_ltx_video(
     stage2_checkpoint: str,
     gemma_root: str,
     spatial_upsampler_path: str,
+    vae_path: str,
     distilled_lora_path: str,
     distilled_lora_strength: float,
     # Generation parameters
@@ -522,9 +523,18 @@ def generate_ltx_video(
     temporal_chunk_size: int,
     # LoRA
     lora_folder: str,
-    user_lora: str,
-    user_lora_strength: float,
-    user_lora_stage: str,
+    user_lora_1: str,
+    user_lora_strength_1: float,
+    user_lora_stage_1: str,
+    user_lora_2: str,
+    user_lora_strength_2: float,
+    user_lora_stage_2: str,
+    user_lora_3: str,
+    user_lora_strength_3: float,
+    user_lora_stage_3: str,
+    user_lora_4: str,
+    user_lora_strength_4: float,
+    user_lora_stage_4: str,
     # Output
     save_path: str,
     batch_size: int,
@@ -667,6 +677,10 @@ def generate_ltx_video(
             if not distilled_checkpoint and not stage2_checkpoint:
                 command.extend(["--distilled-lora", distilled_lora_path, str(distilled_lora_strength)])
 
+        # VAE path (if provided)
+        if vae_path and vae_path.strip() and os.path.exists(vae_path):
+            command.extend(["--vae", vae_path])
+
         # Stage 2 checkpoint (full model for stage 2 refinement)
         if stage2_checkpoint and stage2_checkpoint.strip() and os.path.exists(stage2_checkpoint):
             command.extend(["--stage2-checkpoint", stage2_checkpoint])
@@ -712,17 +726,24 @@ def generate_ltx_video(
             if depth_stage2:
                 command.append("--depth-stage2")
 
-        # User LoRA - apply to selected stage(s)
-        if user_lora and user_lora != "None" and lora_folder:
-            lora_path = os.path.join(lora_folder, user_lora)
-            if os.path.exists(lora_path):
-                if user_lora_stage == "Stage 1 (Base)":
-                    command.extend(["--lora", lora_path, str(user_lora_strength)])
-                elif user_lora_stage == "Stage 2 (Refine)":
-                    command.extend(["--stage2-lora", lora_path, str(user_lora_strength)])
-                else:  # "Both"
-                    command.extend(["--lora", lora_path, str(user_lora_strength)])
-                    command.extend(["--stage2-lora", lora_path, str(user_lora_strength)])
+        # User LoRAs - apply to selected stage(s)
+        lora_configs = [
+            (user_lora_1, user_lora_strength_1, user_lora_stage_1),
+            (user_lora_2, user_lora_strength_2, user_lora_stage_2),
+            (user_lora_3, user_lora_strength_3, user_lora_stage_3),
+            (user_lora_4, user_lora_strength_4, user_lora_stage_4),
+        ]
+        for user_lora, user_lora_strength, user_lora_stage in lora_configs:
+            if user_lora and user_lora != "None" and lora_folder:
+                lora_path = os.path.join(lora_folder, user_lora)
+                if os.path.exists(lora_path):
+                    if user_lora_stage == "Stage 1 (Base)":
+                        command.extend(["--lora", lora_path, str(user_lora_strength)])
+                    elif user_lora_stage == "Stage 2 (Refine)":
+                        command.extend(["--stage2-lora", lora_path, str(user_lora_strength)])
+                    else:  # "Both"
+                        command.extend(["--lora", lora_path, str(user_lora_strength)])
+                        command.extend(["--stage2-lora", lora_path, str(user_lora_strength)])
 
         # Audio handling
         if audio_input and os.path.exists(audio_input):
@@ -1708,8 +1729,8 @@ Audio is synchronized with the video extension.
                             preview=True
                         )
                         # Latent Preview (During Generation)
-                        with gr.Accordion("Latent Preview (During Generation)", open=True):
-                            enable_preview = gr.Checkbox(label="Enable Latent Preview", value=True)
+                        with gr.Accordion("Latent Preview (During Generation)", open=False):
+                            enable_preview = gr.Checkbox(label="Enable Latent Preview", value=False)
                             preview_interval = gr.Slider(
                                 minimum=1, maximum=50, step=1, value=5,
                                 label="Preview Every N Steps"
@@ -1723,27 +1744,81 @@ Audio is synchronized with the video extension.
                                 preview=True,
                                 show_label=True
                             )
-                        # User LoRA
-                        with gr.Accordion("User LoRA (Optional)", open=False):
+                        # User LoRAs (up to 4)
+                        with gr.Accordion("User LoRAs (Optional)", open=True):
                             lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
                             lora_refresh_btn = gr.Button("🔄 Refresh", size="sm")
+                            # LoRA 1
                             with gr.Row():
-                                user_lora = gr.Dropdown(
-                                    label="LoRA",
+                                user_lora_1 = gr.Dropdown(
+                                    label="LoRA 1",
                                     choices=get_ltx_lora_options("lora"),
                                     value="None",
                                     scale=3
                                 )
-                                user_lora_strength = gr.Slider(
+                                user_lora_strength_1 = gr.Slider(
                                     minimum=0.0, maximum=2.0, value=1.0, step=0.1,
                                     label="Strength", scale=1
                                 )
-                                user_lora_stage = gr.Dropdown(
+                                user_lora_stage_1 = gr.Dropdown(
                                     label="Stage",
                                     choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Both"],
                                     value="Stage 2 (Refine)",
-                                    scale=1,
-                                    info="Which pass to apply LoRA"
+                                    scale=1
+                                )
+                            # LoRA 2
+                            with gr.Row():
+                                user_lora_2 = gr.Dropdown(
+                                    label="LoRA 2",
+                                    choices=get_ltx_lora_options("lora"),
+                                    value="None",
+                                    scale=3
+                                )
+                                user_lora_strength_2 = gr.Slider(
+                                    minimum=0.0, maximum=2.0, value=1.0, step=0.1,
+                                    label="Strength", scale=1
+                                )
+                                user_lora_stage_2 = gr.Dropdown(
+                                    label="Stage",
+                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Both"],
+                                    value="Stage 2 (Refine)",
+                                    scale=1
+                                )
+                            # LoRA 3
+                            with gr.Row():
+                                user_lora_3 = gr.Dropdown(
+                                    label="LoRA 3",
+                                    choices=get_ltx_lora_options("lora"),
+                                    value="None",
+                                    scale=3
+                                )
+                                user_lora_strength_3 = gr.Slider(
+                                    minimum=0.0, maximum=2.0, value=1.0, step=0.1,
+                                    label="Strength", scale=1
+                                )
+                                user_lora_stage_3 = gr.Dropdown(
+                                    label="Stage",
+                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Both"],
+                                    value="Stage 2 (Refine)",
+                                    scale=1
+                                )
+                            # LoRA 4
+                            with gr.Row():
+                                user_lora_4 = gr.Dropdown(
+                                    label="LoRA 4",
+                                    choices=get_ltx_lora_options("lora"),
+                                    value="None",
+                                    scale=3
+                                )
+                                user_lora_strength_4 = gr.Slider(
+                                    minimum=0.0, maximum=2.0, value=1.0, step=0.1,
+                                    label="Strength", scale=1
+                                )
+                                user_lora_stage_4 = gr.Dropdown(
+                                    label="Stage",
+                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Both"],
+                                    value="Stage 2 (Refine)",
+                                    scale=1
                                 )
                         # Memory Optimization
                         with gr.Accordion("Model settings", open=True):
@@ -1804,6 +1879,12 @@ Audio is synchronized with the video extension.
                                 label="Spatial Upsampler Path",
                                 value="./weights/ltx-2-spatial-upscaler-x2-1.0.safetensors",
                                 info="Path to 2x spatial upsampler"
+                            )
+                            vae_path = gr.Textbox(
+                                label="VAE Path (Optional)",
+                                value="",
+                                info="Path to dev checkpoint for vae use (leave empty to use VAE from main checkpoint)",
+                                placeholder="e.g., ./home/mayble/h1111/ltx/weights/ltx-2-19b-dev.safetensors"
                             )
                             with gr.Row():
                                 distilled_lora_path = gr.Textbox(
@@ -2235,11 +2316,15 @@ Audio is synchronized with the video extension.
             outputs=[seed]
         )
 
-        # LoRA refresh
+        # LoRA refresh (updates all 4 dropdowns)
+        def refresh_all_lora_dropdowns(folder):
+            choices = get_ltx_lora_options(folder)
+            return [gr.update(choices=choices) for _ in range(4)]
+
         lora_refresh_btn.click(
-            fn=refresh_lora_dropdown,
+            fn=refresh_all_lora_dropdowns,
             inputs=[lora_folder],
-            outputs=[user_lora]
+            outputs=[user_lora_1, user_lora_2, user_lora_3, user_lora_4]
         )
 
         # Block swap visibility toggles
@@ -2313,7 +2398,7 @@ Audio is synchronized with the video extension.
             inputs=[
                 prompt, negative_prompt,
                 checkpoint_path, distilled_checkpoint, stage2_checkpoint, gemma_root, spatial_upsampler_path,
-                distilled_lora_path, distilled_lora_strength,
+                vae_path, distilled_lora_path, distilled_lora_strength,
                 mode, pipeline, enable_sliding_window, width, height, num_frames, frame_rate,
                 cfg_guidance_scale, num_inference_steps, stage2_steps, seed,
                 stg_scale, stg_blocks, stg_mode,
@@ -2327,7 +2412,11 @@ Audio is synchronized with the video extension.
                 enable_text_encoder_block_swap, text_encoder_blocks_in_memory,
                 enable_refiner_block_swap, refiner_blocks_in_memory,
                 ffn_chunk_size, enable_activation_offload, temporal_chunk_size,
-                lora_folder, user_lora, user_lora_strength, user_lora_stage,
+                lora_folder,
+                user_lora_1, user_lora_strength_1, user_lora_stage_1,
+                user_lora_2, user_lora_strength_2, user_lora_stage_2,
+                user_lora_3, user_lora_strength_3, user_lora_stage_3,
+                user_lora_4, user_lora_strength_4, user_lora_stage_4,
                 save_path, batch_size,
                 # Preview Generation
                 enable_preview, preview_interval,
@@ -2600,7 +2689,7 @@ Audio is synchronized with the video extension.
             prompt, negative_prompt,
             # Model paths
             checkpoint_path, distilled_checkpoint, stage2_checkpoint, gemma_root,
-            spatial_upsampler_path, distilled_lora_path, distilled_lora_strength,
+            spatial_upsampler_path, vae_path, distilled_lora_path, distilled_lora_strength,
             # Generation parameters
             mode, pipeline, width, height, num_frames, frame_rate,
             cfg_guidance_scale, num_inference_steps, stage2_steps, seed,
@@ -2620,8 +2709,12 @@ Audio is synchronized with the video extension.
             enable_text_encoder_block_swap, text_encoder_blocks_in_memory,
             enable_refiner_block_swap, refiner_blocks_in_memory,
             ffn_chunk_size, enable_activation_offload, temporal_chunk_size,
-            # LoRA
-            lora_folder, user_lora, user_lora_strength, user_lora_stage,
+            # LoRAs
+            lora_folder,
+            user_lora_1, user_lora_strength_1, user_lora_stage_1,
+            user_lora_2, user_lora_strength_2, user_lora_stage_2,
+            user_lora_3, user_lora_strength_3, user_lora_stage_3,
+            user_lora_4, user_lora_strength_4, user_lora_stage_4,
             # Output
             save_path, batch_size,
             # Scale slider
@@ -2633,7 +2726,7 @@ Audio is synchronized with the video extension.
             "prompt", "negative_prompt",
             # Model paths
             "checkpoint_path", "distilled_checkpoint", "stage2_checkpoint", "gemma_root",
-            "spatial_upsampler_path", "distilled_lora_path", "distilled_lora_strength",
+            "spatial_upsampler_path", "vae_path", "distilled_lora_path", "distilled_lora_strength",
             # Generation parameters
             "mode", "pipeline", "width", "height", "num_frames", "frame_rate",
             "cfg_guidance_scale", "num_inference_steps", "stage2_steps", "seed",
@@ -2653,8 +2746,12 @@ Audio is synchronized with the video extension.
             "enable_text_encoder_block_swap", "text_encoder_blocks_in_memory",
             "enable_refiner_block_swap", "refiner_blocks_in_memory",
             "ffn_chunk_size", "enable_activation_offload", "temporal_chunk_size",
-            # LoRA
-            "lora_folder", "user_lora", "user_lora_strength", "user_lora_stage",
+            # LoRAs
+            "lora_folder",
+            "user_lora_1", "user_lora_strength_1", "user_lora_stage_1",
+            "user_lora_2", "user_lora_strength_2", "user_lora_stage_2",
+            "user_lora_3", "user_lora_strength_3", "user_lora_stage_3",
+            "user_lora_4", "user_lora_strength_4", "user_lora_stage_4",
             # Output
             "save_path", "batch_size",
             # Scale slider
@@ -2702,8 +2799,8 @@ Audio is synchronized with the video extension.
 
                 value_to_set = loaded_settings.get(key, default_value_from_component)
 
-                # Special handling for LoRA dropdown
-                if key == "user_lora":
+                # Special handling for LoRA dropdowns
+                if key in ("user_lora_1", "user_lora_2", "user_lora_3", "user_lora_4"):
                     if value_to_set not in lora_choices:
                         value_to_set = "None"
                     updates.append(gr.update(choices=lora_choices, value=value_to_set))

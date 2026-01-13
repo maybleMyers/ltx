@@ -95,6 +95,7 @@ class ModelLedger:
         checkpoint_path: str | None = None,
         gemma_root_path: str | None = None,
         spatial_upsampler_path: str | None = None,
+        vae_path: str | None = None,
         loras: LoraPathStrengthAndSDOps | None = None,
         registry: Registry | None = None,
         fp8transformer: bool = False,
@@ -104,6 +105,7 @@ class ModelLedger:
         self.checkpoint_path = checkpoint_path
         self.gemma_root_path = gemma_root_path
         self.spatial_upsampler_path = spatial_upsampler_path
+        self.vae_path = vae_path
         self.loras = loras or ()
         self.registry = registry or DummyRegistry()
         self.fp8transformer = fp8transformer
@@ -119,15 +121,19 @@ class ModelLedger:
                 registry=self.registry,
             )
 
+            # Use separate VAE path if provided, otherwise use checkpoint
+            # VAE path should point to a full LTX checkpoint file (e.g., dev checkpoint for better VAE)
+            vae_model_path = self.vae_path if self.vae_path is not None else self.checkpoint_path
+
             self.vae_decoder_builder = Builder(
-                model_path=self.checkpoint_path,
+                model_path=vae_model_path,
                 model_class_configurator=VideoDecoderConfigurator,
                 model_sd_ops=VAE_DECODER_COMFY_KEYS_FILTER,
                 registry=self.registry,
             )
 
             self.vae_encoder_builder = Builder(
-                model_path=self.checkpoint_path,
+                model_path=vae_model_path,
                 model_class_configurator=VideoEncoderConfigurator,
                 model_sd_ops=VAE_ENCODER_COMFY_KEYS_FILTER,
                 registry=self.registry,
@@ -183,6 +189,7 @@ class ModelLedger:
             checkpoint_path=self.checkpoint_path,
             gemma_root_path=self.gemma_root_path,
             spatial_upsampler_path=self.spatial_upsampler_path,
+            vae_path=self.vae_path,
             loras=(*self.loras, *loras),
             registry=self.registry,
             fp8transformer=self.fp8transformer,
