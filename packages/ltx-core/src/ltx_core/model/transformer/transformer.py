@@ -367,30 +367,30 @@ class BasicAVTransformerBlock(torch.nn.Module):
         # 1. VIDEO SELF-ATTENTION (chunked)
         # ============================================================
         if run_vx:
-            # Get ada values (small, can stay on GPU)
-            vshift_msa, vscale_msa, vgate_msa = self.get_ada_values(
-                self.scale_shift_table, vx.shape[0], video.timesteps.to(device), slice(0, 3)
-            )
-
-            # Check if ada values are per-token (shape [B, N, D]) or shared (shape [B, 1, D])
-            ada_per_token = vscale_msa.shape[1] > 1
+            # Check if timesteps are per-token by checking shape
+            # video.timesteps shape: [B, N, D] for per-token, [B, 1, D] for shared
+            ada_per_token = video.timesteps.shape[1] > 1
 
             if not perturbations.all_in_batch(PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx):
                 # Apply norm + ada to input in chunks, store on CPU
+                # Compute ada values chunk by chunk to avoid OOM
                 norm_vx_chunks = []
+                gate_chunks = []  # Store gate values for later use
                 for start in range(0, N_video, chunk_size):
                     end = min(start + chunk_size, N_video)
                     vx_chunk = vx[:, start:end].to(device)
-                    # Slice ada values if they are per-token
+                    # Compute ada values for this chunk only
                     if ada_per_token:
-                        vscale_chunk = vscale_msa[:, start:end]
-                        vshift_chunk = vshift_msa[:, start:end]
+                        timesteps_chunk = video.timesteps[:, start:end].to(device)
                     else:
-                        vscale_chunk = vscale_msa
-                        vshift_chunk = vshift_msa
+                        timesteps_chunk = video.timesteps.to(device)
+                    vshift_chunk, vscale_chunk, vgate_chunk = self.get_ada_values(
+                        self.scale_shift_table, vx.shape[0], timesteps_chunk, slice(0, 3)
+                    )
                     norm_chunk = rms_norm(vx_chunk, eps=self.norm_eps) * (1 + vscale_chunk) + vshift_chunk
                     norm_vx_chunks.append(norm_chunk.cpu())
-                    del vx_chunk, norm_chunk
+                    gate_chunks.append(vgate_chunk)  # Keep on GPU for now
+                    del vx_chunk, norm_chunk, vshift_chunk, vscale_chunk, timesteps_chunk
                 norm_vx = torch.cat(norm_vx_chunks, dim=1)
                 del norm_vx_chunks
 
@@ -402,17 +402,16 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 # Apply gate and residual in chunks
                 v_mask = perturbations.mask_like(PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx, vx[:, :1].to(device))
                 vx_new_chunks = []
-                for start in range(0, N_video, chunk_size):
+                for i, start in enumerate(range(0, N_video, chunk_size)):
                     end = min(start + chunk_size, N_video)
                     vx_chunk = vx[:, start:end].to(device)
                     attn_chunk = attn_out[:, start:end].to(device)
-                    # Slice gate if per-token
-                    vgate_chunk = vgate_msa[:, start:end] if ada_per_token else vgate_msa
+                    vgate_chunk = gate_chunks[i]
                     vx_chunk = vx_chunk + attn_chunk * vgate_chunk * v_mask
                     vx_new_chunks.append(vx_chunk.cpu())
-                    del vx_chunk, attn_chunk
+                    del vx_chunk, attn_chunk, vgate_chunk
                 vx = torch.cat(vx_new_chunks, dim=1)
-                del vx_new_chunks, attn_out, v_mask
+                del vx_new_chunks, attn_out, v_mask, gate_chunks
 
             # Cross-attention to text (text context is small, just chunk queries)
             text_attn_out_chunks = []
@@ -432,7 +431,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
 
             # Apply residual
             vx = vx + text_attn_out
-            del text_attn_out, vshift_msa, vscale_msa, vgate_msa
+            del text_attn_out
             torch.cuda.empty_cache()
 
         # ============================================================
@@ -462,7 +461,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
         # 3. AUDIO-VIDEO CROSS-ATTENTION (chunk video queries)
         # ============================================================
         if run_a2v or run_v2a:
-            # Compute ada values
+            # Compute audio ada values (audio is small, OK to compute at once)
             (
                 scale_ca_audio_a2v, shift_ca_audio_a2v,
                 scale_ca_audio_v2a, shift_ca_audio_v2a,
@@ -473,15 +472,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 audio.cross_gate_timestep.to(device),
             )
 
-            (
-                scale_ca_video_a2v, shift_ca_video_a2v,
-                scale_ca_video_v2a, shift_ca_video_v2a,
-                gate_out_a2v,
-            ) = self.get_av_ca_ada_values(
-                self.scale_shift_table_a2v_ca_video, vx.shape[0],
-                video.cross_scale_shift_timestep.to(device),
-                video.cross_gate_timestep.to(device),
-            )
+            # Check if video cross-attention timesteps are per-token
+            ca_video_ada_per_token = video.cross_scale_shift_timestep.shape[1] > 1
 
             # Prepare normalized audio (on GPU, reusable)
             ax_norm3 = rms_norm(ax, eps=self.norm_eps)
@@ -492,22 +484,26 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 # Audio-to-video: video queries, audio K/V (audio is small, fits on GPU)
                 a2v_out_chunks = []
                 a2v_mask = perturbations.mask_like(PerturbationType.SKIP_A2V_CROSS_ATTN, self.idx, vx[:, :1].to(device))
-                # Check if cross-attention ada values are per-token
-                ca_video_ada_per_token = scale_ca_video_a2v.shape[1] > 1
 
                 for start in range(0, N_video, chunk_size):
                     end = min(start + chunk_size, N_video)
                     vx_chunk = vx[:, start:end].to(device)
                     vx_norm_chunk = rms_norm(vx_chunk, eps=self.norm_eps)
-                    # Slice ada values if per-token
+                    # Compute video ada values for this chunk only
                     if ca_video_ada_per_token:
-                        scale_chunk = scale_ca_video_a2v[:, start:end]
-                        shift_chunk = shift_ca_video_a2v[:, start:end]
-                        gate_chunk = gate_out_a2v[:, start:end]
+                        v_ss_ts_chunk = video.cross_scale_shift_timestep[:, start:end].to(device)
+                        v_gate_ts_chunk = video.cross_gate_timestep[:, start:end].to(device)
                     else:
-                        scale_chunk = scale_ca_video_a2v
-                        shift_chunk = shift_ca_video_a2v
-                        gate_chunk = gate_out_a2v
+                        v_ss_ts_chunk = video.cross_scale_shift_timestep.to(device)
+                        v_gate_ts_chunk = video.cross_gate_timestep.to(device)
+                    (
+                        scale_chunk, shift_chunk,
+                        _, _,  # v2a values not needed here
+                        gate_chunk,
+                    ) = self.get_av_ca_ada_values(
+                        self.scale_shift_table_a2v_ca_video, vx.shape[0],
+                        v_ss_ts_chunk, v_gate_ts_chunk,
+                    )
                     vx_scaled_chunk = vx_norm_chunk * (1 + scale_chunk) + shift_chunk
 
                     # Cross-attention: video queries attend to audio
@@ -520,6 +516,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                     )
                     a2v_out_chunks.append((vx_chunk + a2v_chunk * gate_chunk * a2v_mask).cpu())
                     del vx_chunk, vx_norm_chunk, vx_scaled_chunk, a2v_chunk, v_pe_chunk
+                    del scale_chunk, shift_chunk, gate_chunk, v_ss_ts_chunk, v_gate_ts_chunk
 
                 vx = torch.cat(a2v_out_chunks, dim=1)
                 del a2v_out_chunks, a2v_mask
@@ -527,23 +524,29 @@ class BasicAVTransformerBlock(torch.nn.Module):
             if run_v2a:
                 # Video-to-audio: audio queries, video K/V (need to stream video)
                 # Prepare video K/V by computing in chunks and storing on CPU
-                # Check if ada values are per-token (reuse flag from a2v if available)
-                ca_video_ada_per_token_v2a = scale_ca_video_v2a.shape[1] > 1
                 V_kv_chunks = []
                 for start in range(0, N_video, chunk_size):
                     end = min(start + chunk_size, N_video)
                     vx_chunk = vx[:, start:end].to(device)
                     vx_norm_chunk = rms_norm(vx_chunk, eps=self.norm_eps)
-                    # Slice ada values if per-token
-                    if ca_video_ada_per_token_v2a:
-                        scale_chunk = scale_ca_video_v2a[:, start:end]
-                        shift_chunk = shift_ca_video_v2a[:, start:end]
+                    # Compute video ada values for this chunk only
+                    if ca_video_ada_per_token:
+                        v_ss_ts_chunk = video.cross_scale_shift_timestep[:, start:end].to(device)
+                        v_gate_ts_chunk = video.cross_gate_timestep[:, start:end].to(device)
                     else:
-                        scale_chunk = scale_ca_video_v2a
-                        shift_chunk = shift_ca_video_v2a
+                        v_ss_ts_chunk = video.cross_scale_shift_timestep.to(device)
+                        v_gate_ts_chunk = video.cross_gate_timestep.to(device)
+                    (
+                        _, _,  # a2v values not needed here
+                        scale_chunk, shift_chunk,
+                        _,  # gate not needed for K/V
+                    ) = self.get_av_ca_ada_values(
+                        self.scale_shift_table_a2v_ca_video, vx.shape[0],
+                        v_ss_ts_chunk, v_gate_ts_chunk,
+                    )
                     vx_scaled_chunk = vx_norm_chunk * (1 + scale_chunk) + shift_chunk
                     V_kv_chunks.append(vx_scaled_chunk.cpu())
-                    del vx_chunk, vx_norm_chunk, vx_scaled_chunk
+                    del vx_chunk, vx_norm_chunk, vx_scaled_chunk, v_ss_ts_chunk, v_gate_ts_chunk
 
                 vx_scaled_full = torch.cat(V_kv_chunks, dim=1)
                 del V_kv_chunks
@@ -564,33 +567,25 @@ class BasicAVTransformerBlock(torch.nn.Module):
 
             del ax_norm3, ax_scaled_a2v, ax_scaled_v2a
             del scale_ca_audio_a2v, shift_ca_audio_a2v, scale_ca_audio_v2a, shift_ca_audio_v2a
-            del scale_ca_video_a2v, shift_ca_video_a2v, scale_ca_video_v2a, shift_ca_video_v2a
-            del gate_out_a2v, gate_out_v2a
+            del gate_out_v2a
             torch.cuda.empty_cache()
 
         # ============================================================
         # 4. FFN (chunked for video, normal for audio)
         # ============================================================
         if run_vx:
-            vshift_mlp, vscale_mlp, vgate_mlp = self.get_ada_values(
-                self.scale_shift_table, vx.shape[0], video.timesteps.to(device), slice(3, None)
-            )
-            # Check if ada values are per-token
-            mlp_ada_per_token = vscale_mlp.shape[1] > 1
-
             vx_ffn_chunks = []
             for start in range(0, N_video, chunk_size):
                 end = min(start + chunk_size, N_video)
                 vx_chunk = vx[:, start:end].to(device)
-                # Slice ada values if per-token
-                if mlp_ada_per_token:
-                    vscale_chunk = vscale_mlp[:, start:end]
-                    vshift_chunk = vshift_mlp[:, start:end]
-                    vgate_chunk = vgate_mlp[:, start:end]
+                # Compute ada values for this chunk only
+                if ada_per_token:
+                    timesteps_chunk = video.timesteps[:, start:end].to(device)
                 else:
-                    vscale_chunk = vscale_mlp
-                    vshift_chunk = vshift_mlp
-                    vgate_chunk = vgate_mlp
+                    timesteps_chunk = video.timesteps.to(device)
+                vshift_chunk, vscale_chunk, vgate_chunk = self.get_ada_values(
+                    self.scale_shift_table, vx.shape[0], timesteps_chunk, slice(3, None)
+                )
                 vx_scaled = rms_norm(vx_chunk, eps=self.norm_eps) * (1 + vscale_chunk) + vshift_chunk
 
                 if self.ffn_chunk_size is not None:
@@ -599,10 +594,10 @@ class BasicAVTransformerBlock(torch.nn.Module):
                     ffn_out = self.ff(vx_scaled)
 
                 vx_ffn_chunks.append((vx_chunk + ffn_out * vgate_chunk).cpu())
-                del vx_chunk, vx_scaled, ffn_out
+                del vx_chunk, vx_scaled, ffn_out, vshift_chunk, vscale_chunk, vgate_chunk, timesteps_chunk
 
             vx = torch.cat(vx_ffn_chunks, dim=1)
-            del vx_ffn_chunks, vshift_mlp, vscale_mlp, vgate_mlp
+            del vx_ffn_chunks
 
         if run_ax:
             ashift_mlp, ascale_mlp, agate_mlp = self.get_ada_values(
