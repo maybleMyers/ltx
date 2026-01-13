@@ -30,11 +30,123 @@ def synchronize_device(device: torch.device):
         torch.mps.synchronize()
 
 
+def get_block_param_shapes(block: nn.Module) -> list[tuple[str, str, torch.Size, torch.dtype]]:
+    """Extract parameter shapes from a block for buffer pre-allocation."""
+    shapes = []
+    for module_name, module in block.named_modules():
+        for param_name, param in module.named_parameters(recurse=False):
+            if param is not None:
+                shapes.append((module_name, param_name, param.shape, param.dtype))
+    return shapes
+
+
+def create_pinned_buffer_for_block(shapes: list[tuple[str, str, torch.Size, torch.dtype]]) -> dict[tuple[str, str], torch.Tensor]:
+    """Pre-allocate pinned CPU buffers matching a block's parameter structure."""
+    buffers = {}
+    for module_name, param_name, shape, dtype in shapes:
+        key = (module_name, param_name)
+        buffers[key] = torch.empty(shape, dtype=dtype, device='cpu', pin_memory=True)
+    return buffers
+
+
+def swap_weight_devices_cuda_fast(
+    device: torch.device,
+    layer_to_cpu: nn.Module,
+    layer_to_cuda: nn.Module,
+    spare_buffer: dict[tuple[str, str], torch.Tensor],
+    stream_to_gpu: torch.cuda.Stream,
+    stream_to_cpu: torch.cuda.Stream,
+    event_gpu_done: torch.cuda.Event,
+    event_cpu_done: torch.cuda.Event,
+):
+    """
+    Fast weight swap using pre-allocated buffers and dual streams.
+
+    Uses separate streams for GPU→CPU and CPU→GPU transfers to achieve
+    full PCIe duplex utilization. Event-based sync ensures correctness
+    without blocking the entire stream.
+    """
+    assert layer_to_cpu.__class__ == layer_to_cuda.__class__
+
+    # Collect all parameter swap jobs
+    swap_jobs = []  # (module_to_cpu, module_to_cuda, param_name, cpu_data, gpu_data, spare_buf)
+
+    modules_to_cpu = {k: v for k, v in layer_to_cpu.named_modules()}
+    for module_to_cuda_name, module_to_cuda in layer_to_cuda.named_modules():
+        module_to_cpu = modules_to_cpu.get(module_to_cuda_name, None)
+        if module_to_cpu is None:
+            continue
+
+        for param_name, param in module_to_cuda.named_parameters(recurse=False):
+            if param is None:
+                continue
+            cpu_param = getattr(module_to_cpu, param_name, None)
+            if cpu_param is None:
+                continue
+
+            key = (module_to_cuda_name, param_name)
+            spare_buf = spare_buffer.get(key)
+            if spare_buf is None or spare_buf.shape != param.shape:
+                # Fallback: allocate if shape mismatch (shouldn't happen)
+                spare_buf = torch.empty_like(param, device='cpu', pin_memory=True)
+                spare_buffer[key] = spare_buf
+
+            swap_jobs.append((
+                module_to_cpu, module_to_cuda, param_name,
+                cpu_param.data, param.data, spare_buf
+            ))
+
+    # Wait for any previous operations on default stream
+    torch.cuda.current_stream(device).synchronize()
+
+    # Phase 1: Start GPU→CPU transfers (into spare buffers)
+    # This can run while we wait for previous CPU→GPU to finish
+    with torch.cuda.stream(stream_to_cpu):
+        for module_to_cpu, module_to_cuda, param_name, cpu_data, gpu_data, spare_buf in swap_jobs:
+            gpu_data.record_stream(stream_to_cpu)
+            spare_buf.copy_(gpu_data, non_blocking=True)
+
+    # Record when GPU→CPU copies are queued
+    event_cpu_done.record(stream_to_cpu)
+
+    # Phase 2: Start CPU→GPU transfers (reusing GPU memory)
+    # Wait for previous GPU→CPU to ensure we don't overwrite data being read
+    with torch.cuda.stream(stream_to_gpu):
+        stream_to_gpu.wait_event(event_gpu_done)  # Wait for previous CPU→GPU
+        for module_to_cpu, module_to_cuda, param_name, cpu_data, gpu_data, spare_buf in swap_jobs:
+            gpu_data.copy_(cpu_data, non_blocking=True)
+            # Point cuda module to the (reused) GPU buffer
+            getattr(module_to_cuda, param_name).data = gpu_data
+
+    # Record when CPU→GPU copies are queued
+    event_gpu_done.record(stream_to_gpu)
+
+    # Phase 3: Wait for GPU→CPU to complete, then swap buffer ownership
+    stream_to_cpu.synchronize()
+
+    # Swap buffer ownership:
+    # - spare_buf now contains GPU's old weights (moved to CPU)
+    # - cpu_data was the CPU block's weights (now being copied to GPU)
+    # - Give spare_buf to CPU module, put cpu_data into spare for next swap
+    for module_to_cpu, module_to_cuda, param_name, cpu_data, gpu_data, spare_buf in swap_jobs:
+        # CPU module gets the spare buffer (which now has GPU's old data)
+        getattr(module_to_cpu, param_name).data = spare_buf
+
+    # Update spare_buffer dict: old CPU buffers become new spare buffers
+    modules_to_cpu_inv = {id(v): k for k, v in modules_to_cpu.items()}
+    for module_to_cpu, module_to_cuda, param_name, cpu_data, gpu_data, spare_buf in swap_jobs:
+        module_name = modules_to_cpu_inv.get(id(module_to_cpu), "")
+        key = (module_name, param_name)
+        spare_buffer[key] = cpu_data  # Old CPU buffer is now spare
+
+    # Ensure CPU→GPU is done before returning (needed for correct execution)
+    stream_to_gpu.synchronize()
+
+
 def swap_weight_devices_cuda(device: torch.device, layer_to_cpu: nn.Module, layer_to_cuda: nn.Module):
     """
-    Swap weights between two layers, moving layer_to_cpu's weights to CPU and layer_to_cuda's weights to GPU.
-    Uses buffer reuse for large weight tensors to minimize GPU memory allocation.
-    Also handles biases and other parameters with simple device transfers.
+    Legacy swap function - allocates buffers each time.
+    Use swap_weight_devices_cuda_fast with pre-allocated buffers for better performance.
     """
     assert layer_to_cpu.__class__ == layer_to_cuda.__class__
 
@@ -172,35 +284,95 @@ class Offloader:
         self.debug = debug
         self.use_pinned_weights = use_pinned_weights
 
-        self.thread_pool = ThreadPoolExecutor(max_workers=2)
+        self.thread_pool = ThreadPoolExecutor(max_workers=4)
         self.futures = {}
         self.cuda_available = device.type == "cuda"
 
-    def swap_weight_devices(self, block_to_cpu: nn.Module, block_to_cuda: nn.Module):
+        # Fast path: pre-allocated resources (initialized in prepare_block_devices_before_forward)
+        self.use_fast_swap = False
+        self.spare_buffers = {}  # worker_id -> buffer dict
+        self.streams_to_gpu = {}  # worker_id -> stream
+        self.streams_to_cpu = {}  # worker_id -> stream
+        self.events_gpu_done = {}  # worker_id -> event
+        self.events_cpu_done = {}  # worker_id -> event
+        self._worker_id_counter = 0
+        self._worker_id_lock = None
+
+    def _get_worker_id(self) -> int:
+        """Get a unique worker ID for the current thread."""
+        import threading
+        if self._worker_id_lock is None:
+            self._worker_id_lock = threading.Lock()
+
+        thread_id = threading.current_thread().ident
+        # Simple round-robin assignment
+        with self._worker_id_lock:
+            worker_id = self._worker_id_counter % 4
+            self._worker_id_counter += 1
+        return worker_id
+
+    def _init_fast_swap_resources(self, reference_block: nn.Module):
+        """Initialize pre-allocated buffers and streams for fast swapping."""
+        if not self.cuda_available:
+            return
+
+        shapes = get_block_param_shapes(reference_block)
+
+        # Create resources for each worker
+        for worker_id in range(4):
+            self.spare_buffers[worker_id] = create_pinned_buffer_for_block(shapes)
+            self.streams_to_gpu[worker_id] = torch.cuda.Stream(device=self.device)
+            self.streams_to_cpu[worker_id] = torch.cuda.Stream(device=self.device)
+            self.events_gpu_done[worker_id] = torch.cuda.Event()
+            self.events_cpu_done[worker_id] = torch.cuda.Event()
+            # Record initial event so first wait doesn't block forever
+            self.events_gpu_done[worker_id].record()
+
+        self.use_fast_swap = True
+
+        # Calculate memory usage
+        total_spare_mem = sum(buf.numel() * buf.element_size() for buf in self.spare_buffers[0].values())
+        print(f"[{self.block_type}] Fast swap initialized: {total_spare_mem / 1e6:.1f}MB spare buffers x 4 workers = {total_spare_mem * 4 / 1e6:.1f}MB total")
+
+    def swap_weight_devices(self, block_to_cpu: nn.Module, block_to_cuda: nn.Module, worker_id: int = 0):
         if self.cuda_available:
-            swap_weight_devices_cuda(self.device, block_to_cpu, block_to_cuda)
+            if self.use_fast_swap and worker_id in self.spare_buffers:
+                swap_weight_devices_cuda_fast(
+                    self.device,
+                    block_to_cpu,
+                    block_to_cuda,
+                    self.spare_buffers[worker_id],
+                    self.streams_to_gpu[worker_id],
+                    self.streams_to_cpu[worker_id],
+                    self.events_gpu_done[worker_id],
+                    self.events_cpu_done[worker_id],
+                )
+            else:
+                swap_weight_devices_cuda(self.device, block_to_cpu, block_to_cuda)
         else:
             swap_weight_devices_no_cuda(self.device, block_to_cpu, block_to_cuda)
 
     def _submit_move_blocks(self, blocks, block_idx_to_cpu, block_idx_to_cuda):
-        def move_blocks(bidx_to_cpu, block_to_cpu, bidx_to_cuda, block_to_cuda):
+        worker_id = self._get_worker_id()
+
+        def move_blocks(bidx_to_cpu, block_to_cpu, bidx_to_cuda, block_to_cuda, wid):
             if self.debug:
                 start_time = time.perf_counter()
                 print(
-                    f"[{self.block_type}] Move block {bidx_to_cpu} to CPU and block {bidx_to_cuda} to {'CUDA' if self.cuda_available else 'device'}"
+                    f"[{self.block_type}] Move block {bidx_to_cpu} to CPU and block {bidx_to_cuda} to {'CUDA' if self.cuda_available else 'device'} (worker {wid})"
                 )
 
-            self.swap_weight_devices(block_to_cpu, block_to_cuda)
+            self.swap_weight_devices(block_to_cpu, block_to_cuda, wid)
 
             if self.debug:
                 print(f"[{self.block_type}] Moved blocks {bidx_to_cpu} and {bidx_to_cuda} in {time.perf_counter()-start_time:.2f}s")
-            return bidx_to_cpu, bidx_to_cuda  # , event
+            return bidx_to_cpu, bidx_to_cuda
 
         block_to_cpu = blocks[block_idx_to_cpu]
         block_to_cuda = blocks[block_idx_to_cuda]
 
         self.futures[block_idx_to_cuda] = self.thread_pool.submit(
-            move_blocks, block_idx_to_cpu, block_to_cpu, block_idx_to_cuda, block_to_cuda
+            move_blocks, block_idx_to_cpu, block_to_cpu, block_idx_to_cuda, block_to_cuda, worker_id
         )
 
     def _wait_blocks_move(self, block_idx):
@@ -216,8 +388,9 @@ class Offloader:
 
         assert block_idx == bidx_to_cuda, f"Block index mismatch: {block_idx} != {bidx_to_cuda}"
 
-        # Ensure CUDA operations from swap are complete
-        if self.cuda_available:
+        # For fast swap, sync is already done in the swap function
+        # For legacy swap, we still need a sync
+        if self.cuda_available and not self.use_fast_swap:
             torch.cuda.synchronize()
             if self.debug:
                 print(f"[{self.block_type}] Swap complete for block {block_idx}: {torch.cuda.memory_allocated() / 1e9:.2f} GB", flush=True)
@@ -317,6 +490,10 @@ class ModelOffloader(Offloader):
 
         synchronize_device(self.device)
         clean_memory_on_device(self.device)
+
+        # Initialize fast swap resources using first block as reference
+        if len(blocks) > 0 and self.cuda_available:
+            self._init_fast_swap_resources(blocks[0])
 
         if self.debug and self.device.type == "cuda":
             print(f"[{self.block_type}] After prepare: GPU memory: {torch.cuda.memory_allocated(self.device) / 1e9:.2f} GB")

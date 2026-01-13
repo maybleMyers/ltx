@@ -364,7 +364,10 @@ class LTXModel(torch.nn.Module):
         shift, scale = scale_shift_values[:, :, 0], scale_shift_values[:, :, 1]
 
         x = norm_out(x)
-        x = x * (1 + scale) + shift
+        # Use in-place ops to avoid intermediate tensor allocations (saves ~6GB for large latents)
+        scale.add_(1)
+        x.mul_(scale)
+        x.add_(shift)
         x = proj_out(x)
         return x
 
