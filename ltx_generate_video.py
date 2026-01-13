@@ -3220,6 +3220,12 @@ class LTXVideoGeneratorWithOffloading:
             if stage2_steps == 3:
                 # Use exact tuned values for default 3 steps
                 distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
+            elif stage2_steps == 8:
+                # Use full trained 8-step distilled schedule for better quality
+                # This schedule was specifically trained and produces better results
+                # than interpolating from the 3-step schedule
+                distilled_sigmas = torch.Tensor(DISTILLED_SIGMA_VALUES).to(self.device)
+                print(f">>> Stage 2 using full trained 8-step distilled schedule")
             else:
                 # Interpolate tuned values to support different step counts
                 # Original tuned values: [0.909375, 0.725, 0.421875, 0.0]
