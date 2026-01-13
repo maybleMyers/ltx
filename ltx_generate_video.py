@@ -2997,11 +2997,20 @@ class LTXVideoGeneratorWithOffloading:
 
                 # Load video decoder, decode, then offload
                 video_decoder = self.stage_1_model_ledger.video_decoder()
-                decoded_video = vae_decode_video(
+                # vae_decode_video returns a generator - consume it immediately before offloading decoder
+                decoded_video_chunks = []
+                for chunk in vae_decode_video(
                     video_state.latent,
                     video_decoder,
                     tiling_config,
-                )
+                ):
+                    decoded_video_chunks.append(chunk.cpu())  # Move chunks to CPU immediately
+                    del chunk
+                # Create a generator that yields the cached chunks for encode_video compatibility
+                def decoded_video_iter():
+                    for chunk in decoded_video_chunks:
+                        yield chunk.cuda()  # Move back to GPU when consumed
+                decoded_video = decoded_video_iter()
                 video_decoder.to("cpu")
                 del video_decoder
                 synchronize_and_cleanup()
@@ -3558,11 +3567,20 @@ class LTXVideoGeneratorWithOffloading:
 
         # Load video decoder, decode, then offload to free memory before audio
         video_decoder = self.stage_2_model_ledger.video_decoder()
-        decoded_video = vae_decode_video(
+        # vae_decode_video returns a generator - consume it immediately before offloading decoder
+        decoded_video_chunks = []
+        for chunk in vae_decode_video(
             video_state.latent,
             video_decoder,
             tiling_config,
-        )
+        ):
+            decoded_video_chunks.append(chunk.cpu())  # Move chunks to CPU immediately
+            del chunk
+        # Create a generator that yields the cached chunks for encode_video compatibility
+        def decoded_video_iter():
+            for chunk in decoded_video_chunks:
+                yield chunk.cuda()  # Move back to GPU when consumed
+        decoded_video = decoded_video_iter()
         # Offload video decoder before loading audio models
         video_decoder.to("cpu")
         del video_decoder
