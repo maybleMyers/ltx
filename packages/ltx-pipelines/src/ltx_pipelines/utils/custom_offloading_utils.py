@@ -62,6 +62,10 @@ def swap_weight_devices_cuda_fast(
     """
     Fast weight swap using pre-allocated buffers and dual streams.
 
+    Args:
+        layer_to_cpu: Layer currently on GPU, should end up on CPU
+        layer_to_cuda: Layer currently on CPU (pinned), should end up on GPU
+
     Uses separate streams for GPU→CPU and CPU→GPU transfers to achieve
     full PCIe duplex utilization. Event-based sync ensures correctness
     without blocking the entire stream.
@@ -69,54 +73,60 @@ def swap_weight_devices_cuda_fast(
     assert layer_to_cpu.__class__ == layer_to_cuda.__class__
 
     # Collect all parameter swap jobs
-    swap_jobs = []  # (module_to_cpu, module_to_cuda, param_name, cpu_data, gpu_data, spare_buf)
+    # layer_to_cpu is currently ON GPU (will move to CPU)
+    # layer_to_cuda is currently ON CPU/pinned (will move to GPU)
+    swap_jobs = []  # (mod_going_to_cpu, mod_going_to_gpu, param_name, data_on_gpu, data_on_cpu_pinned, spare_buf, module_name)
 
-    modules_to_cpu = {k: v for k, v in layer_to_cpu.named_modules()}
-    for module_to_cuda_name, module_to_cuda in layer_to_cuda.named_modules():
-        module_to_cpu = modules_to_cpu.get(module_to_cuda_name, None)
-        if module_to_cpu is None:
+    modules_going_to_cpu = {k: v for k, v in layer_to_cpu.named_modules()}
+    for module_name, mod_going_to_gpu in layer_to_cuda.named_modules():
+        mod_going_to_cpu = modules_going_to_cpu.get(module_name, None)
+        if mod_going_to_cpu is None:
             continue
 
-        for param_name, param in module_to_cuda.named_parameters(recurse=False):
-            if param is None:
+        for param_name, param_on_cpu in mod_going_to_gpu.named_parameters(recurse=False):
+            if param_on_cpu is None:
                 continue
-            cpu_param = getattr(module_to_cpu, param_name, None)
-            if cpu_param is None:
+            param_on_gpu = getattr(mod_going_to_cpu, param_name, None)
+            if param_on_gpu is None:
                 continue
 
-            key = (module_to_cuda_name, param_name)
+            key = (module_name, param_name)
             spare_buf = spare_buffer.get(key)
-            if spare_buf is None or spare_buf.shape != param.shape:
+            if spare_buf is None or spare_buf.shape != param_on_cpu.shape:
                 # Fallback: allocate if shape mismatch (shouldn't happen)
-                spare_buf = torch.empty_like(param, device='cpu', pin_memory=True)
+                spare_buf = torch.empty_like(param_on_cpu, device='cpu', pin_memory=True)
                 spare_buffer[key] = spare_buf
 
             swap_jobs.append((
-                module_to_cpu, module_to_cuda, param_name,
-                cpu_param.data, param.data, spare_buf
+                mod_going_to_cpu, mod_going_to_gpu, param_name,
+                param_on_gpu.data,  # Currently on GPU
+                param_on_cpu.data,  # Currently on CPU (pinned)
+                spare_buf,
+                module_name,
             ))
 
     # Wait for any previous operations on default stream
     torch.cuda.current_stream(device).synchronize()
 
     # Phase 1: Start GPU→CPU transfers (into spare buffers)
-    # This can run while we wait for previous CPU→GPU to finish
+    # Copy from GPU tensors to spare pinned buffers
     with torch.cuda.stream(stream_to_cpu):
-        for module_to_cpu, module_to_cuda, param_name, cpu_data, gpu_data, spare_buf in swap_jobs:
-            gpu_data.record_stream(stream_to_cpu)
-            spare_buf.copy_(gpu_data, non_blocking=True)
+        for mod_going_to_cpu, mod_going_to_gpu, param_name, data_on_gpu, data_on_cpu_pinned, spare_buf, module_name in swap_jobs:
+            data_on_gpu.record_stream(stream_to_cpu)
+            spare_buf.copy_(data_on_gpu, non_blocking=True)
 
     # Record when GPU→CPU copies are queued
     event_cpu_done.record(stream_to_cpu)
 
-    # Phase 2: Start CPU→GPU transfers (reusing GPU memory)
-    # Wait for previous GPU→CPU to ensure we don't overwrite data being read
+    # Phase 2: Start CPU→GPU transfers (reusing GPU memory buffers)
+    # Copy from pinned CPU tensors to GPU, reusing the existing GPU buffer
     with torch.cuda.stream(stream_to_gpu):
-        stream_to_gpu.wait_event(event_gpu_done)  # Wait for previous CPU→GPU
-        for module_to_cpu, module_to_cuda, param_name, cpu_data, gpu_data, spare_buf in swap_jobs:
-            gpu_data.copy_(cpu_data, non_blocking=True)
-            # Point cuda module to the (reused) GPU buffer
-            getattr(module_to_cuda, param_name).data = gpu_data
+        stream_to_gpu.wait_event(event_gpu_done)  # Wait for previous CPU→GPU from last swap
+        for mod_going_to_cpu, mod_going_to_gpu, param_name, data_on_gpu, data_on_cpu_pinned, spare_buf, module_name in swap_jobs:
+            # Reuse the GPU buffer, copy pinned CPU data into it
+            data_on_gpu.copy_(data_on_cpu_pinned, non_blocking=True)
+            # Point the module going to GPU to this buffer
+            getattr(mod_going_to_gpu, param_name).data = data_on_gpu
 
     # Record when CPU→GPU copies are queued
     event_gpu_done.record(stream_to_gpu)
@@ -124,20 +134,14 @@ def swap_weight_devices_cuda_fast(
     # Phase 3: Wait for GPU→CPU to complete, then swap buffer ownership
     stream_to_cpu.synchronize()
 
-    # Swap buffer ownership:
-    # - spare_buf now contains GPU's old weights (moved to CPU)
-    # - cpu_data was the CPU block's weights (now being copied to GPU)
-    # - Give spare_buf to CPU module, put cpu_data into spare for next swap
-    for module_to_cpu, module_to_cuda, param_name, cpu_data, gpu_data, spare_buf in swap_jobs:
-        # CPU module gets the spare buffer (which now has GPU's old data)
-        getattr(module_to_cpu, param_name).data = spare_buf
+    # Assign spare buffers (now containing old GPU data) to the modules going to CPU
+    for mod_going_to_cpu, mod_going_to_gpu, param_name, data_on_gpu, data_on_cpu_pinned, spare_buf, module_name in swap_jobs:
+        getattr(mod_going_to_cpu, param_name).data = spare_buf
 
-    # Update spare_buffer dict: old CPU buffers become new spare buffers
-    modules_to_cpu_inv = {id(v): k for k, v in modules_to_cpu.items()}
-    for module_to_cpu, module_to_cuda, param_name, cpu_data, gpu_data, spare_buf in swap_jobs:
-        module_name = modules_to_cpu_inv.get(id(module_to_cpu), "")
+    # Update spare_buffer dict: old pinned CPU buffers become new spare buffers
+    for mod_going_to_cpu, mod_going_to_gpu, param_name, data_on_gpu, data_on_cpu_pinned, spare_buf, module_name in swap_jobs:
         key = (module_name, param_name)
-        spare_buffer[key] = cpu_data  # Old CPU buffer is now spare
+        spare_buffer[key] = data_on_cpu_pinned  # Old pinned buffer is now spare
 
     # Ensure CPU→GPU is done before returning (needed for correct execution)
     stream_to_gpu.synchronize()
