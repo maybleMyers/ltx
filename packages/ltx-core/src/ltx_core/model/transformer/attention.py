@@ -253,11 +253,11 @@ class Attention(torch.nn.Module):
         # With 4096 Q and 4096 K: scores = [B, H, 4096, 4096] ≈ 2GB at fp32
         attn_chunk = min(attention_chunk_size, chunk_size)
 
-        # Phase 1: Compute K, V for all tokens in small chunks, store on CPU
+        # Phase 1: Compute K, V for all tokens in small chunks, store on pinned CPU memory
         K_chunks = []
         V_chunks = []
 
-        for start in range(0, N, attn_chunk):
+        for i, start in enumerate(range(0, N, attn_chunk)):
             end = min(start + attn_chunk, N)
             x_chunk = x[:, start:end].to(device, non_blocking=True)
             pe_chunk = _pe_to_device(_pe_slice(pe, start, end), device)
@@ -269,17 +269,23 @@ class Attention(torch.nn.Module):
             if pe_chunk is not None:
                 k = apply_rotary_emb(k, pe_chunk, self.rope_type)
 
-            # Store on CPU
-            K_chunks.append(k.cpu())
-            V_chunks.append(v.cpu())
+            # Store on pinned CPU memory for faster transfers back to GPU
+            k_pinned = torch.empty_like(k, device='cpu', pin_memory=True)
+            v_pinned = torch.empty_like(v, device='cpu', pin_memory=True)
+            k_pinned.copy_(k)
+            v_pinned.copy_(v)
+            K_chunks.append(k_pinned)
+            V_chunks.append(v_pinned)
 
             del x_chunk, k, v, pe_chunk
-            torch.cuda.empty_cache()
+            # Only clear cache every 10 chunks to reduce overhead
+            if i % 10 == 9:
+                torch.cuda.empty_cache()
 
         # Phase 2: For each Q chunk, attend to ALL K/V via streaming
         output_chunks = []
 
-        for q_start in range(0, N, attn_chunk):
+        for i, q_start in enumerate(range(0, N, attn_chunk)):
             q_end = min(q_start + attn_chunk, N)
             x_chunk = x[:, q_start:q_end].to(device, non_blocking=True)
             pe_chunk = _pe_to_device(_pe_slice(pe, q_start, q_end), device)
@@ -292,12 +298,16 @@ class Attention(torch.nn.Module):
             # Attend to ALL K/V by streaming from CPU
             attn_out = self._streamed_attention(q, K_chunks, V_chunks, device)
 
-            # Apply output projection and store on CPU
+            # Apply output projection and store on pinned CPU memory
             out = self.to_out(attn_out)
-            output_chunks.append(out.cpu())
+            out_pinned = torch.empty_like(out, device='cpu', pin_memory=True)
+            out_pinned.copy_(out)
+            output_chunks.append(out_pinned)
 
             del x_chunk, pe_chunk, q, attn_out, out
-            torch.cuda.empty_cache()
+            # Only clear cache every 10 chunks to reduce overhead
+            if i % 10 == 9:
+                torch.cuda.empty_cache()
 
         # Clean up K/V chunks
         del K_chunks, V_chunks
@@ -411,11 +421,11 @@ class Attention(torch.nn.Module):
             q = apply_rotary_emb(q, pe_gpu, self.rope_type)
         del x_gpu, pe_gpu
 
-        # Compute K/V from context in chunks, store on CPU
+        # Compute K/V from context in chunks, store on pinned CPU memory
         K_chunks = []
         V_chunks = []
 
-        for start in range(0, M, attention_chunk_size):
+        for i, start in enumerate(range(0, M, attention_chunk_size)):
             end = min(start + attention_chunk_size, M)
             ctx_chunk = context[:, start:end].to(device, non_blocking=True)
             k_pe_chunk = _pe_to_device(_pe_slice(k_pe, start, end), device)
@@ -426,11 +436,18 @@ class Attention(torch.nn.Module):
             if k_pe_chunk is not None:
                 k = apply_rotary_emb(k, k_pe_chunk, self.rope_type)
 
-            K_chunks.append(k.cpu())
-            V_chunks.append(v.cpu())
+            # Store on pinned CPU memory for faster transfers back to GPU
+            k_pinned = torch.empty_like(k, device='cpu', pin_memory=True)
+            v_pinned = torch.empty_like(v, device='cpu', pin_memory=True)
+            k_pinned.copy_(k)
+            v_pinned.copy_(v)
+            K_chunks.append(k_pinned)
+            V_chunks.append(v_pinned)
 
             del ctx_chunk, k, v, k_pe_chunk
-            torch.cuda.empty_cache()
+            # Only clear cache every 10 chunks to reduce overhead
+            if i % 10 == 9:
+                torch.cuda.empty_cache()
 
         # Use streaming attention (Q on GPU, stream K/V from CPU)
         attn_out = self._streamed_attention(q, K_chunks, V_chunks, device)
@@ -477,10 +494,10 @@ class Attention(torch.nn.Module):
         scale = dim_head ** -0.5
 
         for k_chunk, v_chunk in zip(K_chunks, V_chunks):
-            # Move this K/V chunk to GPU
+            # Move this K/V chunk to GPU (non_blocking - GPU waits when data is used)
             k = k_chunk.to(device, non_blocking=True)
             v = v_chunk.to(device, non_blocking=True)
-            torch.cuda.synchronize()
+            # Note: explicit sync removed - default stream waits for transfer on first use
 
             # Reshape for multi-head: [B, H, Nk, D]
             Nk = k.shape[1]

@@ -105,15 +105,15 @@ def enable_block_swap(
             # Wait for this block to be ready BEFORE using it
             offloader.wait_for_block(block_idx)
 
+            # Submit swap immediately after block is loaded - gives max overlap with compute
+            offloader.submit_move_blocks_forward(blocks, block_idx)
+
             # Process the block
             video, audio = block(
                 video=video,
                 audio=audio,
                 perturbations=perturbations,
             )
-
-            # Submit swap for next iteration AFTER using block
-            offloader.submit_move_blocks_forward(blocks, block_idx)
 
         return video, audio
 
@@ -201,31 +201,61 @@ def enable_block_swap_with_activation_offload(
 
     # Create replacement method with activation offloading
     def block_swap_process_transformer_blocks_with_activation_offload(self, video, audio, perturbations):
-        """Process transformer blocks with block AND activation offloading."""
+        """Process transformer blocks with block AND activation offloading.
+
+        Uses pinned CPU memory and async CUDA streams for faster transfers.
+        """
         offloader = self._block_swap_offloader
         blocks = self._blocks_ref
         verbose = getattr(self, '_activation_offload_verbose', False)
         temporal_chunk_size = getattr(self, '_temporal_chunk_size', 0)
         device = offloader.device
 
-        # Extract activations - start on CPU
-        vx = video.x.cpu() if video is not None and video.x is not None else None
-        ax = audio.x.cpu() if audio is not None and audio.x is not None else None
+        # Extract initial activations
+        vx_initial = video.x if video is not None and video.x is not None else None
+        ax_initial = audio.x if audio is not None and audio.x is not None else None
+
+        # Allocate pinned CPU buffers for faster DMA transfers
+        if vx_initial is not None:
+            vx_pinned = torch.empty_like(vx_initial, device='cpu', pin_memory=True)
+            vx_pinned.copy_(vx_initial.cpu() if vx_initial.is_cuda else vx_initial)
+        else:
+            vx_pinned = None
+
+        if ax_initial is not None:
+            ax_pinned = torch.empty_like(ax_initial, device='cpu', pin_memory=True)
+            ax_pinned.copy_(ax_initial.cpu() if ax_initial.is_cuda else ax_initial)
+        else:
+            ax_pinned = None
+
+        # Create dedicated stream for GPU→CPU transfers (overlaps with compute)
+        transfer_stream = torch.cuda.Stream(device=device)
 
         if verbose:
             log_memory("Before block loop")
 
-        use_temporal_chunking = temporal_chunk_size > 0 and vx is not None
+        use_temporal_chunking = temporal_chunk_size > 0 and vx_pinned is not None
+
+        # Track if we have a pending transfer
+        pending_transfer = False
 
         for block_idx, block in enumerate(self.transformer_blocks):
             # Wait for block weights to be ready
             offloader.wait_for_block(block_idx)
 
+            # Submit weight swap immediately after block is loaded (overlaps with compute)
+            # This gives maximum time for the swap to complete before we need the next block
+            offloader.submit_move_blocks_forward(blocks, block_idx)
+
             if use_temporal_chunking:
+                # Wait for any pending transfer from previous block
+                if pending_transfer:
+                    transfer_stream.synchronize()
+                    pending_transfer = False
+
                 # Use temporal chunking - keeps vx/ax on CPU, processes in chunks
-                # Create video/audio args with CPU activations
-                video_cpu = replace(video, x=vx) if video is not None else None
-                audio_cpu = replace(audio, x=ax) if audio is not None else None
+                video_cpu = replace(video, x=vx_pinned) if video is not None else None
+                audio_cpu = replace(audio, x=ax_pinned) if audio is not None else None
 
                 if verbose and block_idx % 10 == 0:
                     log_memory(f"Block {block_idx} (before, chunked)")
@@ -239,25 +269,29 @@ def enable_block_swap_with_activation_offload(
                     device=device,
                 )
 
-                # Results are already on CPU from forward_chunked
-                vx = video_out.x if video_out is not None else None
-                ax = audio_out.x if audio_out is not None else None
+                # Copy results to pinned buffers
+                if video_out is not None and video_out.x is not None:
+                    vx_pinned.copy_(video_out.x)
+                if audio_out is not None and audio_out.x is not None:
+                    ax_pinned.copy_(audio_out.x)
 
                 del video_cpu, audio_cpu, video_out, audio_out
             else:
-                # Original path - move full activations to GPU
-                if vx is not None:
-                    vx_gpu = vx.to(device, non_blocking=True)
+                # Wait for any pending GPU→CPU transfer from previous block
+                if pending_transfer:
+                    transfer_stream.synchronize()
+                    pending_transfer = False
+
+                # Move activations from pinned CPU to GPU (fast DMA)
+                if vx_pinned is not None:
+                    vx_gpu = vx_pinned.to(device, non_blocking=True)
                 else:
                     vx_gpu = None
 
-                if ax is not None:
-                    ax_gpu = ax.to(device, non_blocking=True)
+                if ax_pinned is not None:
+                    ax_gpu = ax_pinned.to(device, non_blocking=True)
                 else:
                     ax_gpu = None
-
-                # Sync to ensure activations are on GPU
-                torch.cuda.synchronize()
 
                 # Create video/audio args with GPU activations
                 video_gpu = replace(video, x=vx_gpu) if video is not None else None
@@ -266,7 +300,7 @@ def enable_block_swap_with_activation_offload(
                 if verbose and block_idx % 10 == 0:
                     log_memory(f"Block {block_idx} (before)")
 
-                # Process the block
+                # Process the block (default stream waits for non_blocking transfers)
                 video_out, audio_out = block(
                     video=video_gpu,
                     audio=audio_gpu,
@@ -277,38 +311,45 @@ def enable_block_swap_with_activation_offload(
                 vx_result = video_out.x if video_out is not None else None
                 ax_result = audio_out.x if audio_out is not None else None
 
-                # Move activations back to CPU immediately
-                if vx_result is not None:
-                    vx = vx_result.cpu()
-                    del vx_result
-                if ax_result is not None:
-                    ax = ax_result.cpu()
-                    del ax_result
+                # Start async GPU→CPU transfer on separate stream (overlaps with next block's weight load)
+                with torch.cuda.stream(transfer_stream):
+                    if vx_result is not None:
+                        vx_pinned.copy_(vx_result, non_blocking=True)
+                    if ax_result is not None:
+                        ax_pinned.copy_(ax_result, non_blocking=True)
+                pending_transfer = True
 
-                # Clean up GPU tensors
+                # Clean up GPU tensors (can happen while transfer runs)
                 del vx_gpu, ax_gpu, video_gpu, audio_gpu, video_out, audio_out
+                del vx_result, ax_result
 
-            # Submit swap for next block's weights
-            offloader.submit_move_blocks_forward(blocks, block_idx)
-
-            # Clear GPU cache to actually free memory
-            torch.cuda.empty_cache()
+            # Clear GPU cache periodically (every 10 blocks) to balance memory vs overhead
+            if block_idx % 10 == 9:
+                torch.cuda.empty_cache()
 
             if verbose and block_idx % 10 == 0:
                 log_memory(f"Block {block_idx} (after)")
 
+        # Wait for final transfer to complete
+        if pending_transfer:
+            transfer_stream.synchronize()
+
         # Final move back to GPU for output
-        if vx is not None:
-            vx = vx.to(device)
-        if ax is not None:
-            ax = ax.to(device)
+        if vx_pinned is not None:
+            vx_final = vx_pinned.to(device)
+        else:
+            vx_final = None
+        if ax_pinned is not None:
+            ax_final = ax_pinned.to(device)
+        else:
+            ax_final = None
 
         if verbose:
             log_memory("After block loop")
 
         # Return with final activations
-        video_final = replace(video, x=vx) if video is not None else None
-        audio_final = replace(audio, x=ax) if audio is not None else None
+        video_final = replace(video, x=vx_final) if video is not None else None
+        audio_final = replace(audio, x=ax_final) if audio is not None else None
 
         return video_final, audio_final
 

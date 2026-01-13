@@ -149,7 +149,7 @@ class Offloader:
         self.device = device
         self.debug = debug
 
-        self.thread_pool = ThreadPoolExecutor(max_workers=1)
+        self.thread_pool = ThreadPoolExecutor(max_workers=2)
         self.futures = {}
         self.cuda_available = device.type == "cuda"
 
