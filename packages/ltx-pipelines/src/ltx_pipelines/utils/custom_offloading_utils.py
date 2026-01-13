@@ -67,21 +67,29 @@ def swap_weight_devices_cuda(device: torch.device, layer_to_cpu: nn.Module, laye
 
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
-        # cuda to cpu - weights (with buffer reuse)
+        # cuda to cpu - weights (preserve pinned memory if present)
         for module_to_cpu, module_to_cuda, cuda_data_view, cpu_data_view in weight_swap_jobs:
             cuda_data_view.record_stream(stream)
-            module_to_cpu.weight.data = cuda_data_view.data.to("cpu", non_blocking=True)
+            # If CPU buffer is pinned, copy into it to preserve pinned status
+            if cpu_data_view.is_pinned():
+                cpu_data_view.copy_(cuda_data_view.data, non_blocking=True)
+            else:
+                module_to_cpu.weight.data = cuda_data_view.data.to("cpu", non_blocking=True)
 
-        # cuda to cpu - other params (simple transfer)
+        # cuda to cpu - other params (preserve pinned memory if present)
         for module_to_cpu, module_to_cuda, param_name, cpu_param_data, cuda_param_data in other_param_jobs:
             # If the GPU module's param is on GPU, move to CPU
             if cpu_param_data.device.type == device.type:
                 setattr(module_to_cpu, param_name + "_data_backup", cpu_param_data)  # temporary backup
-                getattr(module_to_cpu, param_name).data = cpu_param_data.to("cpu", non_blocking=True)
+                cpu_target = getattr(module_to_cpu, param_name).data
+                if cpu_target.is_pinned():
+                    cpu_target.copy_(cpu_param_data, non_blocking=True)
+                else:
+                    getattr(module_to_cpu, param_name).data = cpu_param_data.to("cpu", non_blocking=True)
 
         stream.synchronize()
 
-        # cpu to cuda - weights (reuse GPU buffer)
+        # cpu to cuda - weights (reuse GPU buffer, transfer from pinned is faster)
         for module_to_cpu, module_to_cuda, cuda_data_view, cpu_data_view in weight_swap_jobs:
             cuda_data_view.copy_(module_to_cuda.weight.data, non_blocking=True)
             module_to_cuda.weight.data = cuda_data_view
@@ -137,17 +145,33 @@ def weighs_to_device(layer: nn.Module, device: torch.device):
                 param.data = param.data.to(device, non_blocking=True)
 
 
+def weights_to_pinned_cpu(layer: nn.Module):
+    """Move all parameters to pinned CPU memory for faster GPU transfers.
+
+    Pinned (page-locked) memory enables DMA transfers which are 2-3x faster
+    than regular paged memory transfers.
+    """
+    for module in layer.modules():
+        for param_name, param in list(module.named_parameters(recurse=False)):
+            if param is not None and param.data.device.type != 'cuda':
+                # Allocate pinned memory and copy
+                pinned = torch.empty_like(param.data, device='cpu', pin_memory=True)
+                pinned.copy_(param.data)
+                param.data = pinned
+
+
 class Offloader:
     """
     common offloading class
     """
 
-    def __init__(self, block_type: str, num_blocks: int, blocks_to_swap: int, device: torch.device, debug: bool = False):
+    def __init__(self, block_type: str, num_blocks: int, blocks_to_swap: int, device: torch.device, debug: bool = False, use_pinned_weights: bool = True):
         self.block_type = block_type
         self.num_blocks = num_blocks
         self.blocks_to_swap = blocks_to_swap
         self.device = device
         self.debug = debug
+        self.use_pinned_weights = use_pinned_weights
 
         self.thread_pool = ThreadPoolExecutor(max_workers=2)
         self.futures = {}
@@ -217,8 +241,9 @@ class ModelOffloader(Offloader):
         supports_backward: bool,
         device: torch.device,
         debug: bool = False,
+        use_pinned_weights: bool = True,
     ):
-        super().__init__(block_type, num_blocks, blocks_to_swap, device, debug)
+        super().__init__(block_type, num_blocks, blocks_to_swap, device, debug, use_pinned_weights)
 
         self.supports_backward = supports_backward
         self.forward_only = not supports_backward  # forward only offloading: can be changed to True for inference
@@ -272,7 +297,7 @@ class ModelOffloader(Offloader):
 
         num_resident = self.num_blocks - self.blocks_to_swap
         if self.debug:
-            print(f"[{self.block_type}] Prepare block devices: {num_resident} blocks on GPU, {self.blocks_to_swap} blocks on CPU")
+            print(f"[{self.block_type}] Prepare block devices: {num_resident} blocks on GPU, {self.blocks_to_swap} blocks on CPU (pinned={self.use_pinned_weights})")
 
         # Move only the first (num_blocks - blocks_to_swap) blocks to GPU
         # These are the blocks that will be on GPU initially
@@ -283,10 +308,13 @@ class ModelOffloader(Offloader):
                 print(f"  Block {i} moved to GPU. GPU memory: {torch.cuda.memory_allocated(self.device) / 1e9:.2f} GB")
 
         # Keep the remaining blocks on CPU - they will be swapped in during forward pass
-        # The swap mechanism will reuse GPU buffers from blocks moving to CPU
+        # Use pinned memory for faster transfers if enabled
         for i, b in enumerate(blocks[num_resident:]):
-            # Ensure all parameters are on CPU (they should already be from model loading)
+            # Ensure all parameters are on CPU first
             weighs_to_device(b, "cpu")
+            # Then convert to pinned memory if enabled
+            if self.use_pinned_weights:
+                weights_to_pinned_cpu(b)
 
         synchronize_device(self.device)
         clean_memory_on_device(self.device)

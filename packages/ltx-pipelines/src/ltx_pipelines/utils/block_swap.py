@@ -30,6 +30,7 @@ def enable_block_swap(
     model: X0Model | LTXModel,
     blocks_in_memory: int = 6,
     device: torch.device | str = "cuda",
+    use_pinned_weights: bool = True,
 ) -> ModelOffloader:
     """
     Enable block swapping on an existing X0Model or LTXModel using ModelOffloader.
@@ -43,6 +44,8 @@ def enable_block_swap(
         model: X0Model (wraps LTXModel) or LTXModel directly.
         blocks_in_memory: Number of transformer blocks to keep in GPU (default: 6).
         device: Target GPU device.
+        use_pinned_weights: If True, use pinned (page-locked) CPU memory for weights.
+            This uses more RAM but enables 2-3x faster CPU<->GPU transfers.
 
     Returns:
         ModelOffloader instance for controlling the swapping behavior.
@@ -78,6 +81,7 @@ def enable_block_swap(
         blocks_to_swap=blocks_to_swap,
         supports_backward=False,
         device=device,
+        use_pinned_weights=use_pinned_weights,
     )
 
     # Store on model for access in forward pass
@@ -121,7 +125,8 @@ def enable_block_swap(
     # Monkey-patch the method
     ltx_model._process_transformer_blocks = types.MethodType(block_swap_process_transformer_blocks, ltx_model)
 
-    print(f"[BlockSwap] Enabled: {blocks_in_memory}/{num_blocks} blocks in GPU, {blocks_to_swap} swapping")
+    pinned_str = ", pinned weights" if use_pinned_weights else ""
+    print(f"[BlockSwap] Enabled: {blocks_in_memory}/{num_blocks} blocks in GPU, {blocks_to_swap} swapping{pinned_str}")
     return offloader
 
 
@@ -131,6 +136,7 @@ def enable_block_swap_with_activation_offload(
     device: torch.device | str = "cuda",
     verbose: bool = False,
     temporal_chunk_size: int = 0,
+    use_pinned_weights: bool = True,
 ) -> ModelOffloader:
     """
     Enable block swapping WITH activation offloading for extreme memory savings.
@@ -149,6 +155,8 @@ def enable_block_swap_with_activation_offload(
         verbose: If True, log memory at each block.
         temporal_chunk_size: If > 0, process video in chunks of this many tokens.
             This allows processing very long videos by streaming K/V from CPU.
+        use_pinned_weights: If True, use pinned (page-locked) CPU memory for weights.
+            This uses more RAM but enables 2-3x faster CPU<->GPU transfers.
 
     Returns:
         ModelOffloader instance for controlling the swapping behavior.
@@ -180,6 +188,7 @@ def enable_block_swap_with_activation_offload(
         blocks_to_swap=blocks_to_swap,
         supports_backward=False,
         device=device,
+        use_pinned_weights=use_pinned_weights,
     )
 
     # Store on model for access in forward pass
@@ -359,7 +368,8 @@ def enable_block_swap_with_activation_offload(
         block_swap_process_transformer_blocks_with_activation_offload, ltx_model
     )
 
-    print(f"[BlockSwap+ActOffload] Enabled: {blocks_in_memory}/{num_blocks} blocks in GPU, {blocks_to_swap} swapping, activations offloaded")
+    pinned_str = ", pinned weights" if use_pinned_weights else ""
+    print(f"[BlockSwap+ActOffload] Enabled: {blocks_in_memory}/{num_blocks} blocks in GPU, {blocks_to_swap} swapping, activations offloaded{pinned_str}")
     return offloader
 
 
