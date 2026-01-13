@@ -41,11 +41,17 @@ def get_block_param_shapes(block: nn.Module) -> list[tuple[str, str, torch.Size,
 
 
 def create_pinned_buffer_for_block(shapes: list[tuple[str, str, torch.Size, torch.dtype]]) -> dict[tuple[str, str], torch.Tensor]:
-    """Pre-allocate pinned CPU buffers matching a block's parameter structure."""
+    """Pre-allocate pinned CPU buffers matching a block's parameter structure.
+
+    IMPORTANT: Must create buffers outside inference mode to allow inplace operations.
+    """
     buffers = {}
-    for module_name, param_name, shape, dtype in shapes:
-        key = (module_name, param_name)
-        buffers[key] = torch.empty(shape, dtype=dtype, device='cpu', pin_memory=True)
+    # Exit inference mode to create mutable (non-inference) tensors
+    # Inference tensors cannot have inplace operations performed on them
+    with torch.inference_mode(False):
+        for module_name, param_name, shape, dtype in shapes:
+            key = (module_name, param_name)
+            buffers[key] = torch.empty(shape, dtype=dtype, device='cpu', pin_memory=True)
     return buffers
 
 
@@ -94,7 +100,9 @@ def swap_weight_devices_cuda_fast(
             spare_buf = spare_buffer.get(key)
             if spare_buf is None or spare_buf.shape != param_on_cpu.shape:
                 # Fallback: allocate if shape mismatch (shouldn't happen)
-                spare_buf = torch.empty_like(param_on_cpu, device='cpu', pin_memory=True)
+                # Must create outside inference mode to allow inplace ops
+                with torch.inference_mode(False):
+                    spare_buf = torch.empty_like(param_on_cpu, device='cpu', pin_memory=True)
                 spare_buffer[key] = spare_buf
 
             swap_jobs.append((
