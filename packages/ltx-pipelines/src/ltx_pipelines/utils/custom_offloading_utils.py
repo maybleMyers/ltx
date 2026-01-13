@@ -67,25 +67,24 @@ def swap_weight_devices_cuda(device: torch.device, layer_to_cpu: nn.Module, laye
 
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
-        # cuda to cpu - weights (preserve pinned memory if present)
+        # cuda to cpu - weights (allocate new pinned buffer to preserve fast transfer capability)
         for module_to_cpu, module_to_cuda, cuda_data_view, cpu_data_view in weight_swap_jobs:
             cuda_data_view.record_stream(stream)
-            # If CPU buffer is pinned, copy into it to preserve pinned status
+            # Allocate a new pinned buffer for the outgoing weights (don't overwrite cpu_data_view
+            # which contains the weights we need to load to GPU next)
             if cpu_data_view.is_pinned():
-                cpu_data_view.copy_(cuda_data_view.data, non_blocking=True)
+                pinned_buf = torch.empty_like(cuda_data_view, device='cpu', pin_memory=True)
+                pinned_buf.copy_(cuda_data_view, non_blocking=True)
+                module_to_cpu.weight.data = pinned_buf
             else:
                 module_to_cpu.weight.data = cuda_data_view.data.to("cpu", non_blocking=True)
 
-        # cuda to cpu - other params (preserve pinned memory if present)
+        # cuda to cpu - other params (biases etc. are small, simple transfer is fine)
         for module_to_cpu, module_to_cuda, param_name, cpu_param_data, cuda_param_data in other_param_jobs:
             # If the GPU module's param is on GPU, move to CPU
             if cpu_param_data.device.type == device.type:
                 setattr(module_to_cpu, param_name + "_data_backup", cpu_param_data)  # temporary backup
-                cpu_target = getattr(module_to_cpu, param_name).data
-                if cpu_target.is_pinned():
-                    cpu_target.copy_(cpu_param_data, non_blocking=True)
-                else:
-                    getattr(module_to_cpu, param_name).data = cpu_param_data.to("cpu", non_blocking=True)
+                getattr(module_to_cpu, param_name).data = cpu_param_data.to("cpu", non_blocking=True)
 
         stream.synchronize()
 
