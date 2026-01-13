@@ -548,15 +548,15 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 vx_scaled_full = torch.cat(V_kv_chunks, dim=1)
                 del V_kv_chunks
 
-                # Use chunked cross-attention with video as context
-                v2a_out = self.video_to_audio_attn.forward_chunked_cross(
-                    x=ax_scaled_v2a.cpu(),
-                    context=vx_scaled_full,
-                    pe=_pe_to_cpu(audio.cross_positional_embeddings),
-                    k_pe=_pe_to_cpu(video.cross_positional_embeddings),
-                    chunk_size=chunk_size,
+                # Use streaming cross-attention for large video context
+                # Audio (Q) is small, video (K/V) is huge - stream K/V from CPU
+                v2a_out = self.video_to_audio_attn.forward_cross_large_context(
+                    x=ax_scaled_v2a,  # Audio queries (small, on GPU)
+                    context=vx_scaled_full,  # Video context (large, on CPU)
+                    pe=audio.cross_positional_embeddings,  # Audio PE
+                    k_pe=video.cross_positional_embeddings,  # Video PE
                     device=device,
-                ).to(device)
+                )
 
                 v2a_mask = perturbations.mask_like(PerturbationType.SKIP_V2A_CROSS_ATTN, self.idx, ax)
                 ax = ax + v2a_out * gate_out_v2a * v2a_mask

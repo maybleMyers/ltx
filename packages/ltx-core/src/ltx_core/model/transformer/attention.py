@@ -373,6 +373,73 @@ class Attention(torch.nn.Module):
 
         return torch.cat(output_chunks, dim=1)
 
+    def forward_cross_large_context(
+        self,
+        x: torch.Tensor,
+        context: torch.Tensor,
+        pe: PETuple,
+        k_pe: PETuple,
+        device: torch.device | str,
+        attention_chunk_size: int = 4096,
+    ) -> torch.Tensor:
+        """
+        Cross-attention where context (K/V source) is too large to fit in memory.
+
+        Streams K/V from context in chunks, uses online softmax to accumulate.
+        Used for video-to-audio cross-attention where video is huge.
+
+        Args:
+            x: [B, N, D] query input (small, e.g., audio tokens) - can be on CPU or GPU
+            context: [B, M, D] context for K/V (large, e.g., video tokens) - on CPU
+            pe: positional embeddings for Q
+            k_pe: positional embeddings for K
+            device: GPU device
+            attention_chunk_size: chunk size for K/V streaming (default 4096)
+
+        Returns:
+            [B, N, D] attention output on GPU
+        """
+        B, N, D = x.shape
+        M = context.shape[1]
+        device = torch.device(device) if isinstance(device, str) else device
+
+        # Move Q to GPU and compute Q projections (Q is small - audio tokens)
+        x_gpu = x.to(device, non_blocking=True)
+        q = self.q_norm(self.to_q(x_gpu))
+        pe_gpu = _pe_to_device(pe, device)
+        if pe_gpu is not None:
+            q = apply_rotary_emb(q, pe_gpu, self.rope_type)
+        del x_gpu, pe_gpu
+
+        # Compute K/V from context in chunks, store on CPU
+        K_chunks = []
+        V_chunks = []
+
+        for start in range(0, M, attention_chunk_size):
+            end = min(start + attention_chunk_size, M)
+            ctx_chunk = context[:, start:end].to(device, non_blocking=True)
+            k_pe_chunk = _pe_to_device(_pe_slice(k_pe, start, end), device)
+
+            k = self.k_norm(self.to_k(ctx_chunk))
+            v = self.to_v(ctx_chunk)
+
+            if k_pe_chunk is not None:
+                k = apply_rotary_emb(k, k_pe_chunk, self.rope_type)
+
+            K_chunks.append(k.cpu())
+            V_chunks.append(v.cpu())
+
+            del ctx_chunk, k, v, k_pe_chunk
+            torch.cuda.empty_cache()
+
+        # Use streaming attention (Q on GPU, stream K/V from CPU)
+        attn_out = self._streamed_attention(q, K_chunks, V_chunks, device)
+
+        del q, K_chunks, V_chunks
+        torch.cuda.empty_cache()
+
+        return self.to_out(attn_out)
+
     def _streamed_attention(
         self,
         q: torch.Tensor,
