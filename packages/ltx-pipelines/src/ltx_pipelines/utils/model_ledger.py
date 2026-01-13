@@ -2,8 +2,10 @@ from dataclasses import replace
 
 import torch
 
+import gc
+
 from ltx_core.loader.primitives import LoraPathStrengthAndSDOps
-from ltx_core.loader.registry import DummyRegistry, Registry
+from ltx_core.loader.registry import DummyRegistry, Registry, StateDictRegistry
 from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder as Builder
 from ltx_core.model.audio_vae import (
     AUDIO_VAE_DECODER_COMFY_KEYS_FILTER,
@@ -260,3 +262,15 @@ class ModelLedger:
             raise ValueError("Upsampler not initialized. Please provide upsampler path to the ModelLedger constructor.")
 
         return self.upsampler_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device).eval()
+
+    def clear_state_dict_cache(self) -> None:
+        """
+        Clear the state dict cache to free memory.
+
+        Call this after all models have been built and you no longer need to
+        load additional models from this ledger. This releases cached state
+        dictionaries that were kept to speed up repeated model loading.
+        """
+        if hasattr(self.registry, "clear"):
+            self.registry.clear()
+        gc.collect()

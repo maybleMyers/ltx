@@ -19,6 +19,33 @@ except ImportError:
     flash_attn_interface = None
 
 
+# Type alias for positional embeddings (tuple of cos, sin tensors)
+PETuple = tuple[torch.Tensor, torch.Tensor] | None
+
+
+def _pe_to_device(pe: PETuple, device: torch.device | str) -> PETuple:
+    """Move positional embedding tuple to device."""
+    if pe is None:
+        return None
+    return (pe[0].to(device, non_blocking=True), pe[1].to(device, non_blocking=True))
+
+
+def _pe_slice(pe: PETuple, start: int, end: int) -> PETuple:
+    """Slice positional embedding tuple along token dimension.
+
+    For interleaved rope (3D tensors: B, T, D), slices dim 1.
+    For split rope (4D tensors: B, H, T, D), slices dim 2.
+    """
+    if pe is None:
+        return None
+    if pe[0].ndim == 3:
+        return (pe[0][:, start:end], pe[1][:, start:end])
+    elif pe[0].ndim == 4:
+        return (pe[0][:, :, start:end], pe[1][:, :, start:end])
+    else:
+        raise ValueError(f"Unsupported positional embedding shape: {pe[0].shape}")
+
+
 class AttentionCallable(Protocol):
     def __call__(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int, mask: torch.Tensor | None = None
@@ -193,3 +220,299 @@ class Attention(torch.nn.Module):
         # attention_function can be an enum *or* a custom callable
         out = self.attention_function(q, k, v, self.heads, mask)
         return self.to_out(out)
+
+    def forward_chunked(
+        self,
+        x: torch.Tensor,
+        pe: torch.Tensor | None,
+        chunk_size: int,
+        device: torch.device | str,
+        attention_chunk_size: int = 4096,
+    ) -> torch.Tensor:
+        """
+        Chunked self-attention that maintains full global context.
+
+        Computes K/V for all tokens (stored on CPU), then processes Q in chunks,
+        streaming K/V from CPU for each Q chunk. Uses online softmax for numerical
+        stability without materializing full attention matrix.
+
+        Args:
+            x: [B, N, D] input tensor (can be on CPU)
+            pe: positional embeddings tuple (cos, sin) (can be on CPU)
+            chunk_size: number of tokens per chunk for outer operations
+            device: GPU device to use for computation
+            attention_chunk_size: smaller chunk size for attention computation (default 4096)
+
+        Returns:
+            [B, N, D] attention output (on CPU)
+        """
+        B, N, D = x.shape
+        device = torch.device(device) if isinstance(device, str) else device
+
+        # Use smaller chunks for attention to avoid huge score matrices
+        # With 4096 Q and 4096 K: scores = [B, H, 4096, 4096] ≈ 2GB at fp32
+        attn_chunk = min(attention_chunk_size, chunk_size)
+
+        # Phase 1: Compute K, V for all tokens in small chunks, store on CPU
+        K_chunks = []
+        V_chunks = []
+
+        for start in range(0, N, attn_chunk):
+            end = min(start + attn_chunk, N)
+            x_chunk = x[:, start:end].to(device, non_blocking=True)
+            pe_chunk = _pe_to_device(_pe_slice(pe, start, end), device)
+
+            # Compute K, V for this chunk
+            k = self.k_norm(self.to_k(x_chunk))
+            v = self.to_v(x_chunk)
+
+            if pe_chunk is not None:
+                k = apply_rotary_emb(k, pe_chunk, self.rope_type)
+
+            # Store on CPU
+            K_chunks.append(k.cpu())
+            V_chunks.append(v.cpu())
+
+            del x_chunk, k, v, pe_chunk
+            torch.cuda.empty_cache()
+
+        # Phase 2: For each Q chunk, attend to ALL K/V via streaming
+        output_chunks = []
+
+        for q_start in range(0, N, attn_chunk):
+            q_end = min(q_start + attn_chunk, N)
+            x_chunk = x[:, q_start:q_end].to(device, non_blocking=True)
+            pe_chunk = _pe_to_device(_pe_slice(pe, q_start, q_end), device)
+
+            # Compute Q for this chunk
+            q = self.q_norm(self.to_q(x_chunk))
+            if pe_chunk is not None:
+                q = apply_rotary_emb(q, pe_chunk, self.rope_type)
+
+            # Attend to ALL K/V by streaming from CPU
+            attn_out = self._streamed_attention(q, K_chunks, V_chunks, device)
+
+            # Apply output projection and store on CPU
+            out = self.to_out(attn_out)
+            output_chunks.append(out.cpu())
+
+            del x_chunk, pe_chunk, q, attn_out, out
+            torch.cuda.empty_cache()
+
+        # Clean up K/V chunks
+        del K_chunks, V_chunks
+
+        return torch.cat(output_chunks, dim=1)
+
+    def forward_chunked_cross(
+        self,
+        x: torch.Tensor,
+        context: torch.Tensor,
+        pe: torch.Tensor | None,
+        k_pe: torch.Tensor | None,
+        chunk_size: int,
+        device: torch.device | str,
+        mask: torch.Tensor | None = None,
+        attention_chunk_size: int = 4096,
+    ) -> torch.Tensor:
+        """
+        Chunked cross-attention where context (K/V source) fits in memory.
+
+        For cross-attention to text embeddings, the context is small enough to
+        keep on GPU. We just chunk the queries.
+
+        Args:
+            x: [B, N, D] query input (can be on CPU)
+            context: [B, M, D] context for K/V (should fit on GPU)
+            pe: positional embeddings for Q
+            k_pe: positional embeddings for K
+            chunk_size: number of query tokens per chunk (outer operations)
+            device: GPU device
+            mask: optional attention mask
+            attention_chunk_size: smaller chunk size for attention computation (default 4096)
+
+        Returns:
+            [B, N, D] attention output (on CPU)
+        """
+        B, N, D = x.shape
+        device = torch.device(device) if isinstance(device, str) else device
+
+        # Use smaller chunks for attention to avoid huge score matrices
+        attn_chunk = min(attention_chunk_size, chunk_size)
+
+        # Move context to GPU and compute K, V once
+        context_gpu = context.to(device, non_blocking=True)
+        k = self.k_norm(self.to_k(context_gpu))
+        v = self.to_v(context_gpu)
+
+        k_pe_gpu = _pe_to_device(k_pe, device)
+        if k_pe_gpu is not None:
+            k = apply_rotary_emb(k, k_pe_gpu, self.rope_type)
+
+        # Process Q in small chunks for memory efficiency
+        output_chunks = []
+
+        for q_start in range(0, N, attn_chunk):
+            q_end = min(q_start + attn_chunk, N)
+            x_chunk = x[:, q_start:q_end].to(device, non_blocking=True)
+            pe_chunk = _pe_to_device(_pe_slice(pe, q_start, q_end), device)
+
+            q = self.q_norm(self.to_q(x_chunk))
+            if pe_chunk is not None:
+                q = apply_rotary_emb(q, pe_chunk, self.rope_type)
+
+            # Full attention with all K/V
+            out = self.attention_function(q, k, v, self.heads, mask)
+            out = self.to_out(out)
+            output_chunks.append(out.cpu())
+
+            del x_chunk, pe_chunk, q, out
+
+        del context_gpu, k, v
+        torch.cuda.empty_cache()
+
+        return torch.cat(output_chunks, dim=1)
+
+    def forward_cross_large_context(
+        self,
+        x: torch.Tensor,
+        context: torch.Tensor,
+        pe: PETuple,
+        k_pe: PETuple,
+        device: torch.device | str,
+        attention_chunk_size: int = 4096,
+    ) -> torch.Tensor:
+        """
+        Cross-attention where context (K/V source) is too large to fit in memory.
+
+        Streams K/V from context in chunks, uses online softmax to accumulate.
+        Used for video-to-audio cross-attention where video is huge.
+
+        Args:
+            x: [B, N, D] query input (small, e.g., audio tokens) - can be on CPU or GPU
+            context: [B, M, D] context for K/V (large, e.g., video tokens) - on CPU
+            pe: positional embeddings for Q
+            k_pe: positional embeddings for K
+            device: GPU device
+            attention_chunk_size: chunk size for K/V streaming (default 4096)
+
+        Returns:
+            [B, N, D] attention output on GPU
+        """
+        B, N, D = x.shape
+        M = context.shape[1]
+        device = torch.device(device) if isinstance(device, str) else device
+
+        # Move Q to GPU and compute Q projections (Q is small - audio tokens)
+        x_gpu = x.to(device, non_blocking=True)
+        q = self.q_norm(self.to_q(x_gpu))
+        pe_gpu = _pe_to_device(pe, device)
+        if pe_gpu is not None:
+            q = apply_rotary_emb(q, pe_gpu, self.rope_type)
+        del x_gpu, pe_gpu
+
+        # Compute K/V from context in chunks, store on CPU
+        K_chunks = []
+        V_chunks = []
+
+        for start in range(0, M, attention_chunk_size):
+            end = min(start + attention_chunk_size, M)
+            ctx_chunk = context[:, start:end].to(device, non_blocking=True)
+            k_pe_chunk = _pe_to_device(_pe_slice(k_pe, start, end), device)
+
+            k = self.k_norm(self.to_k(ctx_chunk))
+            v = self.to_v(ctx_chunk)
+
+            if k_pe_chunk is not None:
+                k = apply_rotary_emb(k, k_pe_chunk, self.rope_type)
+
+            K_chunks.append(k.cpu())
+            V_chunks.append(v.cpu())
+
+            del ctx_chunk, k, v, k_pe_chunk
+            torch.cuda.empty_cache()
+
+        # Use streaming attention (Q on GPU, stream K/V from CPU)
+        attn_out = self._streamed_attention(q, K_chunks, V_chunks, device)
+
+        del q, K_chunks, V_chunks
+        torch.cuda.empty_cache()
+
+        return self.to_out(attn_out)
+
+    def _streamed_attention(
+        self,
+        q: torch.Tensor,
+        K_chunks: list[torch.Tensor],
+        V_chunks: list[torch.Tensor],
+        device: torch.device,
+    ) -> torch.Tensor:
+        """
+        Compute attention with Q on GPU, streaming K/V chunks from CPU.
+
+        Uses online softmax (numerically stable incremental computation) to
+        avoid materializing the full attention matrix.
+
+        Args:
+            q: [B, Nq, D] query tensor on GPU
+            K_chunks: list of [B, Nk_i, D] key chunks on CPU
+            V_chunks: list of [B, Nk_i, D] value chunks on CPU
+            device: GPU device
+
+        Returns:
+            [B, Nq, D] attention output on GPU
+        """
+        B, Nq, _ = q.shape
+        heads = self.heads
+        dim_head = self.dim_head
+
+        # Reshape Q for multi-head attention: [B, H, Nq, D]
+        q = q.view(B, Nq, heads, dim_head).transpose(1, 2)
+
+        # Initialize online softmax accumulators
+        max_scores = torch.full((B, heads, Nq, 1), float('-inf'), device=device, dtype=q.dtype)
+        sum_exp = torch.zeros((B, heads, Nq, 1), device=device, dtype=q.dtype)
+        output = torch.zeros((B, heads, Nq, dim_head), device=device, dtype=q.dtype)
+
+        scale = dim_head ** -0.5
+
+        for k_chunk, v_chunk in zip(K_chunks, V_chunks):
+            # Move this K/V chunk to GPU
+            k = k_chunk.to(device, non_blocking=True)
+            v = v_chunk.to(device, non_blocking=True)
+            torch.cuda.synchronize()
+
+            # Reshape for multi-head: [B, H, Nk, D]
+            Nk = k.shape[1]
+            k = k.view(B, Nk, heads, dim_head).transpose(1, 2)
+            v = v.view(B, Nk, heads, dim_head).transpose(1, 2)
+
+            # Compute attention scores for this K chunk: [B, H, Nq, Nk]
+            scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+
+            # Online softmax update (numerically stable)
+            chunk_max = scores.max(dim=-1, keepdim=True).values
+            new_max = torch.maximum(max_scores, chunk_max)
+
+            # Rescale factors
+            exp_diff_old = torch.exp(max_scores - new_max)
+            exp_diff_new = torch.exp(chunk_max - new_max)
+
+            # Compute exp(scores - chunk_max) for this chunk
+            chunk_exp = torch.exp(scores - chunk_max)
+            chunk_sum = chunk_exp.sum(dim=-1, keepdim=True)
+
+            # Update accumulators
+            output = output * exp_diff_old + torch.matmul(chunk_exp, v) * exp_diff_new
+            sum_exp = sum_exp * exp_diff_old + chunk_sum * exp_diff_new
+            max_scores = new_max
+
+            del k, v, scores, chunk_exp, chunk_max, exp_diff_old, exp_diff_new
+
+        # Final normalization
+        output = output / (sum_exp + 1e-8)  # Small epsilon for stability
+
+        # Reshape back: [B, Nq, H*D]
+        output = output.transpose(1, 2).reshape(B, Nq, heads * dim_head)
+
+        return output
