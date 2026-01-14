@@ -35,99 +35,22 @@ def enable_block_swap(
     """
     Enable block swapping on an existing X0Model or LTXModel using ModelOffloader.
 
-    This function:
-    1. Creates a ModelOffloader for async block transfers
-    2. Prepares initial block positions (first N on GPU, rest on CPU)
-    3. Monkey-patches _process_transformer_blocks to use wait/submit pattern
+    Uses the simple (main branch) implementation for plain block swapping,
+    which is more stable than the fast-swap version. For activation offloading,
+    use enable_block_swap_with_activation_offload() instead.
 
     Args:
         model: X0Model (wraps LTXModel) or LTXModel directly.
         blocks_in_memory: Number of transformer blocks to keep in GPU (default: 6).
         device: Target GPU device.
-        use_pinned_weights: If True, use pinned (page-locked) CPU memory for weights.
-            This uses more RAM but enables 2-3x faster CPU<->GPU transfers.
+        use_pinned_weights: Ignored for simple block swap (kept for API compatibility).
 
     Returns:
         ModelOffloader instance for controlling the swapping behavior.
-
-    Example:
-        transformer = model_ledger.transformer()
-        offloader = enable_block_swap(transformer, blocks_in_memory=6)
-        # ... run inference ...
-        # Cleanup handled automatically
     """
-    # Get the underlying LTXModel
-    if isinstance(model, X0Model):
-        ltx_model = model.velocity_model
-    else:
-        ltx_model = model
-
-    device = torch.device(device) if isinstance(device, str) else device
-    num_blocks = len(ltx_model.transformer_blocks)
-    blocks_to_swap = num_blocks - blocks_in_memory
-
-    if blocks_to_swap <= 0:
-        print(f"[BlockSwap] blocks_in_memory ({blocks_in_memory}) >= num_blocks ({num_blocks}), no swapping needed")
-        return None
-
-    # Get reference to the actual blocks (not a copy!)
-    blocks = ltx_model.transformer_blocks
-
-    # Create offloader with ThreadPoolExecutor for async transfers
-    offloader = ModelOffloader(
-        block_type="ltx_transformer_block",
-        blocks=blocks,
-        num_blocks=num_blocks,
-        blocks_to_swap=blocks_to_swap,
-        supports_backward=False,
-        device=device,
-        use_pinned_weights=use_pinned_weights,
-    )
-
-    # Store on model for access in forward pass
-    ltx_model._block_swap_offloader = offloader
-    ltx_model._blocks_to_swap = blocks_to_swap
-    ltx_model._blocks_ref = blocks  # Store reference for forward pass
-    if isinstance(model, X0Model):
-        model._block_swap_offloader = offloader
-        model._blocks_to_swap = blocks_to_swap
-        model._blocks_ref = blocks
-
-    # Prepare block positions: first (num_blocks - blocks_to_swap) on GPU, rest on CPU
-    offloader.prepare_block_devices_before_forward(blocks)
-
-    # Store original method for potential restoration
-    ltx_model._original_process_transformer_blocks = ltx_model._process_transformer_blocks
-
-    # Create replacement method using wait/submit pattern
-    def block_swap_process_transformer_blocks(self, video, audio, perturbations):
-        """Process transformer blocks with block swapping using wait/submit pattern."""
-        offloader = self._block_swap_offloader
-        blocks = self._blocks_ref  # Use stored reference, not a copy
-
-        for block_idx, block in enumerate(self.transformer_blocks):
-            # Wait for this block to be ready BEFORE using it
-            offloader.wait_for_block(block_idx)
-
-            # Process the block
-            video, audio = block(
-                video=video,
-                audio=audio,
-                perturbations=perturbations,
-            )
-
-            # Submit swap for next iteration AFTER using block
-            # (moves current block to CPU, loads next needed block to GPU)
-            offloader.submit_move_blocks_forward(blocks, block_idx)
-
-        return video, audio
-
-    # Monkey-patch the method
-    ltx_model._process_transformer_blocks = types.MethodType(block_swap_process_transformer_blocks, ltx_model)
-
-    pinned_str = ", pinned weights" if use_pinned_weights else ""
-    print(f"[BlockSwap] Enabled: {blocks_in_memory}/{num_blocks} blocks in GPU, {blocks_to_swap} swapping{pinned_str}")
-    return offloader
+    # Use the simple (main branch) implementation for plain block swapping
+    from .block_swap_simple import enable_block_swap as enable_block_swap_simple
+    return enable_block_swap_simple(model, blocks_in_memory, device)
 
 
 def enable_block_swap_with_activation_offload(

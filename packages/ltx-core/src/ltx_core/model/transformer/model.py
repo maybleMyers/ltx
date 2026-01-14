@@ -365,12 +365,11 @@ class LTXModel(torch.nn.Module):
 
         x = norm_out(x)
         # Plain block swap (without activation offload) needs non-in-place ops
-        # Activation offload creates fresh tensors per block, so in-place is safe there
-        # Check: offloader exists AND no activation offload attributes
-        plain_block_swap = (
-            getattr(self, '_block_swap_offloader', None) is not None and
-            not hasattr(self, '_activation_offload_verbose')
-        )
+        # because tensors are reused across blocks. Activation offload creates
+        # fresh tensors per block, so in-place is safe there.
+        has_offloader = getattr(self, '_block_swap_offloader', None) is not None
+        has_activation_offload = hasattr(self, '_activation_offload_verbose')
+        plain_block_swap = has_offloader and not has_activation_offload
         if plain_block_swap:
             x = x * (1 + scale) + shift
         else:
