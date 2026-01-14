@@ -636,18 +636,91 @@ def _extract_video_frames(video_path: str, output_dir: str) -> Tuple[List[str], 
     return [str(p) for p in frame_paths], fps
 
 
-def _frames_to_video(frame_dir: str, output_path: str, fps: float):
-    """Reassemble frames into video using ffmpeg."""
-    cmd = [
-        "ffmpeg", "-y",
-        "-framerate", str(fps),
-        "-i", os.path.join(frame_dir, "%05d.png"),
-        "-c:v", "libx264",
-        "-pix_fmt", "yuv420p",
-        "-crf", "18",
-        output_path
-    ]
-    subprocess.run(cmd, capture_output=True)
+def _frames_to_video(frame_dir: str, output_path: str, fps: float, audio_source: str = None):
+    """Reassemble frames into video using ffmpeg, optionally adding audio."""
+    if audio_source:
+        # Create video without audio first
+        temp_video = output_path + ".temp.mp4"
+        cmd = [
+            "ffmpeg", "-y",
+            "-framerate", str(fps),
+            "-i", os.path.join(frame_dir, "%05d.png"),
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-crf", "18",
+            temp_video
+        ]
+        subprocess.run(cmd, capture_output=True)
+
+        # Mux audio from source (stretch/compress to match new duration)
+        # Get durations
+        probe_cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1", temp_video]
+        result = subprocess.run(probe_cmd, capture_output=True, text=True)
+        new_duration = float(result.stdout.strip()) if result.stdout.strip() else 0
+
+        probe_cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1", audio_source]
+        result = subprocess.run(probe_cmd, capture_output=True, text=True)
+        orig_duration = float(result.stdout.strip()) if result.stdout.strip() else 0
+
+        if orig_duration > 0 and new_duration > 0:
+            # Calculate tempo adjustment for audio to match video duration
+            tempo = orig_duration / new_duration
+            # atempo filter only accepts 0.5 to 2.0, chain multiple if needed
+            atempo_filters = []
+            t = tempo
+            while t > 2.0:
+                atempo_filters.append("atempo=2.0")
+                t /= 2.0
+            while t < 0.5:
+                atempo_filters.append("atempo=0.5")
+                t *= 2.0
+            atempo_filters.append(f"atempo={t}")
+            atempo_chain = ",".join(atempo_filters)
+
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", temp_video,
+                "-i", audio_source,
+                "-c:v", "copy",
+                "-af", atempo_chain,
+                "-map", "0:v:0",
+                "-map", "1:a:0?",
+                "-shortest",
+                output_path
+            ]
+        else:
+            # Just copy audio without tempo adjustment
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", temp_video,
+                "-i", audio_source,
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-map", "0:v:0",
+                "-map", "1:a:0?",
+                "-shortest",
+                output_path
+            ]
+
+        subprocess.run(cmd, capture_output=True)
+        # Clean up temp file
+        try:
+            os.remove(temp_video)
+        except:
+            pass
+    else:
+        cmd = [
+            "ffmpeg", "-y",
+            "-framerate", str(fps),
+            "-i", os.path.join(frame_dir, "%05d.png"),
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-crf", "18",
+            output_path
+        ]
+        subprocess.run(cmd, capture_output=True)
 
 
 def interpolate_video_gimm(
@@ -790,7 +863,7 @@ def interpolate_video_gimm(
         output_filename = f"interpolated_{int(time.time())}.mp4"
         output_path = os.path.join(output_dir, output_filename)
 
-        _frames_to_video(output_frames_dir, output_path, output_fps)
+        _frames_to_video(output_frames_dir, output_path, output_fps, audio_source=input_video)
 
         yield output_path, f"Done! Output: {output_fps:.1f} FPS ({output_frame_idx} frames)", 1.0
 
@@ -807,11 +880,16 @@ def interpolate_video_gimm(
         # Unload GIMM-VFI model to free VRAM
         try:
             import torch
+            import gc
             if _gimm_model_cache["model"] is not None:
+                # Move to CPU first to release CUDA memory
+                _gimm_model_cache["model"].cpu()
                 del _gimm_model_cache["model"]
                 _gimm_model_cache["model"] = None
                 _gimm_model_cache["variant"] = None
-                torch.cuda.empty_cache()
+            # Force garbage collection and clear CUDA cache
+            gc.collect()
+            torch.cuda.empty_cache()
         except:
             pass
 
