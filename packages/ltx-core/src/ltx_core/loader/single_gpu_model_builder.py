@@ -35,13 +35,17 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
     loras: tuple[LoraPathStrengthAndSDOps, ...] = field(default_factory=tuple)
     model_loader: StateDictLoader = field(default_factory=SafetensorsModelStateDictLoader)
     registry: Registry = field(default_factory=DummyRegistry)
+    config_path: str | None = None  # Optional: read config from different file than weights
 
     def lora(self, lora_path: str, strength: float = 1.0, sd_ops: SDOps | None = None) -> "SingleGPUModelBuilder":
         return replace(self, loras=(*self.loras, LoraPathStrengthAndSDOps(lora_path, strength, sd_ops)))
 
     def model_config(self) -> dict:
-        first_shard_path = self.model_path[0] if isinstance(self.model_path, tuple) else self.model_path
-        return self.model_loader.metadata(first_shard_path)
+        if self.config_path is not None:
+            config_source = self.config_path
+        else:
+            config_source = self.model_path[0] if isinstance(self.model_path, tuple) else self.model_path
+        return self.model_loader.metadata(config_source)
 
     def meta_model(self, config: dict, module_ops: tuple[ModuleOps, ...]) -> ModelType:
         with torch.device("meta"):

@@ -1168,6 +1168,13 @@ Examples:
         help="Number of denoising steps for stage 2 refinement (default: 3). "
              "Uses LTX2Scheduler to generate sigma schedule.",
     )
+    model_group.add_argument(
+        "--vae",
+        type=resolve_path,
+        default=None,
+        help="Path to separate VAE weights file (e.g., diffusion_pytorch_model_vae.safetensors). "
+             "If not specified, VAE weights are loaded from the main checkpoint.",
+    )
 
     # ==========================================================================
     # Generation Parameters
@@ -2149,6 +2156,7 @@ class LTXVideoGeneratorWithOffloading:
         distilled_checkpoint: bool = False,
         stage2_checkpoint: str | None = None,
         ffn_chunk_size: int | None = None,
+        vae_path: str | None = None,
     ):
         self.device = device or get_device()
         self.dtype = torch.bfloat16
@@ -2167,6 +2175,7 @@ class LTXVideoGeneratorWithOffloading:
         self.distilled_checkpoint = distilled_checkpoint
         self.stage2_checkpoint = stage2_checkpoint
         self.ffn_chunk_size = ffn_chunk_size
+        self.vae_path = vae_path
 
         # Create model ledger for stage 1
         self.stage_1_model_ledger = ModelLedger(
@@ -2175,6 +2184,7 @@ class LTXVideoGeneratorWithOffloading:
             checkpoint_path=checkpoint_path,
             gemma_root_path=gemma_root,
             spatial_upsampler_path=spatial_upsampler_path,
+            vae_path=vae_path,
             loras=loras,
             fp8transformer=fp8transformer,
         )
@@ -2184,6 +2194,7 @@ class LTXVideoGeneratorWithOffloading:
         self._stage_2_checkpoint_path = stage2_checkpoint if stage2_checkpoint else checkpoint_path
         self._stage_2_gemma_root = gemma_root
         self._stage_2_spatial_upsampler_path = spatial_upsampler_path
+        self._stage_2_vae_path = vae_path
         # Stage 2 gets stage2_loras (user LoRAs for stage 2 only), not the stage 1 loras
         self._stage_2_loras = stage2_loras or []
         self._stage_2_distilled_lora = distilled_lora
@@ -2499,6 +2510,7 @@ class LTXVideoGeneratorWithOffloading:
                         checkpoint_path=self.stage_1_model_ledger.checkpoint_path,
                         gemma_root_path=self.stage_1_model_ledger.gemma_root_path,
                         spatial_upsampler_path=self.stage_1_model_ledger.spatial_upsampler_path,
+                        vae_path=self.stage_1_model_ledger.vae_path,
                         loras=(),  # No LoRAs - load base model only
                         fp8transformer=self.stage_1_model_ledger.fp8transformer,
                     )
@@ -3082,6 +3094,7 @@ class LTXVideoGeneratorWithOffloading:
                 checkpoint_path=self._stage_2_checkpoint_path,
                 gemma_root_path=self._stage_2_gemma_root,
                 spatial_upsampler_path=self._stage_2_spatial_upsampler_path,
+                vae_path=self._stage_2_vae_path,
                 loras=(),  # No LoRAs - load base model only
                 fp8transformer=self._stage_2_fp8transformer,
             )
@@ -3194,6 +3207,7 @@ class LTXVideoGeneratorWithOffloading:
                 checkpoint_path=self._stage_2_checkpoint_path,
                 gemma_root_path=self._stage_2_gemma_root,
                 spatial_upsampler_path=self._stage_2_spatial_upsampler_path,
+                vae_path=self._stage_2_vae_path,
                 loras=(*self._stage_2_loras, *self._stage_2_distilled_lora) if self._stage_2_distilled_lora else self._stage_2_loras,
                 fp8transformer=self._stage_2_fp8transformer,
             )
@@ -3220,6 +3234,12 @@ class LTXVideoGeneratorWithOffloading:
             if stage2_steps == 3:
                 # Use exact tuned values for default 3 steps
                 distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
+            elif stage2_steps == 8:
+                # Use full trained 8-step distilled schedule for better quality
+                # This schedule was specifically trained and produces better results
+                # than interpolating from the 3-step schedule
+                distilled_sigmas = torch.Tensor(DISTILLED_SIGMA_VALUES).to(self.device)
+                print(f">>> Stage 2 using full trained 8-step distilled schedule")
             else:
                 # Interpolate tuned values to support different step counts
                 # Original tuned values: [0.909375, 0.725, 0.421875, 0.0]
@@ -4479,6 +4499,7 @@ def generate_av_extension(
                 checkpoint_path=generator.stage_1_model_ledger.checkpoint_path,
                 gemma_root_path=generator.stage_1_model_ledger.gemma_root_path,
                 spatial_upsampler_path=generator.stage_1_model_ledger.spatial_upsampler_path,
+                vae_path=generator.stage_1_model_ledger.vae_path,
                 loras=(),  # No LoRAs - load base model only
                 fp8transformer=generator.stage_1_model_ledger.fp8transformer,
             )
@@ -4949,6 +4970,7 @@ def generate_av_extension(
                 checkpoint_path=generator.stage_2_model_ledger.checkpoint_path if hasattr(generator.stage_2_model_ledger, 'checkpoint_path') else generator.stage_1_model_ledger.checkpoint_path,
                 gemma_root_path=generator.stage_2_model_ledger.gemma_root_path if hasattr(generator.stage_2_model_ledger, 'gemma_root_path') else generator.stage_1_model_ledger.gemma_root_path,
                 spatial_upsampler_path=generator.stage_2_model_ledger.spatial_upsampler_path if hasattr(generator.stage_2_model_ledger, 'spatial_upsampler_path') else generator.stage_1_model_ledger.spatial_upsampler_path,
+                vae_path=generator.stage_2_model_ledger.vae_path if hasattr(generator.stage_2_model_ledger, 'vae_path') else generator.stage_1_model_ledger.vae_path,
                 loras=(),  # No LoRAs - load base model only
                 fp8transformer=generator.stage_2_model_ledger.fp8transformer if hasattr(generator.stage_2_model_ledger, 'fp8transformer') else generator.stage_1_model_ledger.fp8transformer,
             )
@@ -5963,6 +5985,7 @@ def main():
         distilled_checkpoint=args.distilled_checkpoint,
         stage2_checkpoint=args.stage2_checkpoint,
         ffn_chunk_size=args.ffn_chunk_size,
+        vae_path=args.vae,
     )
 
     # Set up tiling config for VAE

@@ -364,7 +364,19 @@ class LTXModel(torch.nn.Module):
         shift, scale = scale_shift_values[:, :, 0], scale_shift_values[:, :, 1]
 
         x = norm_out(x)
-        x = x * (1 + scale) + shift
+        # Plain block swap (without activation offload) needs non-in-place ops
+        # because tensors are reused across blocks. Activation offload creates
+        # fresh tensors per block, so in-place is safe there.
+        has_offloader = getattr(self, '_block_swap_offloader', None) is not None
+        has_activation_offload = hasattr(self, '_activation_offload_verbose')
+        plain_block_swap = has_offloader and not has_activation_offload
+        if plain_block_swap:
+            x = x * (1 + scale) + shift
+        else:
+            # Use in-place ops to avoid intermediate tensor allocations (saves ~6GB for large latents)
+            scale.add_(1)
+            x.mul_(scale)
+            x.add_(shift)
         x = proj_out(x)
         return x
 

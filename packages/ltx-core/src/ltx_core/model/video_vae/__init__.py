@@ -2,7 +2,9 @@
 
 from ltx_core.model.video_vae.model_configurator import (
     VAE_DECODER_COMFY_KEYS_FILTER,
+    VAE_DECODER_SEPARATE_KEYS_FILTER,
     VAE_ENCODER_COMFY_KEYS_FILTER,
+    VAE_ENCODER_SEPARATE_KEYS_FILTER,
     VideoDecoderConfigurator,
     VideoEncoderConfigurator,
 )
@@ -11,7 +13,9 @@ from ltx_core.model.video_vae.video_vae import VideoDecoder, VideoEncoder, decod
 
 __all__ = [
     "VAE_DECODER_COMFY_KEYS_FILTER",
+    "VAE_DECODER_SEPARATE_KEYS_FILTER",
     "VAE_ENCODER_COMFY_KEYS_FILTER",
+    "VAE_ENCODER_SEPARATE_KEYS_FILTER",
     "SpatialTilingConfig",
     "TemporalTilingConfig",
     "TilingConfig",
