@@ -30,6 +30,9 @@ from typing import Generator, List, Tuple, Optional, Dict
 import threading
 import json
 from PIL import Image
+from pathlib import Path
+import tempfile
+import shutil
 
 # Global state
 stop_event = threading.Event()
@@ -453,6 +456,354 @@ def extract_video_details(video_path: str) -> Tuple[dict, str, Optional[str]]:
 
     # Return metadata, status message, and first frame path
     return metadata, "Video details extracted successfully", first_frame_path
+
+
+# =============================================================================
+# GIMM-VFI Frame Interpolation
+# =============================================================================
+
+def _gimm_set_seed(seed=None):
+    """Set random seed for reproducibility (inlined from GIMM-VFI)."""
+    import random
+    import numpy as np
+    import torch
+    if seed is None:
+        seed = random.getrandbits(32)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    return seed
+
+
+class _GIMMInputPadder:
+    """Pads images such that dimensions are divisible by divisor (inlined from GIMM-VFI)."""
+
+    def __init__(self, dims, divisor=16):
+        import torch.nn.functional as F
+        self.F = F
+        self.ht, self.wd = dims[-2:]
+        pad_ht = (((self.ht // divisor) + 1) * divisor - self.ht) % divisor
+        pad_wd = (((self.wd // divisor) + 1) * divisor - self.wd) % divisor
+        self._pad = [
+            pad_wd // 2,
+            pad_wd - pad_wd // 2,
+            pad_ht // 2,
+            pad_ht - pad_ht // 2,
+        ]
+
+    def pad(self, *inputs):
+        if len(inputs) == 1:
+            return self.F.pad(inputs[0], self._pad, mode="replicate")
+        else:
+            return [self.F.pad(x, self._pad, mode="replicate") for x in inputs]
+
+    def unpad(self, *inputs):
+        if len(inputs) == 1:
+            return self._unpad(inputs[0])
+        else:
+            return [self._unpad(x) for x in inputs]
+
+    def _unpad(self, x):
+        ht, wd = x.shape[-2:]
+        c = [self._pad[2], ht - self._pad[3], self._pad[0], wd - self._pad[1]]
+        return x[..., c[0] : c[1], c[2] : c[3]]
+
+
+# Model variant configurations
+GIMM_MODELS = {
+    "GIMM-VFI-R (RAFT)": {
+        "config": "GIMM-VFI/configs/gimmvfi/gimmvfi_r_arb.yaml",
+        "checkpoint": "GIMM-VFI/pretrained_ckpt/gimmvfi_r_arb.pt",
+    },
+    "GIMM-VFI-R-P (RAFT+Perceptual)": {
+        "config": "GIMM-VFI/configs/gimmvfi/gimmvfi_r_arb.yaml",
+        "checkpoint": "GIMM-VFI/pretrained_ckpt/gimmvfi_r_arb_lpips.pt",
+    },
+    "GIMM-VFI-F (FlowFormer)": {
+        "config": "GIMM-VFI/configs/gimmvfi/gimmvfi_f_arb.yaml",
+        "checkpoint": "GIMM-VFI/pretrained_ckpt/gimmvfi_f_arb.pt",
+    },
+    "GIMM-VFI-F-P (FlowFormer+Perceptual)": {
+        "config": "GIMM-VFI/configs/gimmvfi/gimmvfi_f_arb.yaml",
+        "checkpoint": "GIMM-VFI/pretrained_ckpt/gimmvfi_f_arb_lpips.pt",
+    },
+}
+
+# Global cache for GIMM-VFI model
+_gimm_model_cache = {"model": None, "variant": None}
+
+
+def _load_gimm_model(model_variant: str, checkpoint_path: str = "", config_path: str = ""):
+    """Load GIMM-VFI model with caching."""
+    import torch
+
+    # Get paths
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    gimm_dir = os.path.join(script_dir, "GIMM-VFI")
+    gimm_src_path = os.path.join(gimm_dir, "src")
+
+    # Add GIMM-VFI to path
+    if gimm_src_path not in sys.path:
+        sys.path.insert(0, gimm_src_path)
+
+    from models import create_model
+    from utils.setup import single_setup
+
+    # Use defaults if not specified
+    model_info = GIMM_MODELS.get(model_variant, GIMM_MODELS["GIMM-VFI-R-P (RAFT+Perceptual)"])
+    config_file = config_path if config_path else model_info["config"]
+    ckpt_file = checkpoint_path if checkpoint_path else model_info["checkpoint"]
+
+    # Check if already loaded
+    cache_key = f"{model_variant}:{ckpt_file}"
+    if _gimm_model_cache["model"] is not None and _gimm_model_cache["variant"] == cache_key:
+        return _gimm_model_cache["model"]
+
+    # Clear old model from GPU
+    if _gimm_model_cache["model"] is not None:
+        del _gimm_model_cache["model"]
+        _gimm_model_cache["model"] = None
+        torch.cuda.empty_cache()
+
+    # Setup config via argparse.Namespace (required by GIMM-VFI single_setup)
+    # Use absolute path for config file
+    import argparse
+    abs_config_file = os.path.join(script_dir, config_file) if not os.path.isabs(config_file) else config_file
+    args = argparse.Namespace(
+        eval=True,
+        resume=False,
+        seed=0,
+        model_config=abs_config_file,
+    )
+    config = single_setup(args, extra_args=[])
+
+    # Create model - need to change to GIMM-VFI dir because RAFT uses relative paths
+    original_cwd = os.getcwd()
+    try:
+        os.chdir(gimm_dir)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model, _ = create_model(config.arch)
+        model = model.to(device)
+    finally:
+        os.chdir(original_cwd)
+
+    # Load checkpoint (use absolute path)
+    abs_ckpt_file = os.path.join(script_dir, ckpt_file) if not os.path.isabs(ckpt_file) else ckpt_file
+    if os.path.exists(abs_ckpt_file):
+        ckpt = torch.load(abs_ckpt_file, map_location="cpu")
+        model.load_state_dict(ckpt["state_dict"], strict=True)
+    else:
+        raise FileNotFoundError(f"Checkpoint not found: {abs_ckpt_file}")
+
+    model.eval()
+
+    # Cache the model
+    _gimm_model_cache["model"] = model
+    _gimm_model_cache["variant"] = cache_key
+
+    return model
+
+
+def _extract_video_frames(video_path: str, output_dir: str) -> Tuple[List[str], float]:
+    """Extract frames from video using ffmpeg. Returns frame paths and FPS."""
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Get video FPS
+    probe_cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=r_frame_rate",
+        "-of", "default=noprint_wrappers=1:nokey=1", video_path
+    ]
+    result = subprocess.run(probe_cmd, capture_output=True, text=True)
+    fps_str = result.stdout.strip()
+    if "/" in fps_str:
+        num, den = fps_str.split("/")
+        fps = float(num) / float(den)
+    else:
+        fps = float(fps_str) if fps_str else 24.0
+
+    # Extract frames
+    extract_cmd = [
+        "ffmpeg", "-y", "-i", video_path,
+        "-qscale:v", "2",
+        os.path.join(output_dir, "%05d.png")
+    ]
+    subprocess.run(extract_cmd, capture_output=True)
+
+    # Get sorted frame paths
+    frame_paths = sorted(Path(output_dir).glob("*.png"))
+    return [str(p) for p in frame_paths], fps
+
+
+def _frames_to_video(frame_dir: str, output_path: str, fps: float):
+    """Reassemble frames into video using ffmpeg."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-framerate", str(fps),
+        "-i", os.path.join(frame_dir, "%05d.png"),
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-crf", "18",
+        output_path
+    ]
+    subprocess.run(cmd, capture_output=True)
+
+
+def interpolate_video_gimm(
+    input_video: str,
+    model_variant: str,
+    checkpoint_path: str,
+    config_path: str,
+    interp_factor: int,
+    ds_scale: float,
+    output_fps_override: float,
+    raft_iters: int,
+    seed: int,
+) -> Generator[Tuple[Optional[str], str, float], None, None]:
+    """
+    Interpolate video frames using GIMM-VFI.
+
+    Yields: (output_video_path, status_text, progress_fraction)
+    """
+    import torch
+    import numpy as np
+    import cv2
+
+    if not input_video:
+        yield None, "Error: No input video provided", 0.0
+        return
+
+    _gimm_set_seed(seed)
+
+    # Create temp directories
+    temp_dir = tempfile.mkdtemp(prefix="gimm_interp_")
+    input_frames_dir = os.path.join(temp_dir, "input_frames")
+    output_frames_dir = os.path.join(temp_dir, "output_frames")
+    os.makedirs(input_frames_dir, exist_ok=True)
+    os.makedirs(output_frames_dir, exist_ok=True)
+
+    try:
+        # Extract frames
+        yield None, "Extracting video frames...", 0.05
+        frame_paths, original_fps = _extract_video_frames(input_video, input_frames_dir)
+
+        if len(frame_paths) < 2:
+            yield None, "Error: Video must have at least 2 frames", 0.0
+            return
+
+        yield None, f"Extracted {len(frame_paths)} frames at {original_fps:.2f} FPS", 0.1
+
+        # Load model
+        yield None, f"Loading {model_variant}...", 0.15
+        model = _load_gimm_model(model_variant, checkpoint_path, config_path)
+        device = next(model.parameters()).device
+
+        yield None, "Model loaded, starting interpolation...", 0.2
+
+        # Process frame pairs
+        N = interp_factor  # Number of output frames per input pair (including endpoints)
+        total_pairs = len(frame_paths) - 1
+        output_frame_idx = 0
+
+        def load_image(img_path):
+            from PIL import Image
+            img = Image.open(img_path)
+            raw_img = np.array(img.convert("RGB"))
+            img_tensor = torch.from_numpy(raw_img.copy()).permute(2, 0, 1) / 255.0
+            return img_tensor.to(torch.float).unsqueeze(0)
+
+        for pair_idx in range(total_pairs):
+            progress = 0.2 + (pair_idx / total_pairs) * 0.7
+            yield None, f"Interpolating pair {pair_idx + 1}/{total_pairs}...", progress
+
+            # Load frame pair
+            I0 = load_image(frame_paths[pair_idx]).to(device)
+            I2 = load_image(frame_paths[pair_idx + 1]).to(device)
+
+            # Pad to divisible by 32
+            padder = _GIMMInputPadder(I0.shape, 32)
+            I0_pad, I2_pad = padder.pad(I0, I2)
+
+            # Create batch
+            xs = torch.cat((I0_pad.unsqueeze(2), I2_pad.unsqueeze(2)), dim=2)
+            batch_size = xs.shape[0]
+            s_shape = xs.shape[-2:]
+
+            # Save first frame (only for first pair)
+            if pair_idx == 0:
+                frame_np = (I0[0].cpu().numpy().transpose(1, 2, 0) * 255.0).astype(np.uint8)
+                frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
+                cv2.imwrite(os.path.join(output_frames_dir, f"{output_frame_idx:05d}.png"), frame_bgr)
+                output_frame_idx += 1
+
+            # Generate intermediate frames
+            with torch.no_grad():
+                coord_inputs = [
+                    (
+                        model.sample_coord_input(
+                            batch_size,
+                            s_shape,
+                            [1 / N * i],
+                            device=xs.device,
+                            upsample_ratio=ds_scale,
+                        ),
+                        None,
+                    )
+                    for i in range(1, N)
+                ]
+                timesteps = [
+                    i * 1 / N * torch.ones(batch_size).to(xs.device).to(torch.float)
+                    for i in range(1, N)
+                ]
+
+                outputs = model(xs, coord_inputs, t=timesteps, ds_factor=ds_scale)
+                out_frames = [padder.unpad(im) for im in outputs["imgt_pred"]]
+
+            # Save interpolated frames
+            for frame_tensor in out_frames:
+                frame_np = (frame_tensor[0].cpu().numpy().transpose(1, 2, 0) * 255.0)
+                frame_np = np.clip(frame_np, 0, 255).astype(np.uint8)
+                frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
+                cv2.imwrite(os.path.join(output_frames_dir, f"{output_frame_idx:05d}.png"), frame_bgr)
+                output_frame_idx += 1
+
+            # Save second frame of pair
+            frame_np = (padder.unpad(I2_pad)[0].cpu().numpy().transpose(1, 2, 0) * 255.0).astype(np.uint8)
+            frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(os.path.join(output_frames_dir, f"{output_frame_idx:05d}.png"), frame_bgr)
+            output_frame_idx += 1
+
+            # Clear CUDA cache periodically
+            if pair_idx % 10 == 0:
+                torch.cuda.empty_cache()
+
+        # Reassemble video
+        yield None, "Encoding output video...", 0.92
+
+        # Calculate output FPS
+        output_fps = output_fps_override if output_fps_override > 0 else original_fps * N
+
+        # Create output path
+        output_dir = "outputs"
+        os.makedirs(output_dir, exist_ok=True)
+        output_filename = f"interpolated_{int(time.time())}.mp4"
+        output_path = os.path.join(output_dir, output_filename)
+
+        _frames_to_video(output_frames_dir, output_path, output_fps)
+
+        yield output_path, f"Done! Output: {output_fps:.1f} FPS ({output_frame_idx} frames)", 1.0
+
+    except Exception as e:
+        yield None, f"Error: {str(e)}", 0.0
+        import traceback
+        traceback.print_exc()
+    finally:
+        # Cleanup temp directory
+        try:
+            shutil.rmtree(temp_dir)
+        except:
+            pass
 
 
 # =============================================================================
@@ -2242,6 +2593,103 @@ Audio is synchronized with the video extension.
                             depth_send_to_gen_btn = gr.Button("📤 Send to Generation Tab", variant="secondary")
 
             # =================================================================
+            # Frame Interpolation Tab (GIMM-VFI)
+            # =================================================================
+            with gr.Tab("Frame Interpolation", id="interp_tab"):
+                gr.Markdown("### Increase Video FPS using GIMM-VFI\nState-of-the-art frame interpolation for smooth slow motion and higher frame rates.")
+
+                with gr.Row():
+                    # Input Column
+                    with gr.Column(scale=1):
+                        interp_input_video = gr.Video(label="Input Video", sources=["upload"])
+
+                        # Model Settings
+                        with gr.Accordion("Model Settings", open=True):
+                            interp_model_variant = gr.Dropdown(
+                                label="Model Variant",
+                                choices=list(GIMM_MODELS.keys()),
+                                value="GIMM-VFI-R-P (RAFT+Perceptual)",
+                                info="R=RAFT (faster), F=FlowFormer (better quality), P=Perceptual loss (recommended)"
+                            )
+                            interp_checkpoint_path = gr.Textbox(
+                                label="Checkpoint Path (optional)",
+                                placeholder="Leave empty to use default for selected variant",
+                                info="Override the default checkpoint path"
+                            )
+                            interp_config_path = gr.Textbox(
+                                label="Config Path (optional)",
+                                placeholder="Leave empty to use default for selected variant",
+                                info="Override the default config path"
+                            )
+
+                        # Interpolation Settings
+                        with gr.Accordion("Interpolation Settings", open=True):
+                            interp_factor = gr.Slider(
+                                label="Interpolation Factor",
+                                minimum=2,
+                                maximum=16,
+                                value=2,
+                                step=1,
+                                info="2=2x FPS (1 new frame), 4=4x FPS (3 new frames), 8=8x FPS (7 new frames)"
+                            )
+                            interp_ds_scale = gr.Slider(
+                                label="DS Scale (for high-res)",
+                                minimum=0.25,
+                                maximum=1.0,
+                                value=1.0,
+                                step=0.05,
+                                info="Downscale factor: 1.0=SD/HD, 0.5=2K (~8GB VRAM), 0.25=4K (~11GB VRAM)"
+                            )
+                            interp_output_fps = gr.Number(
+                                label="Output FPS Override",
+                                value=0,
+                                minimum=0,
+                                info="0 = auto (input FPS × factor). Set manually for custom output FPS."
+                            )
+
+                        # Advanced Settings
+                        with gr.Accordion("Advanced", open=False):
+                            interp_raft_iters = gr.Slider(
+                                label="RAFT Iterations",
+                                minimum=12,
+                                maximum=32,
+                                value=20,
+                                step=1,
+                                info="More iterations = better quality, slower"
+                            )
+                            interp_seed = gr.Number(
+                                label="Seed",
+                                value=0,
+                                info="Random seed for reproducibility"
+                            )
+
+                        # Action Buttons
+                        with gr.Row():
+                            interp_generate_btn = gr.Button("🎬 Interpolate", variant="primary", elem_classes="green-btn")
+
+                    # Output Column
+                    with gr.Column(scale=1):
+                        interp_output_video = gr.Video(label="Interpolated Video")
+                        interp_status = gr.Textbox(label="Status", value="Ready", interactive=False)
+                        interp_progress = gr.Slider(
+                            label="Progress",
+                            minimum=0,
+                            maximum=1,
+                            value=0,
+                            interactive=False,
+                            visible=True
+                        )
+
+                        gr.Markdown("""
+                        **Notes:**
+                        - Download checkpoints from [HuggingFace](https://huggingface.co/GSean/GIMM-VFI)
+                        - Place `.pt` files in `GIMM-VFI/pretrained_ckpt/`
+                        - For 2K/4K video, reduce DS Scale to fit in VRAM
+                        - FlowFormer (F) variants need more VRAM but produce better quality
+                        - Recommended: `gimmvfi_r_arb_lpips.pt` (RAFT+Perceptual)
+                        """)
+
+            # =================================================================
             # Help Tab
             # =================================================================
             with gr.Tab("Help"):
@@ -3082,6 +3530,25 @@ Audio is synchronized with the video extension.
             fn=send_depth_to_generation,
             inputs=[depth_output_image, depth_output_video],
             outputs=[tabs, depth_control_video, depth_control_image, depth_status]
+        )
+
+        # =================================================================
+        # Frame Interpolation Event Handlers
+        # =================================================================
+        interp_generate_btn.click(
+            fn=interpolate_video_gimm,
+            inputs=[
+                interp_input_video,
+                interp_model_variant,
+                interp_checkpoint_path,
+                interp_config_path,
+                interp_factor,
+                interp_ds_scale,
+                interp_output_fps,
+                interp_raft_iters,
+                interp_seed,
+            ],
+            outputs=[interp_output_video, interp_status, interp_progress]
         )
 
         return demo

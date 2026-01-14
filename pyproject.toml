@@ -36,6 +36,16 @@ dependencies = [
     "typing-extensions>=4.0",
     "uvicorn>=0.20",
     "websockets>=11.0",
+    # GIMM-VFI dependencies for frame interpolation
+    "easydict>=1.9",
+    "einops>=0.6.1",
+    "omegaconf>=2.3.0",
+    "timm>=0.4.12",
+    "cupy-cuda12x>=12.0.0,<13.0.0",
+    "yacs>=0.1.6",
+    "tensorboard>=2.14.0",
+    "imageio-ffmpeg>=0.5.1",
+    "torchvision",
 ]
 
 [tool.uv.sources]
