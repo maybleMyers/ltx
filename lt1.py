@@ -804,6 +804,16 @@ def interpolate_video_gimm(
             shutil.rmtree(temp_dir)
         except:
             pass
+        # Unload GIMM-VFI model to free VRAM
+        try:
+            import torch
+            if _gimm_model_cache["model"] is not None:
+                del _gimm_model_cache["model"]
+                _gimm_model_cache["model"] = None
+                _gimm_model_cache["variant"] = None
+                torch.cuda.empty_cache()
+        except:
+            pass
 
 
 # =============================================================================
