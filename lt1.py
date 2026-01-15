@@ -174,9 +174,9 @@ def validate_num_frames(num_frames: int) -> Optional[str]:
 
 
 def validate_resolution(width: int, height: int) -> Optional[str]:
-    """Validate resolution is divisible by 32."""
-    if width % 32 != 0 or height % 32 != 0:
-        return f"Error: width ({width}) and height ({height}) must be divisible by 32"
+    """Validate resolution is divisible by 64."""
+    if width % 64 != 0 or height % 64 != 0:
+        return f"Error: width ({width}) and height ({height}) must be divisible by 64"
     return None
 
 
@@ -233,7 +233,7 @@ def update_image_dimensions(image_path):
 
 
 def update_resolution_from_scale(scale, original_dims):
-    """Update dimensions based on scale percentage (divisible by 32)."""
+    """Update dimensions based on scale percentage (divisible by 64)."""
     if not original_dims:
         return gr.update(), gr.update()
     try:
@@ -244,13 +244,13 @@ def update_resolution_from_scale(scale, original_dims):
         orig_w, orig_h = map(int, original_dims.split('x'))
         scale_factor = scale / 100.0
 
-        # Calculate and round to the nearest multiple of 32
-        new_w = round((orig_w * scale_factor) / 32) * 32
-        new_h = round((orig_h * scale_factor) / 32) * 32
+        # Calculate and round to the nearest multiple of 64
+        new_w = round((orig_w * scale_factor) / 64) * 64
+        new_h = round((orig_h * scale_factor) / 64) * 64
 
-        # Ensure minimum size (must be multiple of 32)
-        new_w = max(32, new_w)
-        new_h = max(32, new_h)
+        # Ensure minimum size (must be multiple of 64)
+        new_w = max(64, new_w)
+        new_h = max(64, new_h)
 
         return gr.update(value=new_w), gr.update(value=new_h)
     except Exception as e:
@@ -259,22 +259,22 @@ def update_resolution_from_scale(scale, original_dims):
 
 
 def calculate_width_from_height(height, original_dims):
-    """Calculate width based on height maintaining aspect ratio (divisible by 32)."""
+    """Calculate width based on height maintaining aspect ratio (divisible by 64)."""
     if not original_dims or height is None:
         return gr.update()
     try:
         height = int(height)
         if height <= 0:
             return gr.update()
-        height = (height // 32) * 32
-        height = max(32, height)
+        height = (height // 64) * 64
+        height = max(64, height)
 
         orig_w, orig_h = map(int, original_dims.split('x'))
         if orig_h == 0:
             return gr.update()
         aspect_ratio = orig_w / orig_h
-        new_width = round((height * aspect_ratio) / 32) * 32
-        return gr.update(value=max(32, new_width))
+        new_width = round((height * aspect_ratio) / 64) * 64
+        return gr.update(value=max(64, new_width))
 
     except Exception as e:
         print(f"Error calculating width: {e}")
@@ -282,22 +282,22 @@ def calculate_width_from_height(height, original_dims):
 
 
 def calculate_height_from_width(width, original_dims):
-    """Calculate height based on width maintaining aspect ratio (divisible by 32)."""
+    """Calculate height based on width maintaining aspect ratio (divisible by 64)."""
     if not original_dims or width is None:
         return gr.update()
     try:
         width = int(width)
         if width <= 0:
             return gr.update()
-        width = (width // 32) * 32
-        width = max(32, width)
+        width = (width // 64) * 64
+        width = max(64, width)
 
         orig_w, orig_h = map(int, original_dims.split('x'))
         if orig_w == 0:
             return gr.update()
         aspect_ratio = orig_w / orig_h
-        new_height = round((width / aspect_ratio) / 32) * 32
-        return gr.update(value=max(32, new_height))
+        new_height = round((width / aspect_ratio) / 64) * 64
+        return gr.update(value=max(64, new_height))
 
     except Exception as e:
         print(f"Error calculating height: {e}")
@@ -1997,10 +1997,10 @@ def create_interface():
                             info="Scale the input image dimensions. Works for I2V mode."
                         )
                         with gr.Row():
-                            width = gr.Number(label="Width", value=1024, step=32, info="Must be divisible by 32")
+                            width = gr.Number(label="Width", value=1024, step=64, info="Must be divisible by 64")
                             calc_height_btn = gr.Button("→", size="sm", min_width=40)
                             calc_width_btn = gr.Button("←", size="sm", min_width=40)
-                            height = gr.Number(label="Height", value=1024, step=32, info="Must be divisible by 32")
+                            height = gr.Number(label="Height", value=1024, step=64, info="Must be divisible by 64")
                         with gr.Row():
                             num_frames = gr.Slider(minimum=9, maximum=2001, step=8, value=121, label="Num Frames (8*K+1)", info="e.g., 121 = 5s @ 24fps")
                             frame_rate = gr.Slider(minimum=12, maximum=60, value=24, step=1, label="Frame Rate")
@@ -2483,10 +2483,10 @@ Audio is synchronized with the video extension.
                         gr.Markdown("### Generation Parameters")
                         svi_scale_slider = gr.Slider(minimum=1, maximum=200, value=100, step=1, label="Scale %")
                         with gr.Row():
-                            svi_width = gr.Number(label="Width", value=768, step=32, interactive=True)
+                            svi_width = gr.Number(label="Width", value=768, step=64, interactive=True)
                             svi_calc_height_btn = gr.Button("→")
                             svi_calc_width_btn = gr.Button("←")
-                            svi_height = gr.Number(label="Height", value=512, step=32, interactive=True)
+                            svi_height = gr.Number(label="Height", value=512, step=64, interactive=True)
                         svi_num_frames = gr.Slider(minimum=9, maximum=241, step=8, label="Frames Per Clip", value=121, info="Frame count for each individual clip (8k+1)")
                         svi_frame_rate = gr.Slider(minimum=1, maximum=60, step=1, label="Frames Per Second", value=24)
                         svi_inference_steps = gr.Slider(minimum=4, maximum=100, step=1, label="Sampling Steps", value=40)
@@ -2849,7 +2849,7 @@ Audio is synchronized with the video extension.
                 - **→ / ← Buttons**: Calculate width from height or height from width while preserving aspect ratio
 
                 ### Resolution Requirements
-                - Width and height must be divisible by 32
+                - Width and height must be divisible by 64
                 - Recommended: 1024x1024, 768x1024, 1024x768
                 - When using I2V, the scale slider helps maintain the input image's aspect ratio
 
