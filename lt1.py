@@ -1023,6 +1023,15 @@ def generate_ltx_video(
     estimate_depth: bool,
     depth_strength: float,
     depth_stage2: bool,
+    # Latent Normalization (fixes overbaking and audio clipping)
+    latent_norm_mode: str,
+    latent_norm_factors: str,
+    latent_norm_target_mean: float,
+    latent_norm_target_std: float,
+    latent_norm_percentile: float,
+    latent_norm_clip_outliers: bool,
+    latent_norm_video_only: bool,
+    latent_norm_audio_only: bool,
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     """
     Generate video using LTX-2 pipeline.
@@ -1185,6 +1194,20 @@ def generate_ltx_video(
             command.extend(["--depth-strength", str(float(depth_strength))])
             if depth_stage2:
                 command.append("--depth-stage2")
+
+        # Latent Normalization (fixes overbaking and audio clipping)
+        if latent_norm_mode and latent_norm_mode != "none":
+            command.extend(["--latent-norm", str(latent_norm_mode)])
+            command.extend(["--latent-norm-factors", str(latent_norm_factors)])
+            command.extend(["--latent-norm-target-mean", str(float(latent_norm_target_mean))])
+            command.extend(["--latent-norm-target-std", str(float(latent_norm_target_std))])
+            command.extend(["--latent-norm-percentile", str(float(latent_norm_percentile))])
+            if latent_norm_clip_outliers:
+                command.append("--latent-norm-clip-outliers")
+            if latent_norm_video_only:
+                command.append("--latent-norm-video-only")
+            if latent_norm_audio_only:
+                command.append("--latent-norm-audio-only")
 
         # User LoRAs - apply to selected stage(s)
         lora_configs = [
@@ -2367,6 +2390,56 @@ Audio is synchronized with the video extension.
                                 lt1_save_defaults_btn = gr.Button("Save Defaults")
                                 lt1_load_defaults_btn = gr.Button("Load Defaults")
                             lt1_defaults_status = gr.Textbox(label="Defaults Status", interactive=False, visible=False)
+                        # Latent Normalization (fixes overbaking and audio clipping)
+                        with gr.Accordion("Latent Normalization", open=False):
+                            gr.Markdown("""
+                            **Fixes overbaking and audio clipping** by normalizing latent values during denoising.
+                            Apply stronger normalization early (high factors) and reduce later (low factors).
+                            """)
+                            latent_norm_mode = gr.Dropdown(
+                                label="Normalization Mode",
+                                choices=["none", "stat"],
+                                value="none",
+                                info="'none' = disabled, 'stat' = statistical normalization"
+                            )
+                            latent_norm_factors = gr.Textbox(
+                                label="Per-Step Factors",
+                                value="0.9,0.75,0.5,0.25,0.0",
+                                info="Comma-separated factors for each step (higher = stronger normalization)"
+                            )
+                            with gr.Row():
+                                latent_norm_target_mean = gr.Number(
+                                    label="Target Mean",
+                                    value=0.0,
+                                    info="Target mean for normalization"
+                                )
+                                latent_norm_target_std = gr.Number(
+                                    label="Target Std",
+                                    value=1.0,
+                                    info="Target standard deviation"
+                                )
+                            with gr.Row():
+                                latent_norm_percentile = gr.Slider(
+                                    minimum=50.0, maximum=100.0, value=95.0, step=1.0,
+                                    label="Percentile",
+                                    info="Percentile for outlier filtering (95 = ignore top/bottom 2.5%)"
+                                )
+                                latent_norm_clip_outliers = gr.Checkbox(
+                                    label="Clip Outliers",
+                                    value=False,
+                                    info="Hard clip values outside percentile bounds"
+                                )
+                            with gr.Row():
+                                latent_norm_video_only = gr.Checkbox(
+                                    label="Video Only",
+                                    value=False,
+                                    info="Apply to video latents only"
+                                )
+                                latent_norm_audio_only = gr.Checkbox(
+                                    label="Audio Only",
+                                    value=False,
+                                    info="Apply to audio latents only"
+                                )
 
             # =================================================================
             # Video Info Tab
@@ -2993,6 +3066,11 @@ Audio is synchronized with the video extension.
                 # Depth Control (IC-LoRA)
                 depth_control_video, depth_control_image, estimate_depth,
                 depth_strength, depth_stage2,
+                # Latent Normalization
+                latent_norm_mode, latent_norm_factors,
+                latent_norm_target_mean, latent_norm_target_std,
+                latent_norm_percentile, latent_norm_clip_outliers,
+                latent_norm_video_only, latent_norm_audio_only,
             ],
             outputs=[output_gallery, preview_gallery, status_text, progress_text]
         )

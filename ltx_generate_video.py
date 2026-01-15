@@ -72,6 +72,8 @@ from ltx_pipelines.utils.constants import (
 from ltx_pipelines.utils.helpers import (
     assert_resolution,
     cleanup_memory,
+    create_per_step_adain_norm_fn,
+    create_per_step_stat_norm_fn,
     denoise_audio_video,
     euler_denoising_loop,
     generate_enhanced_prompt,
@@ -1604,6 +1606,59 @@ Examples:
     )
 
     # ==========================================================================
+    # Latent Normalization (fixes overbaking and audio clipping)
+    # ==========================================================================
+    norm_group = parser.add_argument_group("Latent Normalization (Quality Fix)")
+    norm_group.add_argument(
+        "--latent-norm",
+        type=str,
+        choices=["none", "stat", "adain"],
+        default="none",
+        help="Latent normalization mode: 'none' (disabled), 'stat' (statistical normalization), "
+             "'adain' (adaptive instance normalization with reference). Default: none",
+    )
+    norm_group.add_argument(
+        "--latent-norm-factors",
+        type=str,
+        default="0.9,0.75,0.5,0.25,0.0",
+        help="Per-step normalization factors (comma-separated). Higher values = stronger normalization. "
+             "Recommended: stronger early, weaker late. Default: '0.9,0.75,0.5,0.25,0.0'",
+    )
+    norm_group.add_argument(
+        "--latent-norm-target-mean",
+        type=float,
+        default=0.0,
+        help="Target mean for statistical normalization. Default: 0.0",
+    )
+    norm_group.add_argument(
+        "--latent-norm-target-std",
+        type=float,
+        default=1.0,
+        help="Target standard deviation for statistical normalization. Default: 1.0",
+    )
+    norm_group.add_argument(
+        "--latent-norm-percentile",
+        type=float,
+        default=95.0,
+        help="Percentile for outlier filtering in stat norm (50-100). Default: 95.0",
+    )
+    norm_group.add_argument(
+        "--latent-norm-clip-outliers",
+        action="store_true",
+        help="Clip outliers to normalized bounds (stat norm only).",
+    )
+    norm_group.add_argument(
+        "--latent-norm-video-only",
+        action="store_true",
+        help="Apply normalization to video latents only (skip audio).",
+    )
+    norm_group.add_argument(
+        "--latent-norm-audio-only",
+        action="store_true",
+        help="Apply normalization to audio latents only (skip video).",
+    )
+
+    # ==========================================================================
     # Preview Generation
     # ==========================================================================
     preview_group = parser.add_argument_group("Preview Generation")
@@ -2281,6 +2336,8 @@ class LTXVideoGeneratorWithOffloading:
         estimate_depth: bool = False,
         depth_strength: float = 1.0,
         depth_stage2: bool = False,
+        # Latent normalization (fixes overbaking/audio clipping)
+        latent_norm_fn: Callable | None = None,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor | None, str | None]:
         """
         Generate video with optional audio.
@@ -2677,6 +2734,7 @@ class LTXVideoGeneratorWithOffloading:
                         anchor_decay=effective_anchor_decay,
                         callback=preview_callback,
                         callback_interval=preview_callback_interval,
+                        latent_norm_fn=latent_norm_fn,
                     )
             else:
                 # No guidance, single forward pass
@@ -2699,6 +2757,7 @@ class LTXVideoGeneratorWithOffloading:
                         anchor_decay=effective_anchor_decay,
                         callback=preview_callback,
                         callback_interval=preview_callback_interval,
+                        latent_norm_fn=latent_norm_fn,
                     )
 
             # Stage 1 output shape (half resolution for two-stage, full for one-stage)
@@ -3313,6 +3372,7 @@ class LTXVideoGeneratorWithOffloading:
                 anchor_decay=effective_anchor_decay,
                 callback=preview_callback,
                 callback_interval=preview_callback_interval,
+                latent_norm_fn=latent_norm_fn,
             )
 
         # Stage 2 output shape (full resolution)
@@ -3669,6 +3729,7 @@ def generate_svi_multi_clip(
     overlap_frames: int = 1,
     prompts: list[str] | None = None,
     initial_motion_latent: torch.Tensor | None = None,
+    latent_norm_fn: Callable | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """
     Generate multi-clip streaming video using SVI Pro approach.
@@ -3805,6 +3866,8 @@ def generate_svi_multi_clip(
                 estimate_depth=args.estimate_depth,
                 depth_strength=args.depth_strength,
                 depth_stage2=args.depth_stage2,
+                # Latent normalization
+                latent_norm_fn=latent_norm_fn,
             )
 
             # Collect video frames from iterator - move to CPU immediately to save GPU memory
@@ -3916,6 +3979,7 @@ def generate_svi_video_extension(
     anchor_image_path: str | None = None,
     prepend_original: bool = True,
     prompts: list[str] | None = None,
+    latent_norm_fn: Callable | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """
     Extend an existing video using SVI Pro approach.
@@ -4066,6 +4130,7 @@ def generate_svi_video_extension(
             overlap_frames=overlap_frames,
             prompts=prompts,
             initial_motion_latent=initial_motion_latent,
+            latent_norm_fn=latent_norm_fn,
         )
 
         # Restore args
@@ -4121,6 +4186,7 @@ def generate_av_extension(
     terminal: float = 0.1,
     slope_len: int = 3,
     skip_stage2: bool = False,
+    latent_norm_fn: Callable | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """
     Extend a video using time-based audio-video masking.
@@ -4806,6 +4872,7 @@ def generate_av_extension(
         audio_state=audio_state,
         stepper=stepper,
         denoise_fn=denoise_fn,
+        latent_norm_fn=latent_norm_fn,
     )
 
     # =========================================================================
@@ -5113,6 +5180,7 @@ def generate_av_extension(
                 audio_state=audio_state,
                 stepper=stepper,
                 denoise_fn=stage2_denoise_fn,
+                latent_norm_fn=latent_norm_fn,
             )
 
         # 9H: Run stage 2 denoising WITH PRESERVATION MASK
@@ -5181,6 +5249,7 @@ def generate_av_extension(
             audio_state=stage2_audio_state,
             stepper=stepper,
             denoise_fn=stage2_denoise_fn,
+            latent_norm_fn=latent_norm_fn,
         )
 
         # Unpatchify results
@@ -5635,6 +5704,7 @@ def sliding_window_generate(
     overlap: int = 9,
     overlap_noise: float = 0.0,
     color_correction_strength: float = 0.0,
+    latent_norm_fn: Callable | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """
     Generate long videos using sliding window approach.
@@ -5781,6 +5851,8 @@ def sliding_window_generate(
             estimate_depth=args.estimate_depth,
             depth_strength=args.depth_strength,
             depth_stage2=args.depth_stage2,
+            # Latent normalization
+            latent_norm_fn=latent_norm_fn,
         )
 
         # Collect video frames from iterator - move to CPU immediately to save GPU memory
@@ -6014,6 +6086,36 @@ def main():
     # Set up tiling config for VAE
     tiling_config = TilingConfig.default()
 
+    # Create latent normalization function from args (fixes overbaking/audio clipping)
+    latent_norm_fn = None
+    if args.latent_norm != "none":
+        apply_to_video = not args.latent_norm_audio_only
+        apply_to_audio = not args.latent_norm_video_only
+        if args.latent_norm == "stat":
+            latent_norm_fn = create_per_step_stat_norm_fn(
+                factors=args.latent_norm_factors,
+                target_mean=args.latent_norm_target_mean,
+                target_std=args.latent_norm_target_std,
+                percentile=args.latent_norm_percentile,
+                clip_outliers=args.latent_norm_clip_outliers,
+                apply_to_video=apply_to_video,
+                apply_to_audio=apply_to_audio,
+            )
+            print(f">>> Latent normalization: statistical (factors: {args.latent_norm_factors})")
+        elif args.latent_norm == "adain":
+            # For AdaIN, we need a reference latent - this would require encoding a reference image/video
+            # For now, fall back to stat norm if adain is requested without reference
+            print(">>> Warning: AdaIN normalization requires reference latent, falling back to statistical norm")
+            latent_norm_fn = create_per_step_stat_norm_fn(
+                factors=args.latent_norm_factors,
+                target_mean=args.latent_norm_target_mean,
+                target_std=args.latent_norm_target_std,
+                percentile=args.latent_norm_percentile,
+                clip_outliers=args.latent_norm_clip_outliers,
+                apply_to_video=apply_to_video,
+                apply_to_audio=apply_to_audio,
+            )
+
     # Determine if sliding window mode should be used (requires explicit flag)
     use_sliding_window = (
         args.enable_sliding_window
@@ -6041,6 +6143,7 @@ def main():
             overlap=args.sliding_window_overlap,
             overlap_noise=args.sliding_window_overlap_noise,
             color_correction_strength=args.sliding_window_color_correction,
+            latent_norm_fn=latent_norm_fn,
         )
 
         # Convert to iterator for encode_video
@@ -6067,6 +6170,7 @@ def main():
             terminal=args.av_extend_terminal,
             slope_len=args.av_slope_len,
             skip_stage2=args.av_no_stage2,
+            latent_norm_fn=latent_norm_fn,
         )
 
         # Convert to iterator for encode_video
@@ -6106,6 +6210,7 @@ def main():
                 anchor_image_path=args.anchor_image,
                 prepend_original=args.prepend_original,
                 prompts=prompts,
+                latent_norm_fn=latent_norm_fn,
             )
         else:
             # Multi-clip generation mode
@@ -6122,6 +6227,7 @@ def main():
                 seed_multiplier=args.seed_multiplier,
                 overlap_frames=args.overlap_frames,
                 prompts=prompts,
+                latent_norm_fn=latent_norm_fn,
             )
 
         # SVI returns a decoded tensor [F, H, W, C], convert to iterator format for encode_video
@@ -6198,6 +6304,8 @@ def main():
             estimate_depth=args.estimate_depth,
             depth_strength=args.depth_strength,
             depth_stage2=args.depth_stage2,
+            # Latent normalization (fixes overbaking/audio clipping)
+            latent_norm_fn=latent_norm_fn,
         )
 
     # Encode and save video
