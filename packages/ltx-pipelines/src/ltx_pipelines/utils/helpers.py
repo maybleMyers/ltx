@@ -744,9 +744,10 @@ def statistical_normalize(
                 original_shape = channel_data.shape
                 channel_flat = channel_data.flatten()
 
-                # Calculate percentiles
-                lower_bound = torch.quantile(channel_flat, lower_percentile / 100)
-                upper_bound = torch.quantile(channel_flat, upper_percentile / 100)
+                # Calculate percentiles (quantile requires float32/float64)
+                channel_flat_f32 = channel_flat.float()
+                lower_bound = torch.quantile(channel_flat_f32, lower_percentile / 100).to(channel_flat.dtype)
+                upper_bound = torch.quantile(channel_flat_f32, upper_percentile / 100).to(channel_flat.dtype)
 
                 # Create mask for values within percentile range
                 mask = (channel_flat >= lower_bound) & (channel_flat <= upper_bound)
@@ -793,8 +794,10 @@ def statistical_normalize(
                 channel_data = t[i, c]
                 channel_flat = channel_data.flatten()
 
-                lower_bound = torch.quantile(channel_flat, lower_percentile / 100)
-                upper_bound = torch.quantile(channel_flat, upper_percentile / 100)
+                # Calculate percentiles (quantile requires float32/float64)
+                channel_flat_f32 = channel_flat.float()
+                lower_bound = torch.quantile(channel_flat_f32, lower_percentile / 100).to(channel_flat.dtype)
+                upper_bound = torch.quantile(channel_flat_f32, upper_percentile / 100).to(channel_flat.dtype)
 
                 mask = (channel_flat >= lower_bound) & (channel_flat <= upper_bound)
 
