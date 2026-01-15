@@ -605,14 +605,9 @@ def generate_enhanced_prompt(
 
 
 def assert_resolution(height: int, width: int, is_two_stage: bool) -> None:
-    """Assert that the resolution is divisible by the required divisor.
-    For two-stage pipelines, the resolution must be divisible by 64.
-    For one-stage pipelines, the resolution must be divisible by 32.
-    """
-    divisor = 64 if is_two_stage else 32
-    if height % divisor != 0 or width % divisor != 0:
+    """Assert that the resolution is divisible by 32."""
+    if height % 32 != 0 or width % 32 != 0:
         raise ValueError(
-            f"Resolution ({height}x{width}) is not divisible by {divisor}. "
-            f"For {'two-stage' if is_two_stage else 'one-stage'} pipelines, "
-            f"height and width must be multiples of {divisor}."
+            f"Resolution ({height}x{width}) is not divisible by 32. "
+            f"Height and width must be multiples of 32."
         )

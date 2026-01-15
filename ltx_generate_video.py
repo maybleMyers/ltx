@@ -1231,13 +1231,13 @@ Examples:
         "--width",
         type=int,
         default=DEFAULT_WIDTH,
-        help=f"Video width in pixels, must be divisible by 64 (default: {DEFAULT_WIDTH}).",
+        help=f"Video width in pixels, must be divisible by 32 (default: {DEFAULT_WIDTH}).",
     )
     gen_group.add_argument(
         "--height",
         type=int,
         default=DEFAULT_HEIGHT,
-        help=f"Video height in pixels, must be divisible by 64 (default: {DEFAULT_HEIGHT}).",
+        help=f"Video height in pixels, must be divisible by 32 (default: {DEFAULT_HEIGHT}).",
     )
     gen_group.add_argument(
         "--num-frames",
@@ -4236,9 +4236,9 @@ def generate_av_extension(
         stage1_width = out_width
         stage1_height = out_height
 
-    # Ensure dimensions are divisible by 64
-    stage1_width = (stage1_width // 64) * 64
-    stage1_height = (stage1_height // 64) * 64
+    # Ensure dimensions are divisible by 32
+    stage1_width = (stage1_width // 32) * 32
+    stage1_height = (stage1_height // 32) * 32
 
     # Load frames from input video
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -5081,7 +5081,7 @@ def generate_av_extension(
 
         # 9D: Create stage 2 output shape (2x upscaled from stage 1)
         # Note: Use actual upscaled dimensions, not args.height/width
-        # because stage1 dimensions may be rounded to be divisible by 64
+        # because stage1 dimensions may be rounded to be divisible by 32
         stage2_output_shape = VideoPixelShape(
             batch=1,
             frames=output_frames,
