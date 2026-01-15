@@ -343,18 +343,23 @@ def cfg_stg_denoising_func(
     """
     from ltx_core.model.transformer.modality import Modality
 
-    def modality_from_latent_state(state: LatentState, context: torch.Tensor, sigma: float) -> Modality:
+    def modality_from_latent_state(state: LatentState, context: torch.Tensor, sigma: float, clone_latent: bool = False) -> Modality:
         """Create a Modality object from a LatentState.
 
         Matches official LTX-2 code (validation_sampler.py:504) - no timestep clamping.
         Reference frames with denoise_mask=0 get timestep=0, which correctly signals
         to the attention mechanism that these are clean conditioning tokens.
+
+        Args:
+            clone_latent: If True, clone the latent tensor. Needed for multi-pass
+                denoising with block swap to avoid tensor corruption.
         """
         timesteps = sigma * state.denoise_mask
+        latent = state.latent.clone() if clone_latent else state.latent
 
         return Modality(
             enabled=True,
-            latent=state.latent,
+            latent=latent,
             timesteps=timesteps,
             positions=state.positions,
             context=context,
@@ -369,7 +374,21 @@ def cfg_stg_denoising_func(
     ) -> tuple[torch.Tensor, torch.Tensor]:
         sigma = sigmas[step_index]
 
-        # Create positive modalities
+        # Detect plain block swap (without activation offload) - need to clone latents
+        # to avoid tensor corruption across multiple forward passes
+        plain_block_swap = (
+            getattr(transformer, '_block_swap_offloader', None) is not None and
+            not hasattr(transformer, '_activation_offload_verbose')
+        )
+        # Also check the velocity_model for X0Model wrapper
+        if not plain_block_swap and hasattr(transformer, 'velocity_model'):
+            vm = transformer.velocity_model
+            plain_block_swap = (
+                getattr(vm, '_block_swap_offloader', None) is not None and
+                not hasattr(vm, '_activation_offload_verbose')
+            )
+
+        # Create positive modalities (first pass - no clone needed)
         pos_video = modality_from_latent_state(video_state, v_context_p, sigma)
         pos_audio = modality_from_latent_state(audio_state, a_context_p, sigma)
 
@@ -384,8 +403,9 @@ def cfg_stg_denoising_func(
         # Apply CFG if enabled - MASK delta to generated regions only
         # This prevents artifacts from preserved frames (timesteps=0) bleeding into generation
         if cfg_guider.enabled() and v_context_n is not None:
-            neg_video = modality_from_latent_state(video_state, v_context_n, sigma)
-            neg_audio = modality_from_latent_state(audio_state, a_context_n, sigma)
+            # Clone latent for second pass with block swap to avoid tensor corruption
+            neg_video = modality_from_latent_state(video_state, v_context_n, sigma, clone_latent=plain_block_swap)
+            neg_audio = modality_from_latent_state(audio_state, a_context_n, sigma, clone_latent=plain_block_swap)
 
             neg_denoised_video, neg_denoised_audio = transformer(
                 video=neg_video, audio=neg_audio, perturbations=None
@@ -416,8 +436,11 @@ def cfg_stg_denoising_func(
 
         # Apply STG if enabled - also without masking to match source
         if stg_guider.enabled() and stg_perturbation_config is not None:
+            # Clone latent for third pass with block swap to avoid tensor corruption
+            stg_video = modality_from_latent_state(video_state, v_context_p, sigma, clone_latent=plain_block_swap)
+            stg_audio = modality_from_latent_state(audio_state, a_context_p, sigma, clone_latent=plain_block_swap)
             perturbed_video, perturbed_audio = transformer(
-                video=pos_video, audio=pos_audio, perturbations=stg_perturbation_config
+                video=stg_video, audio=stg_audio, perturbations=stg_perturbation_config
             )
 
             stg_delta_video = stg_guider.delta(pos_denoised_video, perturbed_video)
