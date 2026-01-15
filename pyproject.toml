@@ -46,6 +46,7 @@ dependencies = [
     "tensorboard>=2.14.0",
     "imageio-ffmpeg>=0.5.1",
     "torchvision",
+    "loguru",
 ]
 
 [tool.uv.sources]
