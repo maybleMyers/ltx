@@ -345,6 +345,27 @@ def get_video_info(video_path: str) -> dict:
         return {}
 
 
+def update_depth_control_status(video_path: str, image_path: str) -> str:
+    """Get status info for depth control video or image."""
+    if video_path and os.path.exists(video_path):
+        info = get_video_info(video_path)
+        if info:
+            w = info.get("width", 0)
+            h = info.get("height", 0)
+            fps = info.get("fps", 0)
+            frames = info.get("total_frames", 0)
+            return f"Video: {w}x{h} | {fps:.2f} FPS | {frames} frames"
+        return "Video: Unable to read info"
+    elif image_path and os.path.exists(image_path):
+        try:
+            img = Image.open(image_path)
+            w, h = img.size
+            return f"Image: {w}x{h} | N/A FPS | 1 frame"
+        except Exception:
+            return "Image: Unable to read info"
+    return "No depth map loaded"
+
+
 def update_video_dimensions(video_path):
     """Update dimensions and frame count when video is uploaded."""
     if video_path is None:
@@ -2045,6 +2066,11 @@ def create_interface():
                                     value=False,
                                     info="Also apply depth to refinement stage"
                                 )
+                            depth_control_status = gr.Textbox(
+                                label="Depth Map Info",
+                                value="No depth map loaded",
+                                interactive=False
+                            )
 
                         # Audio Conditioning
                         with gr.Accordion("Audio Conditioning", open=False):
@@ -3593,31 +3619,48 @@ Audio is synchronized with the video extension.
         def send_depth_to_generation(img_path, vid_path):
             """Send generated depth map to the Generation tab's depth control section."""
             if vid_path:
+                status_info = update_depth_control_status(vid_path, None)
                 return (
                     gr.Tabs(selected="gen_tab"),
                     gr.update(value=vid_path),  # depth_control_video
                     gr.update(value=None),      # depth_control_image
-                    "Depth video sent to Generation tab"
+                    "Depth video sent to Generation tab",
+                    status_info
                 )
             elif img_path:
+                status_info = update_depth_control_status(None, img_path)
                 return (
                     gr.Tabs(selected="gen_tab"),
                     gr.update(value=None),      # depth_control_video
                     gr.update(value=img_path),  # depth_control_image
-                    "Depth image sent to Generation tab"
+                    "Depth image sent to Generation tab",
+                    status_info
                 )
             else:
                 return (
                     gr.update(),
                     gr.update(),
                     gr.update(),
-                    "No depth map to send - generate one first"
+                    "No depth map to send - generate one first",
+                    gr.update()
                 )
 
         depth_send_to_gen_btn.click(
             fn=send_depth_to_generation,
             inputs=[depth_output_image, depth_output_video],
-            outputs=[tabs, depth_control_video, depth_control_image, depth_status]
+            outputs=[tabs, depth_control_video, depth_control_image, depth_status, depth_control_status]
+        )
+
+        # Depth control status updates
+        depth_control_video.change(
+            fn=update_depth_control_status,
+            inputs=[depth_control_video, depth_control_image],
+            outputs=[depth_control_status]
+        )
+        depth_control_image.change(
+            fn=update_depth_control_status,
+            inputs=[depth_control_video, depth_control_image],
+            outputs=[depth_control_status]
         )
 
         # =================================================================
