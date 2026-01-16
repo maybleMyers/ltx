@@ -178,6 +178,7 @@ def euler_denoising_loop(
     frozen_video_latent: torch.Tensor | None = None,
     freeze_mask: torch.Tensor | None = None,
     freeze_transition_steps: int = 4,
+    latent_norm_fn: callable = None,
 ) -> tuple[LatentState, LatentState]:
     """
     Perform the joint audio-video denoising loop over a diffusion schedule.
@@ -223,6 +224,12 @@ def euler_denoising_loop(
         Used with frozen_video_latent for selective frame injection.
     freeze_transition_steps:
         Number of steps for blending transition at freeze boundary.
+    latent_norm_fn:
+        Optional normalization function applied after each denoising step.
+        Signature: fn(video_latent, audio_latent, step_idx) -> (video_latent, audio_latent)
+        Use create_per_step_stat_norm_fn() or create_per_step_adain_norm_fn() to create.
+        This helps fix overbaking and audio clipping by keeping latent statistics
+        within expected bounds during denoising.
     ### Returns
     tuple[LatentState, LatentState]
         A pair ``(video_state, audio_state)`` containing the final video and
@@ -244,6 +251,10 @@ def euler_denoising_loop(
             video_state = replace(video_state, denoise_mask=adjusted_video_mask)
 
         denoised_video, denoised_audio = denoise_fn(video_state, audio_state, sigmas, step_idx)
+
+        # Apply latent normalization if enabled (fixes overbaking/audio clipping)
+        if latent_norm_fn is not None:
+            denoised_video, denoised_audio = latent_norm_fn(denoised_video, denoised_audio, step_idx)
 
         # Apply frame freezing if enabled
         if frozen_video_latent is not None and freeze_mask is not None:
@@ -278,6 +289,7 @@ def gradient_estimating_euler_denoising_loop(
     denoise_fn: DenoisingFunc,
     ge_gamma: float = 2.0,
     anchor_decay: str | None = None,
+    latent_norm_fn: callable = None,
 ) -> tuple[LatentState, LatentState]:
     """
     Perform the joint audio-video denoising loop using gradient-estimation sampling.
@@ -293,6 +305,8 @@ def gradient_estimating_euler_denoising_loop(
         See :func:`euler_denoising_loop` for parameter descriptions.
     anchor_decay:
         Optional decay schedule for anchor constraints. See :func:`euler_denoising_loop`.
+    latent_norm_fn:
+        Optional normalization function. See :func:`euler_denoising_loop`.
     ### Returns
     tuple[LatentState, LatentState]
         See :func:`euler_denoising_loop` for return value description.
@@ -324,6 +338,10 @@ def gradient_estimating_euler_denoising_loop(
             video_state = replace(video_state, denoise_mask=adjusted_video_mask)
 
         denoised_video, denoised_audio = denoise_fn(video_state, audio_state, sigmas, step_idx)
+
+        # Apply latent normalization if enabled (fixes overbaking/audio clipping)
+        if latent_norm_fn is not None:
+            denoised_video, denoised_audio = latent_norm_fn(denoised_video, denoised_audio, step_idx)
 
         denoised_video = post_process_latent(denoised_video, video_state.denoise_mask, video_state.clean_latent)
         denoised_audio = post_process_latent(denoised_audio, audio_state.denoise_mask, audio_state.clean_latent)
@@ -605,14 +623,337 @@ def generate_enhanced_prompt(
 
 
 def assert_resolution(height: int, width: int, is_two_stage: bool) -> None:
-    """Assert that the resolution is divisible by the required divisor.
-    For two-stage pipelines, the resolution must be divisible by 64.
-    For one-stage pipelines, the resolution must be divisible by 32.
-    """
-    divisor = 64 if is_two_stage else 32
-    if height % divisor != 0 or width % divisor != 0:
+    """Assert that the resolution is divisible by 32."""
+    if height % 32 != 0 or width % 32 != 0:
         raise ValueError(
-            f"Resolution ({height}x{width}) is not divisible by {divisor}. "
-            f"For {'two-stage' if is_two_stage else 'one-stage'} pipelines, "
-            f"height and width must be multiples of {divisor}."
+            f"Resolution ({height}x{width}) is not divisible by 32. "
+            f"Height and width must be multiples of 32."
         )
+
+
+# =============================================================================
+# Latent Normalization Functions
+# =============================================================================
+# Ported from ComfyUI-LTXVideo/latent_norm.py
+# These functions help fix overbaking and audio clipping issues by normalizing
+# latent values during the denoising process.
+
+
+def adain_normalize(
+    latent: torch.Tensor,
+    reference: torch.Tensor,
+    factor: float = 1.0,
+    per_frame: bool = False,
+) -> torch.Tensor:
+    """
+    Adaptive Instance Normalization (AdaIN) for latents.
+
+    Normalizes the input latent to match the mean and standard deviation
+    of a reference latent. This helps prevent overbaking by keeping latent
+    statistics within expected bounds.
+
+    Args:
+        latent: Input latent tensor [B, C, F, H, W] or [B, C, T] for audio
+        reference: Reference latent tensor with target statistics
+        factor: Blending factor (0=original, 1=fully normalized)
+        per_frame: If True, normalize each frame independently
+
+    Returns:
+        Normalized latent tensor
+    """
+    if factor == 0.0:
+        return latent
+
+    t = latent.clone()
+    ndim = t.ndim
+
+    # Handle both video [B, C, F, H, W] and audio [B, C, T] latents
+    if ndim == 5:  # Video: B x C x F x H x W
+        if per_frame:
+            if reference.size(2) == 1:
+                # Broadcast single reference frame to all frames
+                reference = reference.repeat(1, 1, t.size(2), 1, 1)
+            elif t.size(2) > reference.size(2):
+                raise ValueError("Latent has more frames than reference")
+
+        for i in range(t.size(0)):  # batch
+            for c in range(t.size(1)):  # channel
+                if not per_frame:
+                    r_sd, r_mean = torch.std_mean(reference[i, c], dim=None)
+                    i_sd, i_mean = torch.std_mean(t[i, c], dim=None)
+                    if i_sd > 1e-8:
+                        t[i, c] = ((t[i, c] - i_mean) / i_sd) * r_sd + r_mean
+                else:
+                    for f in range(t.size(2)):  # frame
+                        r_sd, r_mean = torch.std_mean(reference[i, c, f], dim=None)
+                        i_sd, i_mean = torch.std_mean(t[i, c, f], dim=None)
+                        if i_sd > 1e-8:
+                            t[i, c, f] = ((t[i, c, f] - i_mean) / i_sd) * r_sd + r_mean
+
+    elif ndim == 3:  # Audio: B x C x T
+        for i in range(t.size(0)):  # batch
+            for c in range(t.size(1)):  # channel
+                r_sd, r_mean = torch.std_mean(reference[i, c], dim=None)
+                i_sd, i_mean = torch.std_mean(t[i, c], dim=None)
+                if i_sd > 1e-8:
+                    t[i, c] = ((t[i, c] - i_mean) / i_sd) * r_sd + r_mean
+
+    return torch.lerp(latent, t, factor)
+
+
+def statistical_normalize(
+    latent: torch.Tensor,
+    target_mean: float = 0.0,
+    target_std: float = 1.0,
+    percentile: float = 95.0,
+    factor: float = 1.0,
+    clip_outliers: bool = False,
+) -> torch.Tensor:
+    """
+    Statistical normalization with percentile-based filtering.
+
+    Normalizes latents to target mean and std values, using percentile
+    filtering to exclude outliers when calculating statistics. This helps
+    prevent audio clipping and video overbaking.
+
+    Args:
+        latent: Input latent tensor [B, C, F, H, W] or [B, C, T]
+        target_mean: Target mean value (default: 0.0)
+        target_std: Target standard deviation (default: 1.0)
+        percentile: Percentile range for statistics (default: 95.0)
+        factor: Blending factor (0=original, 1=fully normalized)
+        clip_outliers: If True, clip values outside percentile bounds
+
+    Returns:
+        Normalized latent tensor
+    """
+    if factor == 0.0:
+        return latent
+
+    t = latent.clone()
+    ndim = t.ndim
+
+    # For 95% of distribution, exclude 2.5% from each tail
+    lower_percentile = (100 - percentile) / 2
+    upper_percentile = 100 - lower_percentile
+
+    if ndim == 5:  # Video: B x C x F x H x W
+        for i in range(t.size(0)):  # batch
+            for c in range(t.size(1)):  # channel
+                channel_data = t[i, c]
+                original_shape = channel_data.shape
+                channel_flat = channel_data.flatten()
+
+                # Calculate percentiles (quantile requires float32/float64)
+                channel_flat_f32 = channel_flat.float()
+                lower_bound = torch.quantile(channel_flat_f32, lower_percentile / 100).to(channel_flat.dtype)
+                upper_bound = torch.quantile(channel_flat_f32, upper_percentile / 100).to(channel_flat.dtype)
+
+                # Create mask for values within percentile range
+                mask = (channel_flat >= lower_bound) & (channel_flat <= upper_bound)
+
+                if mask.sum() > 0:
+                    filtered_data = channel_flat[mask]
+                    current_mean = filtered_data.mean()
+                    current_std = filtered_data.std()
+
+                    if current_std > 1e-8:
+                        # Normalize all values
+                        normalized_flat = (
+                            (channel_flat - current_mean) / current_std
+                        ) * target_std + target_mean
+
+                        if clip_outliers:
+                            # Calculate normalized bounds
+                            normalized_lower = (
+                                (lower_bound - current_mean) / current_std
+                            ) * target_std + target_mean
+                            normalized_upper = (
+                                (upper_bound - current_mean) / current_std
+                            ) * target_std + target_mean
+
+                            # Clip outliers
+                            normalized_flat = torch.where(
+                                channel_flat < lower_bound,
+                                normalized_lower,
+                                normalized_flat,
+                            )
+                            normalized_flat = torch.where(
+                                channel_flat > upper_bound,
+                                normalized_upper,
+                                normalized_flat,
+                            )
+
+                        t[i, c] = normalized_flat.reshape(original_shape)
+                    else:
+                        t[i, c] = channel_data - current_mean + target_mean
+
+    elif ndim == 3:  # Audio: B x C x T
+        for i in range(t.size(0)):  # batch
+            for c in range(t.size(1)):  # channel
+                channel_data = t[i, c]
+                channel_flat = channel_data.flatten()
+
+                # Calculate percentiles (quantile requires float32/float64)
+                channel_flat_f32 = channel_flat.float()
+                lower_bound = torch.quantile(channel_flat_f32, lower_percentile / 100).to(channel_flat.dtype)
+                upper_bound = torch.quantile(channel_flat_f32, upper_percentile / 100).to(channel_flat.dtype)
+
+                mask = (channel_flat >= lower_bound) & (channel_flat <= upper_bound)
+
+                if mask.sum() > 0:
+                    filtered_data = channel_flat[mask]
+                    current_mean = filtered_data.mean()
+                    current_std = filtered_data.std()
+
+                    if current_std > 1e-8:
+                        normalized_flat = (
+                            (channel_flat - current_mean) / current_std
+                        ) * target_std + target_mean
+
+                        if clip_outliers:
+                            normalized_lower = (
+                                (lower_bound - current_mean) / current_std
+                            ) * target_std + target_mean
+                            normalized_upper = (
+                                (upper_bound - current_mean) / current_std
+                            ) * target_std + target_mean
+                            normalized_flat = torch.clamp(
+                                normalized_flat, normalized_lower, normalized_upper
+                            )
+
+                        t[i, c] = normalized_flat
+                    else:
+                        t[i, c] = channel_data - current_mean + target_mean
+
+    return torch.lerp(latent, t, factor)
+
+
+def create_per_step_stat_norm_fn(
+    factors: str | list[float],
+    target_mean: float = 0.0,
+    target_std: float = 1.0,
+    percentile: float = 95.0,
+    clip_outliers: bool = False,
+    apply_to_video: bool = True,
+    apply_to_audio: bool = True,
+):
+    """
+    Create a per-step statistical normalization function for use in the denoising loop.
+
+    This function returns a callable that normalizes latents after each denoising
+    step, with different strengths at different steps. This is the recommended
+    approach for fixing overbaking/clipping - apply stronger normalization early
+    in the denoising process and reduce it later.
+
+    Args:
+        factors: Comma-separated string or list of factors for each step.
+                 e.g., "0.9,0.75,0.5,0.25,0.0" applies 0.9 at step 0, etc.
+                 The last factor is used for all remaining steps.
+        target_mean: Target mean for normalization (default: 0.0)
+        target_std: Target std for normalization (default: 1.0)
+        percentile: Percentile for outlier filtering (default: 95.0)
+        clip_outliers: Whether to clip outliers (default: False)
+        apply_to_video: Apply normalization to video latents (default: True)
+        apply_to_audio: Apply normalization to audio latents (default: True)
+
+    Returns:
+        A function with signature:
+        fn(video_latent, audio_latent, step_idx) -> (video_latent, audio_latent)
+    """
+    if isinstance(factors, str):
+        factor_list = [float(x.strip()) for x in factors.split(",")]
+    else:
+        factor_list = list(factors)
+
+    def norm_fn(
+        video_latent: torch.Tensor,
+        audio_latent: torch.Tensor,
+        step_idx: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        factor = factor_list[min(step_idx, len(factor_list) - 1)]
+
+        if factor == 0.0:
+            return video_latent, audio_latent
+
+        if apply_to_video:
+            video_latent = statistical_normalize(
+                video_latent,
+                target_mean=target_mean,
+                target_std=target_std,
+                percentile=percentile,
+                factor=factor,
+                clip_outliers=clip_outliers,
+            )
+
+        if apply_to_audio:
+            audio_latent = statistical_normalize(
+                audio_latent,
+                target_mean=target_mean,
+                target_std=target_std,
+                percentile=percentile,
+                factor=factor,
+                clip_outliers=clip_outliers,
+            )
+
+        return video_latent, audio_latent
+
+    return norm_fn
+
+
+def create_per_step_adain_norm_fn(
+    factors: str | list[float],
+    reference_video: torch.Tensor | None = None,
+    reference_audio: torch.Tensor | None = None,
+    per_frame: bool = False,
+):
+    """
+    Create a per-step AdaIN normalization function for use in the denoising loop.
+
+    This uses a reference latent to guide the statistics of the generated latent.
+    Useful when you have a "known good" latent to match against.
+
+    Args:
+        factors: Comma-separated string or list of factors for each step.
+        reference_video: Reference video latent for AdaIN (optional)
+        reference_audio: Reference audio latent for AdaIN (optional)
+        per_frame: Apply AdaIN per-frame for video (default: False)
+
+    Returns:
+        A function with signature:
+        fn(video_latent, audio_latent, step_idx) -> (video_latent, audio_latent)
+    """
+    if isinstance(factors, str):
+        factor_list = [float(x.strip()) for x in factors.split(",")]
+    else:
+        factor_list = list(factors)
+
+    def norm_fn(
+        video_latent: torch.Tensor,
+        audio_latent: torch.Tensor,
+        step_idx: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        factor = factor_list[min(step_idx, len(factor_list) - 1)]
+
+        if factor == 0.0:
+            return video_latent, audio_latent
+
+        if reference_video is not None:
+            video_latent = adain_normalize(
+                video_latent,
+                reference_video,
+                factor=factor,
+                per_frame=per_frame,
+            )
+
+        if reference_audio is not None:
+            audio_latent = adain_normalize(
+                audio_latent,
+                reference_audio,
+                factor=factor,
+                per_frame=False,
+            )
+
+        return video_latent, audio_latent
+
+    return norm_fn

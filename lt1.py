@@ -221,11 +221,11 @@ def update_image_dimensions(image_path):
         img = Image.open(image_path)
         w, h = img.size
         original_dims_str = f"{w}x{h}"
-        # Calculate dimensions snapped to nearest multiple of 64 while maintaining aspect ratio
-        new_w = round(w / 64) * 64
-        new_h = round(h / 64) * 64
-        new_w = max(64, new_w)
-        new_h = max(64, new_h)
+        # Calculate dimensions snapped to nearest multiple of 32 while maintaining aspect ratio
+        new_w = round(w / 32) * 32
+        new_h = round(h / 32) * 32
+        new_w = max(32, new_w)
+        new_h = max(32, new_h)
         return original_dims_str, gr.update(value=new_w), gr.update(value=new_h)
     except Exception as e:
         print(f"Error reading image dimensions: {e}")
@@ -345,6 +345,27 @@ def get_video_info(video_path: str) -> dict:
         return {}
 
 
+def update_depth_control_status(video_path: str, image_path: str) -> str:
+    """Get status info for depth control video or image."""
+    if video_path and os.path.exists(video_path):
+        info = get_video_info(video_path)
+        if info:
+            w = info.get("width", 0)
+            h = info.get("height", 0)
+            fps = info.get("fps", 0)
+            frames = info.get("total_frames", 0)
+            return f"Video: {w}x{h} | {fps:.2f} FPS | {frames} frames"
+        return "Video: Unable to read info"
+    elif image_path and os.path.exists(image_path):
+        try:
+            img = Image.open(image_path)
+            w, h = img.size
+            return f"Image: {w}x{h} | N/A FPS | 1 frame"
+        except Exception:
+            return "Image: Unable to read info"
+    return "No depth map loaded"
+
+
 def update_video_dimensions(video_path):
     """Update dimensions and frame count when video is uploaded."""
     if video_path is None:
@@ -355,11 +376,11 @@ def update_video_dimensions(video_path):
             w, h = info.get("width", 0), info.get("height", 0)
             if w and h:
                 original_dims_str = f"{w}x{h}"
-                # Snap to nearest multiple of 64
-                new_w = round(w / 64) * 64
-                new_h = round(h / 64) * 64
-                new_w = max(64, new_w)
-                new_h = max(64, new_h)
+                # Snap to nearest multiple of 32
+                new_w = round(w / 32) * 32
+                new_h = round(h / 32) * 32
+                new_w = max(32, new_w)
+                new_h = max(32, new_h)
                 # Calculate frame count (snap to 8*K+1 format)
                 if info.get("total_frames"):
                     num_frames = info["total_frames"]
@@ -1002,6 +1023,15 @@ def generate_ltx_video(
     estimate_depth: bool,
     depth_strength: float,
     depth_stage2: bool,
+    # Latent Normalization (fixes overbaking and audio clipping)
+    latent_norm_mode: str,
+    latent_norm_factors: str,
+    latent_norm_target_mean: float,
+    latent_norm_target_std: float,
+    latent_norm_percentile: float,
+    latent_norm_clip_outliers: bool,
+    latent_norm_video_only: bool,
+    latent_norm_audio_only: bool,
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     """
     Generate video using LTX-2 pipeline.
@@ -1164,6 +1194,20 @@ def generate_ltx_video(
             command.extend(["--depth-strength", str(float(depth_strength))])
             if depth_stage2:
                 command.append("--depth-stage2")
+
+        # Latent Normalization (fixes overbaking and audio clipping)
+        if latent_norm_mode and latent_norm_mode != "none":
+            command.extend(["--latent-norm", str(latent_norm_mode)])
+            command.extend(["--latent-norm-factors", str(latent_norm_factors)])
+            command.extend(["--latent-norm-target-mean", str(float(latent_norm_target_mean))])
+            command.extend(["--latent-norm-target-std", str(float(latent_norm_target_std))])
+            command.extend(["--latent-norm-percentile", str(float(latent_norm_percentile))])
+            if latent_norm_clip_outliers:
+                command.append("--latent-norm-clip-outliers")
+            if latent_norm_video_only:
+                command.append("--latent-norm-video-only")
+            if latent_norm_audio_only:
+                command.append("--latent-norm-audio-only")
 
         # User LoRAs - apply to selected stage(s)
         lora_configs = [
@@ -2045,6 +2089,11 @@ def create_interface():
                                     value=False,
                                     info="Also apply depth to refinement stage"
                                 )
+                            depth_control_status = gr.Textbox(
+                                label="Depth Map Info",
+                                value="No depth map loaded",
+                                interactive=False
+                            )
 
                         # Audio Conditioning
                         with gr.Accordion("Audio Conditioning", open=False):
@@ -2341,6 +2390,56 @@ Audio is synchronized with the video extension.
                                 lt1_save_defaults_btn = gr.Button("Save Defaults")
                                 lt1_load_defaults_btn = gr.Button("Load Defaults")
                             lt1_defaults_status = gr.Textbox(label="Defaults Status", interactive=False, visible=False)
+                        # Latent Normalization (fixes overbaking and audio clipping)
+                        with gr.Accordion("Latent Normalization", open=False):
+                            gr.Markdown("""
+                            **Fixes overbaking and audio clipping** by normalizing latent values during denoising.
+                            Apply stronger normalization early (high factors) and reduce later (low factors).
+                            """)
+                            latent_norm_mode = gr.Dropdown(
+                                label="Normalization Mode",
+                                choices=["none", "stat"],
+                                value="none",
+                                info="'none' = disabled, 'stat' = statistical normalization"
+                            )
+                            latent_norm_factors = gr.Textbox(
+                                label="Per-Step Factors",
+                                value="0.9,0.75,0.5,0.25,0.0",
+                                info="Comma-separated factors for each step (higher = stronger normalization)"
+                            )
+                            with gr.Row():
+                                latent_norm_target_mean = gr.Number(
+                                    label="Target Mean",
+                                    value=0.0,
+                                    info="Target mean for normalization"
+                                )
+                                latent_norm_target_std = gr.Number(
+                                    label="Target Std",
+                                    value=1.0,
+                                    info="Target standard deviation"
+                                )
+                            with gr.Row():
+                                latent_norm_percentile = gr.Slider(
+                                    minimum=50.0, maximum=100.0, value=95.0, step=1.0,
+                                    label="Percentile",
+                                    info="Percentile for outlier filtering (95 = ignore top/bottom 2.5%)"
+                                )
+                                latent_norm_clip_outliers = gr.Checkbox(
+                                    label="Clip Outliers",
+                                    value=False,
+                                    info="Hard clip values outside percentile bounds"
+                                )
+                            with gr.Row():
+                                latent_norm_video_only = gr.Checkbox(
+                                    label="Video Only",
+                                    value=False,
+                                    info="Apply to video latents only"
+                                )
+                                latent_norm_audio_only = gr.Checkbox(
+                                    label="Audio Only",
+                                    value=False,
+                                    info="Apply to audio latents only"
+                                )
 
             # =================================================================
             # Video Info Tab
@@ -2662,8 +2761,8 @@ Audio is synchronized with the video extension.
                         with gr.Accordion("Resolution (Optional)", open=False):
                             gr.Markdown("Leave at 0 to keep original resolution")
                             with gr.Row():
-                                depth_width = gr.Number(label="Width", value=0, minimum=0, step=64)
-                                depth_height = gr.Number(label="Height", value=0, minimum=0, step=64)
+                                depth_width = gr.Number(label="Width", value=0, minimum=0, step=32)
+                                depth_height = gr.Number(label="Height", value=0, minimum=0, step=32)
 
                         # Generate Button
                         with gr.Row():
@@ -2967,6 +3066,11 @@ Audio is synchronized with the video extension.
                 # Depth Control (IC-LoRA)
                 depth_control_video, depth_control_image, estimate_depth,
                 depth_strength, depth_stage2,
+                # Latent Normalization
+                latent_norm_mode, latent_norm_factors,
+                latent_norm_target_mean, latent_norm_target_std,
+                latent_norm_percentile, latent_norm_clip_outliers,
+                latent_norm_video_only, latent_norm_audio_only,
             ],
             outputs=[output_gallery, preview_gallery, status_text, progress_text]
         )
@@ -3203,9 +3307,9 @@ Audio is synchronized with the video extension.
                 h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                 fps = cap.get(cv2.CAP_PROP_FPS)
                 cap.release()
-                # Round to nearest 64
-                w = round(w / 64) * 64
-                h = round(h / 64) * 64
+                # Round to nearest 32
+                w = round(w / 32) * 32
+                h = round(h / 32) * 32
                 fps = max(1, int(round(fps)))
                 return f"{w}x{h}", gr.update(value=w), gr.update(value=h), gr.update(), gr.update(value=fps)
             except Exception:
@@ -3593,31 +3697,48 @@ Audio is synchronized with the video extension.
         def send_depth_to_generation(img_path, vid_path):
             """Send generated depth map to the Generation tab's depth control section."""
             if vid_path:
+                status_info = update_depth_control_status(vid_path, None)
                 return (
                     gr.Tabs(selected="gen_tab"),
                     gr.update(value=vid_path),  # depth_control_video
                     gr.update(value=None),      # depth_control_image
-                    "Depth video sent to Generation tab"
+                    "Depth video sent to Generation tab",
+                    status_info
                 )
             elif img_path:
+                status_info = update_depth_control_status(None, img_path)
                 return (
                     gr.Tabs(selected="gen_tab"),
                     gr.update(value=None),      # depth_control_video
                     gr.update(value=img_path),  # depth_control_image
-                    "Depth image sent to Generation tab"
+                    "Depth image sent to Generation tab",
+                    status_info
                 )
             else:
                 return (
                     gr.update(),
                     gr.update(),
                     gr.update(),
-                    "No depth map to send - generate one first"
+                    "No depth map to send - generate one first",
+                    gr.update()
                 )
 
         depth_send_to_gen_btn.click(
             fn=send_depth_to_generation,
             inputs=[depth_output_image, depth_output_video],
-            outputs=[tabs, depth_control_video, depth_control_image, depth_status]
+            outputs=[tabs, depth_control_video, depth_control_image, depth_status, depth_control_status]
+        )
+
+        # Depth control status updates
+        depth_control_video.change(
+            fn=update_depth_control_status,
+            inputs=[depth_control_video, depth_control_image],
+            outputs=[depth_control_status]
+        )
+        depth_control_image.change(
+            fn=update_depth_control_status,
+            inputs=[depth_control_video, depth_control_image],
+            outputs=[depth_control_status]
         )
 
         # =================================================================
