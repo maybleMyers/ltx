@@ -1032,6 +1032,8 @@ def generate_ltx_video(
     latent_norm_clip_outliers: bool,
     latent_norm_video_only: bool,
     latent_norm_audio_only: bool,
+    # V2A Mode (Video-to-Audio)
+    v2a_mode: bool,
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     """
     Generate video using LTX-2 pipeline.
@@ -1208,6 +1210,10 @@ def generate_ltx_video(
                 command.append("--latent-norm-video-only")
             if latent_norm_audio_only:
                 command.append("--latent-norm-audio-only")
+
+        # V2A Mode (Video-to-Audio)
+        if v2a_mode:
+            command.append("--v2a-mode")
 
         # User LoRAs - apply to selected stage(s)
         lora_configs = [
@@ -2441,6 +2447,19 @@ Audio is synchronized with the video extension.
                                     info="Apply to audio latents only"
                                 )
 
+                        # V2A Mode (Video-to-Audio)
+                        with gr.Accordion("V2A Mode (Video-to-Audio)", open=False):
+                            gr.Markdown("""
+                            **Generate audio for an existing silent video.**
+                            The video frames are frozen and only audio is generated based on video content.
+                            Upload your video in the **Video Input (V2V / Refine)** section above.
+                            """)
+                            v2a_mode = gr.Checkbox(
+                                label="Enable V2A Mode",
+                                value=False,
+                                info="Freeze video, generate audio only (requires input video)"
+                            )
+
             # =================================================================
             # Video Info Tab
             # =================================================================
@@ -3071,6 +3090,8 @@ Audio is synchronized with the video extension.
                 latent_norm_target_mean, latent_norm_target_std,
                 latent_norm_percentile, latent_norm_clip_outliers,
                 latent_norm_video_only, latent_norm_audio_only,
+                # V2A Mode
+                v2a_mode,
             ],
             outputs=[output_gallery, preview_gallery, status_text, progress_text]
         )
@@ -3359,6 +3380,8 @@ Audio is synchronized with the video extension.
             save_path, batch_size,
             # Scale slider
             scale_slider,
+            # V2A Mode
+            v2a_mode,
         ]
 
         lt1_ui_default_keys = [
@@ -3396,6 +3419,8 @@ Audio is synchronized with the video extension.
             "save_path", "batch_size",
             # Scale slider
             "scale_slider",
+            # V2A Mode
+            "v2a_mode",
         ]
 
         def save_lt1_defaults(*values):

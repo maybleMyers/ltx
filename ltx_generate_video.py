@@ -1532,6 +1532,17 @@ Examples:
     )
 
     # ==========================================================================
+    # V2A Mode (Video-to-Audio)
+    # ==========================================================================
+    v2a_group = parser.add_argument_group("V2A Mode (Video-to-Audio)")
+    v2a_group.add_argument(
+        "--v2a-mode",
+        action="store_true",
+        help="Video-to-Audio mode: preserve input video exactly and generate new audio. "
+             "Requires --input-video.",
+    )
+
+    # ==========================================================================
     # SVI Pro (Multi-Clip) Mode
     # ==========================================================================
     svi_group = parser.add_argument_group("SVI Pro (Multi-Clip) Mode")
@@ -2338,6 +2349,8 @@ class LTXVideoGeneratorWithOffloading:
         depth_stage2: bool = False,
         # Latent normalization (fixes overbaking/audio clipping)
         latent_norm_fn: Callable | None = None,
+        # V2A mode (video-to-audio: freeze video, generate audio)
+        v2a_mode: bool = False,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor | None, str | None]:
         """
         Generate video with optional audio.
@@ -2934,6 +2947,54 @@ class LTXVideoGeneratorWithOffloading:
                 else:
                     v2v_audio_latent = None
 
+            # V2A Mode: Freeze entire video, generate fresh audio
+            if v2a_mode and input_video:
+                from ltx_core.conditioning import VideoConditionByLatentIndex
+                print(f">>> V2A Mode: Encoding input video (video will be frozen)...")
+                v2a_start = time.time()
+
+                # Load input video at stage 1 resolution
+                video_tensor = load_video_conditioning(
+                    video_path=input_video,
+                    height=stage_1_output_shape.height,
+                    width=stage_1_output_shape.width,
+                    frame_cap=num_frames,
+                    dtype=dtype,
+                    device=torch.device("cpu"),
+                )
+
+                actual_frames = video_tensor.shape[2]
+                latent_stride = 8  # VAE temporal compression factor
+
+                # Encode each latent frame position (every 8th pixel frame)
+                for frame_idx in range(0, actual_frames, latent_stride):
+                    latent_idx = frame_idx // latent_stride
+                    frame = video_tensor[:, :, frame_idx:frame_idx+1, :, :].to(device=self.device, dtype=dtype)
+
+                    with torch.no_grad():
+                        encoded_frame = video_encoder(frame)
+
+                    # strength=1.0 → denoise_mask=0 (frozen)
+                    stage_1_conditionings.append(
+                        VideoConditionByLatentIndex(
+                            latent=encoded_frame.cpu(),
+                            strength=1.0,
+                            latent_idx=latent_idx,
+                        )
+                    )
+                    del frame, encoded_frame
+                    torch.cuda.empty_cache()
+
+                del video_tensor
+                cleanup_memory()
+
+                num_latent_frames = (actual_frames - 1) // latent_stride + 1
+                print(f">>> V2A: {num_latent_frames} video frames frozen (stage 1) in {time.time() - v2a_start:.1f}s")
+
+                # Clear any V2V audio - we want fresh audio generation
+                v2v_audio_latent = None
+                print(">>> V2A: Audio will be generated fresh (not extracted from input)")
+
             # Depth Control: Add depth conditioning for IC-LoRA
             depth_tensor = None
             if depth_video or depth_image or estimate_depth:
@@ -3431,6 +3492,53 @@ class LTXVideoGeneratorWithOffloading:
 
         # Note: V2V video conditioning is NOT applied to stage 2 (matching ic_lora.py)
         # Stage 2 only refines the upscaled latent from stage 1 - video guidance already applied there
+
+        # V2A Mode: Add frozen video conditioning for stage 2
+        # Unlike V2V, V2A needs conditioning at stage 2 to keep video exactly frozen
+        if v2a_mode and input_video:
+            from ltx_core.conditioning import VideoConditionByLatentIndex
+            print(f">>> V2A Stage 2: Encoding video at full resolution...")
+            v2a_s2_start = time.time()
+
+            # Load video encoder for stage 2 if needed
+            if stage_2_video_encoder is None:
+                stage_2_video_encoder = self.stage_1_model_ledger.video_encoder()
+
+            # Load input video at stage 2 (full) resolution
+            video_tensor = load_video_conditioning(
+                video_path=input_video,
+                height=stage_2_output_shape.height,
+                width=stage_2_output_shape.width,
+                frame_cap=num_frames,
+                dtype=dtype,
+                device=torch.device("cpu"),
+            )
+
+            actual_frames = video_tensor.shape[2]
+            latent_stride = 8
+
+            for frame_idx in range(0, actual_frames, latent_stride):
+                latent_idx = frame_idx // latent_stride
+                frame = video_tensor[:, :, frame_idx:frame_idx+1, :, :].to(device=self.device, dtype=dtype)
+
+                with torch.no_grad():
+                    encoded_frame = stage_2_video_encoder(frame)
+
+                stage_2_conditionings.append(
+                    VideoConditionByLatentIndex(
+                        latent=encoded_frame.cpu(),
+                        strength=1.0,
+                        latent_idx=latent_idx,
+                    )
+                )
+                del frame, encoded_frame
+                torch.cuda.empty_cache()
+
+            del video_tensor
+            cleanup_memory()
+
+            num_latent_frames = (actual_frames - 1) // latent_stride + 1
+            print(f">>> V2A: {num_latent_frames} video frames frozen (stage 2) in {time.time() - v2a_s2_start:.1f}s")
 
         # SVI Pro: Add motion latent conditionings for stage 2
         if _motion_latent is not None and _num_motion_latent > 0:
@@ -5988,6 +6096,18 @@ def main():
     """Main entry point for LTX-2 video generation."""
     args = parse_args()
 
+    # V2A mode validation
+    if args.v2a_mode:
+        if not args.input_video:
+            print("Error: --v2a-mode requires --input-video")
+            sys.exit(1)
+        if args.disable_audio:
+            print(">>> Warning: --disable-audio is ignored in V2A mode")
+            args.disable_audio = False
+        if args.refine_only:
+            print("Error: --v2a-mode cannot be combined with --refine-only")
+            sys.exit(1)
+
     # Configure logging
     log_level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(level=log_level, format="%(message)s")
@@ -6044,6 +6164,10 @@ def main():
         if args.extend_video:
             print(f"  Input Video: {args.extend_video}")
             print(f"  Prepend Original: {args.prepend_original}")
+    # V2A mode info
+    if args.v2a_mode:
+        print(f"V2A Mode: Video-to-Audio (freeze video, generate audio)")
+        print(f"  Input Video: {args.input_video}")
     # AV Extension mode info
     if args.av_extend_from:
         print(f"AV Extension Mode: Time-Based Audio-Video Continuation")
@@ -6306,6 +6430,8 @@ def main():
             depth_stage2=args.depth_stage2,
             # Latent normalization (fixes overbaking/audio clipping)
             latent_norm_fn=latent_norm_fn,
+            # V2A mode (freeze video, generate audio)
+            v2a_mode=args.v2a_mode,
         )
 
     # Encode and save video
