@@ -6409,7 +6409,7 @@ def generate_v2v_join(
     tiling_config = TilingConfig.default()
 
     decoded_video_chunks = []
-    for chunk in chunk_decode_video(
+    for chunk in vae_decode_video(
         denoised_video_latent,
         video_decoder,
         tiling_config,
