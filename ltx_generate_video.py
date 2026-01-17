@@ -6159,10 +6159,14 @@ def generate_v2v_join(
     # Split the combined latent into three regions: preserve1, generate, preserve2
     # gen_start_latent and gen_end_latent are already computed in Step 7
     preserve1_lat = video_latent[:, :, :gen_start_latent, :, :]
-    generate_lat = video_latent[:, :, gen_start_latent:gen_end_latent, :, :]
+    # CRITICAL FIX: Use ZEROS for generate region, NOT encoded interpolated frames!
+    # The diffusion model expects to start from PURE NOISE for generation regions.
+    # Starting from interpolated_latent + noise confuses the model and causes black output.
+    # Pattern: zeros + noise = pure noise (same as AV extension working code)
+    generate_lat = torch.zeros_like(video_latent[:, :, gen_start_latent:gen_end_latent, :, :])
     preserve2_lat = video_latent[:, :, gen_end_latent:, :, :]
 
-    print(f">>> Split latents: preserve1={preserve1_lat.shape[2]}, gen={generate_lat.shape[2]}, preserve2={preserve2_lat.shape[2]}")
+    print(f">>> Split latents: preserve1={preserve1_lat.shape[2]}, gen={generate_lat.shape[2]} (ZEROS), preserve2={preserve2_lat.shape[2]}")
 
     # Calculate pixel frame counts for each region
     preserve1_pixel_frames = (preserve1_lat.shape[2] - 1) * time_scale_factor + 1
@@ -6477,8 +6481,26 @@ def generate_v2v_join(
 
         # Create stage 2 video state
         stage2_video_state = stage2_video_tools.create_initial_state(device, dtype, upscaled_video_latent)
+
+        # CRITICAL FIX: Create preservation mask for Stage 2
+        # Mask = 0 for preserved regions (no denoising), mask = 1 for generate region (full denoising)
+        # This prevents Stage 2 from corrupting the preserve1 and preserve2 content
+        _, _, F_latent_stage2, H_stage2, W_stage2 = upscaled_video_latent.shape
+        stage2_video_mask = torch.zeros((1, 1, F_latent_stage2, H_stage2, W_stage2), device=device, dtype=torch.float32)
+        stage2_video_mask[:, :, gen_start_latent:gen_end_latent, :, :] = 1.0
+        print(f">>> Stage 2 mask: shape={stage2_video_mask.shape}, gen_region=[{gen_start_latent}:{gen_end_latent}]")
+
+        # Apply preservation mask (patchify and replace)
+        patchified_stage2_video_mask = stage2_video_tools.patchifier.patchify(stage2_video_mask)
+        stage2_video_state = dataclass_replace(
+            stage2_video_state,
+            denoise_mask=patchified_stage2_video_mask.to(dtype=torch.float32),
+        )
+
+        # CRITICAL FIX: Use correct noise scale (initial sigma from schedule, not 1.0)
+        # This matches the AV extension pattern - preserved frames won't get full noise
         stage2_noiser = GaussianNoiser(generator=torch.Generator(device=device).manual_seed(args.seed + 1))
-        stage2_video_state = stage2_noiser(stage2_video_state, noise_scale=1.0)
+        stage2_video_state = stage2_noiser(stage2_video_state, noise_scale=stage2_sigmas[0].item())
 
         # Dummy audio state for stage 2
         stage2_audio_latent_shape = AudioLatentShape.from_video_pixel_shape(stage2_output_shape)
