@@ -6406,7 +6406,7 @@ def generate_v2v_join(
     print(">>> Decoding transition video...")
 
     video_decoder = generator.stage_1_model_ledger.video_decoder() if generator.one_stage else generator.stage_2_model_ledger.video_decoder()
-    tiling_config = TilingConfig.from_args(args)
+    tiling_config = TilingConfig.default()
 
     decoded_video_chunks = []
     for chunk in chunk_decode_video(
