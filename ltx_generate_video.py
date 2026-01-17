@@ -6998,7 +6998,10 @@ def generate_v2v_join(
 
         # Transition audio (decoded from latent)
         if decoded_transition_audio is not None:
-            audio_parts.append(decoded_transition_audio.cpu())
+            transition_audio_part = decoded_transition_audio.cpu()
+            if transition_audio_part.dim() == 2:
+                transition_audio_part = transition_audio_part.unsqueeze(0)
+            audio_parts.append(transition_audio_part)
 
         # Suffix audio from video2
         if v2_suffix_start < total_frames2 and audio2_waveform is not None:
