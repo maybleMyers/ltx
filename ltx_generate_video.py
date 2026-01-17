@@ -5734,29 +5734,45 @@ def generate_v2v_join(
     print(f">>> Video2: {total_frames2} frames at {fps2:.1f} fps, {width2}x{height2}, {duration2:.2f}s")
 
     # =========================================================================
-    # Step 2.5: Extract audio from both input videos
+    # Step 2.5: Handle audio input
     # =========================================================================
-    print(">>> Extracting audio from input videos...")
     audio1_waveform, audio1_sample_rate = None, None
     audio2_waveform, audio2_sample_rate = None, None
+    input_audio_waveform, input_audio_sample_rate = None, None
+    audio_strength = getattr(args, 'audio_strength', 1.0)
 
-    try:
-        waveform1, sample_rate1 = decode_audio_from_file(video1_path, device)
-        if waveform1 is not None:
-            audio1_waveform, audio1_sample_rate = waveform1, sample_rate1
-            print(f">>> Video1 audio: {waveform1.shape}, {sample_rate1}Hz")
-    except Exception as e:
-        print(f">>> No audio in video1: {e}")
+    # Check if explicit audio file is provided
+    if hasattr(args, 'audio') and args.audio is not None:
+        print(f">>> Loading audio from input file: {args.audio}")
+        try:
+            waveform, sample_rate = decode_audio_from_file(args.audio, device)
+            if waveform is not None:
+                input_audio_waveform = waveform
+                input_audio_sample_rate = sample_rate
+                print(f">>> Input audio: {waveform.shape}, {sample_rate}Hz, strength={audio_strength}")
+        except Exception as e:
+            print(f">>> Failed to load audio file: {e}")
+    else:
+        # Extract audio from input videos
+        print(">>> Extracting audio from input videos...")
+        try:
+            waveform1, sample_rate1 = decode_audio_from_file(video1_path, device)
+            if waveform1 is not None:
+                audio1_waveform, audio1_sample_rate = waveform1, sample_rate1
+                print(f">>> Video1 audio: {waveform1.shape}, {sample_rate1}Hz")
+        except Exception as e:
+            print(f">>> No audio in video1: {e}")
 
-    try:
-        waveform2, sample_rate2 = decode_audio_from_file(video2_path, device)
-        if waveform2 is not None:
-            audio2_waveform, audio2_sample_rate = waveform2, sample_rate2
-            print(f">>> Video2 audio: {waveform2.shape}, {sample_rate2}Hz")
-    except Exception as e:
-        print(f">>> No audio in video2: {e}")
+        try:
+            waveform2, sample_rate2 = decode_audio_from_file(video2_path, device)
+            if waveform2 is not None:
+                audio2_waveform, audio2_sample_rate = waveform2, sample_rate2
+                print(f">>> Video2 audio: {waveform2.shape}, {sample_rate2}Hz")
+        except Exception as e:
+            print(f">>> No audio in video2: {e}")
 
-    has_audio = audio1_waveform is not None or audio2_waveform is not None
+    has_audio = input_audio_waveform is not None or audio1_waveform is not None or audio2_waveform is not None
+    use_input_audio = input_audio_waveform is not None
 
     # =========================================================================
     # Step 2: Find best transition frames using sharpness detection
@@ -5913,44 +5929,64 @@ def generate_v2v_join(
     # =========================================================================
     combined_audio_waveform = None
     if has_audio:
-        print(">>> Combining audio segments...")
+        if use_input_audio:
+            # Use the input audio file for the entire transition
+            print(f">>> Using input audio file with strength {audio_strength}...")
+            audio_sample_rate = input_audio_sample_rate
 
-        # Extract preserve1 audio from video1
-        if audio1_waveform is not None:
-            audio1_total = audio1_waveform.shape[-1]
-            v1_start = max(0, v1_audio_start_sample)
-            v1_end = min(v1_audio_end_sample, audio1_total)
-            preserve1_audio = audio1_waveform[..., v1_start:v1_end]
-            if preserve1_audio.dim() == 2:
-                preserve1_audio = preserve1_audio.unsqueeze(0)
-            # Resample if needed
-            if preserve1_audio.shape[-1] != preserve1_audio_samples:
-                preserve1_audio = torch.nn.functional.interpolate(
-                    preserve1_audio.float(), size=preserve1_audio_samples, mode='linear'
+            # Prepare input audio waveform
+            input_audio = input_audio_waveform
+            if input_audio.dim() == 2:
+                input_audio = input_audio.unsqueeze(0)
+
+            # Resample to match total audio samples needed
+            if input_audio.shape[-1] != total_audio_samples:
+                input_audio = torch.nn.functional.interpolate(
+                    input_audio.float(), size=total_audio_samples, mode='linear'
                 ).to(dtype)
+
+            combined_audio_waveform = input_audio
+            print(f">>> Input audio waveform: {combined_audio_waveform.shape}")
         else:
-            preserve1_audio = torch.zeros(1, 2, preserve1_audio_samples, device=device, dtype=dtype)
+            # Extract and combine audio from videos
+            print(">>> Combining audio segments from videos...")
 
-        # Silent placeholder for transition
-        transition_audio = torch.zeros(1, 2, transition_audio_samples, device=device, dtype=dtype)
+            # Extract preserve1 audio from video1
+            if audio1_waveform is not None:
+                audio1_total = audio1_waveform.shape[-1]
+                v1_start = max(0, v1_audio_start_sample)
+                v1_end = min(v1_audio_end_sample, audio1_total)
+                preserve1_audio = audio1_waveform[..., v1_start:v1_end]
+                if preserve1_audio.dim() == 2:
+                    preserve1_audio = preserve1_audio.unsqueeze(0)
+                # Resample if needed
+                if preserve1_audio.shape[-1] != preserve1_audio_samples:
+                    preserve1_audio = torch.nn.functional.interpolate(
+                        preserve1_audio.float(), size=preserve1_audio_samples, mode='linear'
+                    ).to(dtype)
+            else:
+                preserve1_audio = torch.zeros(1, 2, preserve1_audio_samples, device=device, dtype=dtype)
 
-        # Extract preserve2 audio from video2
-        if audio2_waveform is not None:
-            audio2_total = audio2_waveform.shape[-1]
-            v2_start = max(0, v2_audio_start_sample)
-            v2_end = min(v2_audio_end_sample, audio2_total)
-            preserve2_audio = audio2_waveform[..., v2_start:v2_end]
-            if preserve2_audio.dim() == 2:
-                preserve2_audio = preserve2_audio.unsqueeze(0)
-            if preserve2_audio.shape[-1] != preserve2_audio_samples:
-                preserve2_audio = torch.nn.functional.interpolate(
-                    preserve2_audio.float(), size=preserve2_audio_samples, mode='linear'
-                ).to(dtype)
-        else:
-            preserve2_audio = torch.zeros(1, 2, preserve2_audio_samples, device=device, dtype=dtype)
+            # Silent placeholder for transition
+            transition_audio = torch.zeros(1, 2, transition_audio_samples, device=device, dtype=dtype)
 
-        combined_audio_waveform = torch.cat([preserve1_audio, transition_audio, preserve2_audio], dim=-1)
-        print(f">>> Combined audio waveform: {combined_audio_waveform.shape}")
+            # Extract preserve2 audio from video2
+            if audio2_waveform is not None:
+                audio2_total = audio2_waveform.shape[-1]
+                v2_start = max(0, v2_audio_start_sample)
+                v2_end = min(v2_audio_end_sample, audio2_total)
+                preserve2_audio = audio2_waveform[..., v2_start:v2_end]
+                if preserve2_audio.dim() == 2:
+                    preserve2_audio = preserve2_audio.unsqueeze(0)
+                if preserve2_audio.shape[-1] != preserve2_audio_samples:
+                    preserve2_audio = torch.nn.functional.interpolate(
+                        preserve2_audio.float(), size=preserve2_audio_samples, mode='linear'
+                    ).to(dtype)
+            else:
+                preserve2_audio = torch.zeros(1, 2, preserve2_audio_samples, device=device, dtype=dtype)
+
+            combined_audio_waveform = torch.cat([preserve1_audio, transition_audio, preserve2_audio], dim=-1)
+            print(f">>> Combined audio waveform: {combined_audio_waveform.shape}")
 
     # =========================================================================
     # Step 6: Encode to latent space
@@ -6039,14 +6075,19 @@ def generate_v2v_join(
         audio_latents_per_second = audio_latent.shape[2] / total_audio_duration
         print(f">>> Audio latent: {audio_latent.shape}, {audio_latents_per_second:.2f} latent frames/sec")
 
-        # CRITICAL: Zero out the transition region of audio latent (like video does)
-        # This ensures the model generates from pure noise for the transition
-        preserve1_audio_latent_frames = int(round(preserve1_sec * audio_latents_per_second))
-        preserve2_audio_latent_frames = int(round(preserve2_sec * audio_latents_per_second))
-        audio_gen_start_latent = preserve1_audio_latent_frames
-        audio_gen_end_latent = audio_latent.shape[2] - preserve2_audio_latent_frames
-        audio_latent[:, :, audio_gen_start_latent:audio_gen_end_latent, :] = 0.0
-        print(f">>> Audio latent zeroed for generation region: {audio_gen_start_latent}-{audio_gen_end_latent}")
+        if use_input_audio:
+            # When using input audio, keep the full latent - don't zero any region
+            # The audio_strength will control how much this audio influences the generation
+            print(f">>> Using full input audio latent (strength={audio_strength})")
+        else:
+            # CRITICAL: Zero out the transition region of audio latent (like video does)
+            # This ensures the model generates from pure noise for the transition
+            preserve1_audio_latent_frames = int(round(preserve1_sec * audio_latents_per_second))
+            preserve2_audio_latent_frames = int(round(preserve2_sec * audio_latents_per_second))
+            audio_gen_start_latent = preserve1_audio_latent_frames
+            audio_gen_end_latent = audio_latent.shape[2] - preserve2_audio_latent_frames
+            audio_latent[:, :, audio_gen_start_latent:audio_gen_end_latent, :] = 0.0
+            print(f">>> Audio latent zeroed for generation region: {audio_gen_start_latent}-{audio_gen_end_latent}")
 
         del audio_encoder, audio_processor, mel_spectrogram
         cleanup_memory()
@@ -6406,23 +6447,32 @@ def generate_v2v_join(
         )
 
         B_a, C_a, F_audio, mel_bins = audio_latent.shape
-        preserve1_audio_latent = int(round(preserve1_sec * audio_latents_per_second))
-        preserve2_audio_latent = int(round(preserve2_sec * audio_latents_per_second))
-        audio_gen_start = preserve1_audio_latent
-        audio_gen_end = F_audio - preserve2_audio_latent
 
-        # Create audio mask: 0 = preserve, 1 = generate
-        audio_mask = torch.zeros((B_a, 1, F_audio, 1), device=device, dtype=torch.float32)
-        audio_mask[:, :, audio_gen_start:audio_gen_end, :] = 1.0
+        if use_input_audio:
+            # For input audio, use audio_strength to control preservation
+            # mask = 1 - strength: strength=1 means mask=0 (preserve), strength=0 means mask=1 (generate)
+            base_mask_value = 1.0 - audio_strength
+            audio_mask = torch.full((B_a, 1, F_audio, 1), fill_value=base_mask_value, device=device, dtype=torch.float32)
+            print(f">>> Audio mask: full audio with strength {audio_strength} (mask={base_mask_value})")
+        else:
+            # Original behavior: preserve ends, generate middle
+            preserve1_audio_latent = int(round(preserve1_sec * audio_latents_per_second))
+            preserve2_audio_latent = int(round(preserve2_sec * audio_latents_per_second))
+            audio_gen_start = preserve1_audio_latent
+            audio_gen_end = F_audio - preserve2_audio_latent
 
-        # Apply slope at boundaries
-        if slope_len > 0:
-            for i in range(min(slope_len, audio_gen_end - audio_gen_start)):
-                slope_value = (i + 1) / (slope_len + 1)
-                audio_mask[:, :, audio_gen_start + i, :] = slope_value
-                audio_mask[:, :, audio_gen_end - 1 - i, :] = slope_value
+            # Create audio mask: 0 = preserve, 1 = generate
+            audio_mask = torch.zeros((B_a, 1, F_audio, 1), device=device, dtype=torch.float32)
+            audio_mask[:, :, audio_gen_start:audio_gen_end, :] = 1.0
 
-        print(f">>> Audio mask: preserve {0}-{audio_gen_start}, generate {audio_gen_start}-{audio_gen_end}, preserve {audio_gen_end}-{F_audio}")
+            # Apply slope at boundaries
+            if slope_len > 0:
+                for i in range(min(slope_len, audio_gen_end - audio_gen_start)):
+                    slope_value = (i + 1) / (slope_len + 1)
+                    audio_mask[:, :, audio_gen_start + i, :] = slope_value
+                    audio_mask[:, :, audio_gen_end - 1 - i, :] = slope_value
+
+            print(f">>> Audio mask: preserve {0}-{audio_gen_start}, generate {audio_gen_start}-{audio_gen_end}, preserve {audio_gen_end}-{F_audio}")
 
         audio_state = audio_tools.create_initial_state(device, dtype, audio_latent)
         patchified_audio_mask = audio_tools.patchifier.patchify(audio_mask)
@@ -6994,37 +7044,47 @@ def generate_v2v_join(
     # =========================================================================
     final_audio = None
     if has_audio:
-        print(">>> Combining final audio...")
-        audio_parts = []
+        if use_input_audio:
+            # When using input audio, use the decoded audio directly
+            print(">>> Using decoded input audio...")
+            if decoded_transition_audio is not None:
+                final_audio = decoded_transition_audio.cpu()
+                if final_audio.dim() == 3 and final_audio.shape[0] == 1:
+                    final_audio = final_audio.squeeze(0)
+                print(f">>> Final audio: {final_audio.shape}")
+        else:
+            # Original behavior: combine prefix + transition + suffix from videos
+            print(">>> Combining final audio from videos...")
+            audio_parts = []
 
-        # Prefix audio from video1
-        if v1_prefix_end > 0 and audio1_waveform is not None:
-            prefix_end = int(round(v1_prefix_end / fps1 * audio_sample_rate))
-            prefix_audio = audio1_waveform[..., :prefix_end]
-            if prefix_audio.dim() == 2:
-                prefix_audio = prefix_audio.unsqueeze(0)
-            audio_parts.append(prefix_audio.cpu())
+            # Prefix audio from video1
+            if v1_prefix_end > 0 and audio1_waveform is not None:
+                prefix_end = int(round(v1_prefix_end / fps1 * audio_sample_rate))
+                prefix_audio = audio1_waveform[..., :prefix_end]
+                if prefix_audio.dim() == 2:
+                    prefix_audio = prefix_audio.unsqueeze(0)
+                audio_parts.append(prefix_audio.cpu())
 
-        # Transition audio (decoded from latent)
-        if decoded_transition_audio is not None:
-            transition_audio_part = decoded_transition_audio.cpu()
-            if transition_audio_part.dim() == 2:
-                transition_audio_part = transition_audio_part.unsqueeze(0)
-            audio_parts.append(transition_audio_part)
+            # Transition audio (decoded from latent)
+            if decoded_transition_audio is not None:
+                transition_audio_part = decoded_transition_audio.cpu()
+                if transition_audio_part.dim() == 2:
+                    transition_audio_part = transition_audio_part.unsqueeze(0)
+                audio_parts.append(transition_audio_part)
 
-        # Suffix audio from video2
-        if v2_suffix_start < total_frames2 and audio2_waveform is not None:
-            suffix_start = int(round(v2_suffix_start / fps2 * audio_sample_rate))
-            suffix_audio = audio2_waveform[..., suffix_start:]
-            if suffix_audio.dim() == 2:
-                suffix_audio = suffix_audio.unsqueeze(0)
-            audio_parts.append(suffix_audio.cpu())
+            # Suffix audio from video2
+            if v2_suffix_start < total_frames2 and audio2_waveform is not None:
+                suffix_start = int(round(v2_suffix_start / fps2 * audio_sample_rate))
+                suffix_audio = audio2_waveform[..., suffix_start:]
+                if suffix_audio.dim() == 2:
+                    suffix_audio = suffix_audio.unsqueeze(0)
+                audio_parts.append(suffix_audio.cpu())
 
-        if audio_parts:
-            final_audio = torch.cat(audio_parts, dim=-1)
-            if final_audio.dim() == 3 and final_audio.shape[0] == 1:
-                final_audio = final_audio.squeeze(0)
-            print(f">>> Final audio: {final_audio.shape}")
+            if audio_parts:
+                final_audio = torch.cat(audio_parts, dim=-1)
+                if final_audio.dim() == 3 and final_audio.shape[0] == 1:
+                    final_audio = final_audio.squeeze(0)
+                print(f">>> Final audio: {final_audio.shape}")
 
     # Return uint8 tensor - encode_video expects uint8 [0-255]
     return final_video, final_audio
