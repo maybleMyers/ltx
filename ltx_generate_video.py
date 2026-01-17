@@ -5948,6 +5948,7 @@ def generate_v2v_join(
             preserve1_audio = torch.zeros(1, 2, preserve1_audio_samples, device=device, dtype=dtype)
 
         # Transition audio: use input audio if provided, else silence
+        original_transition_audio = None  # Will be set if using input audio
         if use_input_audio:
             print(f">>> Using input audio for transition section (strength={audio_strength})...")
             # Prepare input audio waveform for transition section only
@@ -5965,6 +5966,10 @@ def generate_v2v_join(
             # Ensure correct dtype
             transition_audio = transition_audio.to(dtype)
             print(f">>> Transition audio from input: {transition_audio.shape}")
+
+            # Store original input audio for blending (before VAE processing)
+            original_transition_audio = transition_audio.clone()
+            print(f">>> Saved original input audio for blending: {original_transition_audio.shape}")
         else:
             # Silent placeholder for transition (model will generate)
             transition_audio = torch.zeros(1, 2, transition_audio_samples, device=device, dtype=dtype)
@@ -6074,19 +6079,14 @@ def generate_v2v_join(
         audio_latents_per_second = audio_latent.shape[2] / total_audio_duration
         print(f">>> Audio latent: {audio_latent.shape}, {audio_latents_per_second:.2f} latent frames/sec")
 
-        if use_input_audio:
-            # When using input audio, keep the full latent - don't zero any region
-            # The audio_strength will control how much this audio influences the generation
-            print(f">>> Using full input audio latent (strength={audio_strength})")
-        else:
-            # CRITICAL: Zero out the transition region of audio latent (like video does)
-            # This ensures the model generates from pure noise for the transition
-            preserve1_audio_latent_frames = int(round(preserve1_sec * audio_latents_per_second))
-            preserve2_audio_latent_frames = int(round(preserve2_sec * audio_latents_per_second))
-            audio_gen_start_latent = preserve1_audio_latent_frames
-            audio_gen_end_latent = audio_latent.shape[2] - preserve2_audio_latent_frames
-            audio_latent[:, :, audio_gen_start_latent:audio_gen_end_latent, :] = 0.0
-            print(f">>> Audio latent zeroed for generation region: {audio_gen_start_latent}-{audio_gen_end_latent}")
+        # ALWAYS zero the generation region (matches normal i2v behavior)
+        # This ensures clean generation from noise, we blend original audio at the end
+        preserve1_audio_latent_frames = int(round(preserve1_sec * audio_latents_per_second))
+        preserve2_audio_latent_frames = int(round(preserve2_sec * audio_latents_per_second))
+        audio_gen_start_latent = preserve1_audio_latent_frames
+        audio_gen_end_latent = audio_latent.shape[2] - preserve2_audio_latent_frames
+        audio_latent[:, :, audio_gen_start_latent:audio_gen_end_latent, :] = 0.0
+        print(f">>> Audio latent zeroed for generation region: {audio_gen_start_latent}-{audio_gen_end_latent}")
 
         del audio_encoder, audio_processor, mel_spectrogram
         cleanup_memory()
@@ -6447,49 +6447,27 @@ def generate_v2v_join(
 
         B_a, C_a, F_audio, mel_bins = audio_latent.shape
 
+        # ALWAYS use mask=1.0 for full generation (matches normal i2v behavior)
+        # audio_strength is applied later in waveform blending, not in the mask
+        preserve1_audio_latent = int(round(preserve1_sec * audio_latents_per_second))
+        preserve2_audio_latent = int(round(preserve2_sec * audio_latents_per_second))
+        audio_gen_start = preserve1_audio_latent
+        audio_gen_end = F_audio - preserve2_audio_latent
+
+        # Create audio mask: 0 = preserve, 1 = generate (full generation)
+        audio_mask = torch.zeros((B_a, 1, F_audio, 1), device=device, dtype=torch.float32)
+        audio_mask[:, :, audio_gen_start:audio_gen_end, :] = 1.0
+
+        # Apply slope at boundaries
+        if slope_len > 0:
+            for i in range(min(slope_len, audio_gen_end - audio_gen_start)):
+                slope_value = (i + 1) / (slope_len + 1)
+                audio_mask[:, :, audio_gen_start + i, :] = slope_value
+                audio_mask[:, :, audio_gen_end - 1 - i, :] = slope_value
+
         if use_input_audio:
-            # For input audio: preserve ends (from videos), control transition with audio_strength
-            # mask = 0 for preserved sections, 1 - strength for transition
-            # strength=1 means mask=0 for transition (fully preserve input audio)
-            # strength=0 means mask=1 for transition (fully generate)
-            preserve1_audio_latent = int(round(preserve1_sec * audio_latents_per_second))
-            preserve2_audio_latent = int(round(preserve2_sec * audio_latents_per_second))
-            audio_gen_start = preserve1_audio_latent
-            audio_gen_end = F_audio - preserve2_audio_latent
-
-            # Start with all zeros (preserve)
-            audio_mask = torch.zeros((B_a, 1, F_audio, 1), device=device, dtype=torch.float32)
-            # Apply audio_strength to transition region only
-            transition_mask_value = 1.0 - audio_strength
-            audio_mask[:, :, audio_gen_start:audio_gen_end, :] = transition_mask_value
-
-            # Apply slope at boundaries for smooth blending
-            if slope_len > 0:
-                for i in range(min(slope_len, audio_gen_end - audio_gen_start)):
-                    slope_value = (i + 1) / (slope_len + 1) * transition_mask_value
-                    audio_mask[:, :, audio_gen_start + i, :] = slope_value
-                    audio_mask[:, :, audio_gen_end - 1 - i, :] = slope_value
-
-            print(f">>> Audio mask: preserve {0}-{audio_gen_start}, transition {audio_gen_start}-{audio_gen_end} (strength={audio_strength}, mask={transition_mask_value}), preserve {audio_gen_end}-{F_audio}")
-        else:
-            # Original behavior: preserve ends, generate middle
-            preserve1_audio_latent = int(round(preserve1_sec * audio_latents_per_second))
-            preserve2_audio_latent = int(round(preserve2_sec * audio_latents_per_second))
-            audio_gen_start = preserve1_audio_latent
-            audio_gen_end = F_audio - preserve2_audio_latent
-
-            # Create audio mask: 0 = preserve, 1 = generate
-            audio_mask = torch.zeros((B_a, 1, F_audio, 1), device=device, dtype=torch.float32)
-            audio_mask[:, :, audio_gen_start:audio_gen_end, :] = 1.0
-
-            # Apply slope at boundaries
-            if slope_len > 0:
-                for i in range(min(slope_len, audio_gen_end - audio_gen_start)):
-                    slope_value = (i + 1) / (slope_len + 1)
-                    audio_mask[:, :, audio_gen_start + i, :] = slope_value
-                    audio_mask[:, :, audio_gen_end - 1 - i, :] = slope_value
-
-            print(f">>> Audio mask: preserve {0}-{audio_gen_start}, generate {audio_gen_start}-{audio_gen_end}, preserve {audio_gen_end}-{F_audio}")
+            print(f">>> Audio mask: full generation, will blend with input audio at strength={audio_strength}")
+        print(f">>> Audio mask: preserve {0}-{audio_gen_start}, generate {audio_gen_start}-{audio_gen_end}, preserve {audio_gen_end}-{F_audio}")
 
         audio_state = audio_tools.create_initial_state(device, dtype, audio_latent)
         patchified_audio_mask = audio_tools.patchifier.patchify(audio_mask)
@@ -7075,11 +7053,29 @@ def generate_v2v_join(
             audio_parts.append(prefix_audio.cpu())
             print(f">>> Prefix audio from video1: {prefix_audio.shape}")
 
-        # Transition audio (decoded from latent - contains input audio if provided)
+        # Transition audio (decoded from latent)
         if decoded_transition_audio is not None:
             transition_audio_part = decoded_transition_audio.cpu()
             if transition_audio_part.dim() == 2:
                 transition_audio_part = transition_audio_part.unsqueeze(0)
+
+            # Blend with original input audio if available
+            if use_input_audio and original_transition_audio is not None:
+                orig_audio = original_transition_audio.cpu()
+                if orig_audio.dim() == 2:
+                    orig_audio = orig_audio.unsqueeze(0)
+
+                # Match lengths (VAE may change length slightly)
+                target_len = transition_audio_part.shape[-1]
+                if orig_audio.shape[-1] != target_len:
+                    orig_audio = torch.nn.functional.interpolate(
+                        orig_audio.float(), size=target_len, mode='linear'
+                    ).to(orig_audio.dtype)
+
+                # Blend: strength=1 means 100% original, strength=0 means 100% generated
+                transition_audio_part = audio_strength * orig_audio + (1.0 - audio_strength) * transition_audio_part
+                print(f">>> Blended audio (strength={audio_strength}): {transition_audio_part.shape}")
+
             audio_parts.append(transition_audio_part)
             print(f">>> Transition audio: {transition_audio_part.shape}")
 
