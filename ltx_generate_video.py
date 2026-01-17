@@ -6510,7 +6510,9 @@ def generate_v2v_join(
         # CRITICAL FIX: Use correct noise scale (initial sigma from schedule, not 1.0)
         # This matches the AV extension pattern - preserved frames won't get full noise
         stage2_noiser = GaussianNoiser(generator=torch.Generator(device=device).manual_seed(args.seed + 1))
+        print(f">>> DEBUG Stage2 - sigma[0]={stage2_sigmas[0].item():.4f}, upscaled_latent has_nan={torch.isnan(upscaled_video_latent).any().item()}")
         stage2_video_state = stage2_noiser(stage2_video_state, noise_scale=stage2_sigmas[0].item())
+        print(f">>> DEBUG Stage2 - After noiser: latent has_nan={torch.isnan(stage2_video_state.latent).any().item()}, mask has_nan={torch.isnan(stage2_video_state.denoise_mask).any().item()}")
 
         # Dummy audio state for stage 2
         stage2_audio_latent_shape = AudioLatentShape.from_video_pixel_shape(stage2_output_shape)
