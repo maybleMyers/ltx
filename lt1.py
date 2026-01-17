@@ -1034,6 +1034,16 @@ def generate_ltx_video(
     latent_norm_audio_only: bool,
     # V2A Mode (Video-to-Audio)
     v2a_mode: bool,
+    # Video Joining
+    v2v_join_video1: str,
+    v2v_join_video2: str,
+    v2v_join_frames_check1: int,
+    v2v_join_frames_check2: int,
+    v2v_join_preserve1: float,
+    v2v_join_preserve2: float,
+    v2v_join_transition_time: float,
+    v2v_join_steps: int,
+    v2v_join_terminal: float,
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     """
     Generate video using LTX-2 pipeline.
@@ -1214,6 +1224,18 @@ def generate_ltx_video(
         # V2A Mode (Video-to-Audio)
         if v2a_mode:
             command.append("--v2a-mode")
+
+        # Video Joining
+        if v2v_join_video1 and v2v_join_video2:
+            command.extend(["--v2v-join-video1", str(v2v_join_video1)])
+            command.extend(["--v2v-join-video2", str(v2v_join_video2)])
+            command.extend(["--v2v-join-frames-check1", str(int(v2v_join_frames_check1))])
+            command.extend(["--v2v-join-frames-check2", str(int(v2v_join_frames_check2))])
+            command.extend(["--v2v-join-preserve1", str(float(v2v_join_preserve1))])
+            command.extend(["--v2v-join-preserve2", str(float(v2v_join_preserve2))])
+            command.extend(["--v2v-join-transition-time", str(float(v2v_join_transition_time))])
+            command.extend(["--v2v-join-steps", str(int(v2v_join_steps))])
+            command.extend(["--v2v-join-terminal", str(float(v2v_join_terminal))])
 
         # User LoRAs - apply to selected stage(s)
         lora_configs = [
@@ -2460,6 +2482,63 @@ Audio is synchronized with the video extension.
                                 info="Freeze video, generate audio only (requires input video)"
                             )
 
+                        # Video Joining
+                        with gr.Accordion("Video Joining", open=False):
+                            gr.Markdown("""
+                            **Join two videos with a generated AI transition.**
+                            Upload two videos and the system will:
+                            1. Find the sharpest frames near the transition points
+                            2. Preserve sections from each video
+                            3. Generate a smooth AI transition between them
+                            """)
+
+                            with gr.Row():
+                                v2v_join_video1 = gr.Video(label="Video 1 (transition FROM end)", sources=["upload"])
+                                v2v_join_video2 = gr.Video(label="Video 2 (transition TO start)", sources=["upload"])
+
+                            with gr.Row():
+                                v2v_join_frames_check1 = gr.Slider(
+                                    minimum=1, maximum=120, value=30, step=1,
+                                    label="Frames to Check (Video 1)",
+                                    info="Number of frames from end of video1 to analyze for sharpest transition point"
+                                )
+                                v2v_join_frames_check2 = gr.Slider(
+                                    minimum=1, maximum=120, value=30, step=1,
+                                    label="Frames to Check (Video 2)",
+                                    info="Number of frames from start of video2 to analyze for sharpest transition point"
+                                )
+
+                            with gr.Row():
+                                v2v_join_preserve1 = gr.Slider(
+                                    minimum=0.5, maximum=30.0, value=5.0, step=0.5,
+                                    label="Preserve from Video 1 (seconds)",
+                                    info="Seconds to preserve from end of video1"
+                                )
+                                v2v_join_preserve2 = gr.Slider(
+                                    minimum=0.5, maximum=30.0, value=5.0, step=0.5,
+                                    label="Preserve from Video 2 (seconds)",
+                                    info="Seconds to preserve from start of video2"
+                                )
+
+                            with gr.Row():
+                                v2v_join_transition_time = gr.Slider(
+                                    minimum=1.0, maximum=30.0, value=10.0, step=0.5,
+                                    label="Transition Duration (seconds)",
+                                    info="Duration of AI-generated transition between preserved sections"
+                                )
+
+                            with gr.Row():
+                                v2v_join_steps = gr.Slider(
+                                    minimum=1, maximum=30, value=8, step=1,
+                                    label="Denoising Steps",
+                                    info="Number of denoising steps for transition generation"
+                                )
+                                v2v_join_terminal = gr.Slider(
+                                    minimum=0.0, maximum=1.0, value=0.1, step=0.05,
+                                    label="Terminal Sigma",
+                                    info="Terminal sigma for partial denoising (lower = smoother)"
+                                )
+
             # =================================================================
             # Video Info Tab
             # =================================================================
@@ -3092,6 +3171,12 @@ Audio is synchronized with the video extension.
                 latent_norm_video_only, latent_norm_audio_only,
                 # V2A Mode
                 v2a_mode,
+                # Video Joining
+                v2v_join_video1, v2v_join_video2,
+                v2v_join_frames_check1, v2v_join_frames_check2,
+                v2v_join_preserve1, v2v_join_preserve2,
+                v2v_join_transition_time,
+                v2v_join_steps, v2v_join_terminal,
             ],
             outputs=[output_gallery, preview_gallery, status_text, progress_text]
         )
@@ -3382,6 +3467,11 @@ Audio is synchronized with the video extension.
             scale_slider,
             # V2A Mode
             v2a_mode,
+            # Video Joining (video paths not saved, only parameters)
+            v2v_join_frames_check1, v2v_join_frames_check2,
+            v2v_join_preserve1, v2v_join_preserve2,
+            v2v_join_transition_time,
+            v2v_join_steps, v2v_join_terminal,
         ]
 
         lt1_ui_default_keys = [
@@ -3421,6 +3511,11 @@ Audio is synchronized with the video extension.
             "scale_slider",
             # V2A Mode
             "v2a_mode",
+            # Video Joining
+            "v2v_join_frames_check1", "v2v_join_frames_check2",
+            "v2v_join_preserve1", "v2v_join_preserve2",
+            "v2v_join_transition_time",
+            "v2v_join_steps", "v2v_join_terminal",
         ]
 
         def save_lt1_defaults(*values):
