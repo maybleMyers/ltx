@@ -6279,12 +6279,49 @@ def generate_v2v_join(
             stage2_transformer.velocity_model.scale_shift_table = torch.nn.Parameter(
                 stage2_transformer.velocity_model.scale_shift_table.to(device)
             )
+            # Move args preprocessors to GPU (needed for timestep embedding)
+            if hasattr(stage2_transformer.velocity_model, "video_args_preprocessor"):
+                stage2_transformer.velocity_model.video_args_preprocessor.to(device)
+            if hasattr(stage2_transformer.velocity_model, "audio_args_preprocessor"):
+                stage2_transformer.velocity_model.audio_args_preprocessor.to(device)
+            if hasattr(stage2_transformer.velocity_model, "audio_patchify_proj"):
+                stage2_transformer.velocity_model.audio_patchify_proj.to(device)
+            if hasattr(stage2_transformer.velocity_model, "audio_adaln_single"):
+                stage2_transformer.velocity_model.audio_adaln_single.to(device)
+            if hasattr(stage2_transformer.velocity_model, "audio_caption_projection"):
+                stage2_transformer.velocity_model.audio_caption_projection.to(device)
+            if hasattr(stage2_transformer.velocity_model, "audio_norm_out"):
+                stage2_transformer.velocity_model.audio_norm_out.to(device)
+            if hasattr(stage2_transformer.velocity_model, "audio_proj_out"):
+                stage2_transformer.velocity_model.audio_proj_out.to(device)
+            if hasattr(stage2_transformer.velocity_model, "audio_scale_shift_table"):
+                stage2_transformer.velocity_model.audio_scale_shift_table = torch.nn.Parameter(
+                    stage2_transformer.velocity_model.audio_scale_shift_table.to(device)
+                )
+            if hasattr(stage2_transformer.velocity_model, "av_ca_video_scale_shift_adaln_single"):
+                stage2_transformer.velocity_model.av_ca_video_scale_shift_adaln_single.to(device)
+            if hasattr(stage2_transformer.velocity_model, "av_ca_audio_scale_shift_adaln_single"):
+                stage2_transformer.velocity_model.av_ca_audio_scale_shift_adaln_single.to(device)
+            if hasattr(stage2_transformer.velocity_model, "av_ca_a2v_gate_adaln_single"):
+                stage2_transformer.velocity_model.av_ca_a2v_gate_adaln_single.to(device)
+            if hasattr(stage2_transformer.velocity_model, "av_ca_v2a_gate_adaln_single"):
+                stage2_transformer.velocity_model.av_ca_v2a_gate_adaln_single.to(device)
 
-            stage2_block_swap_manager = enable_block_swap(
-                stage2_transformer,
-                blocks_in_memory=generator.refiner_blocks_in_memory,
-                device=device,
-            )
+            # Use activation offload for extreme memory savings
+            if getattr(generator, 'enable_activation_offload', False):
+                stage2_block_swap_manager = enable_block_swap_with_activation_offload(
+                    stage2_transformer,
+                    blocks_in_memory=generator.refiner_blocks_in_memory,
+                    device=device,
+                    verbose=True,
+                    temporal_chunk_size=getattr(generator, 'temporal_chunk_size', 0),
+                )
+            else:
+                stage2_block_swap_manager = enable_block_swap(
+                    stage2_transformer,
+                    blocks_in_memory=generator.refiner_blocks_in_memory,
+                    device=device,
+                )
         else:
             stage2_transformer = generator.stage_2_model_ledger.transformer()
 
