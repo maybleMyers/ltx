@@ -6235,6 +6235,11 @@ def generate_v2v_join(
     )
     generate_state = noiser(generate_state, noise_scale=1.0)
 
+    # DEBUG: Verify generate_state has proper noise (should be ~N(0,1) for pure noise)
+    print(f">>> DEBUG - Noisy generate latent: mean={generate_state.latent.mean().item():.4f}, std={generate_state.latent.std().item():.4f}")
+    print(f">>> DEBUG - Preserve1 latent (clean): mean={preserve1_state.latent.mean().item():.4f}, std={preserve1_state.latent.std().item():.4f}")
+    print(f">>> DEBUG - Generate mask: all ones = {(generate_state.denoise_mask == 1.0).all().item()}")
+
     # Preserve2: mask=0 (no denoising), no noise
     preserve2_state = preserve2_tools.create_initial_state(device, dtype, preserve2_lat)
     preserve2_state = dataclass_replace(
@@ -6315,6 +6320,11 @@ def generate_v2v_join(
 
     # Get generated latent (unpatchified)
     generated_latent = generate_final_state.latent
+
+    # DEBUG: Check latent statistics to diagnose black video issue
+    print(f">>> DEBUG - Generated latent stats: min={generated_latent.min().item():.4f}, max={generated_latent.max().item():.4f}, mean={generated_latent.mean().item():.4f}, std={generated_latent.std().item():.4f}")
+    print(f">>> DEBUG - Preserve1 latent stats: min={original_preserve1_latent.min().item():.4f}, max={original_preserve1_latent.max().item():.4f}, mean={original_preserve1_latent.mean().item():.4f}")
+    print(f">>> DEBUG - Preserve2 latent stats: min={original_preserve2_latent.min().item():.4f}, max={original_preserve2_latent.max().item():.4f}, mean={original_preserve2_latent.mean().item():.4f}")
 
     # Reconstruct full video: [original_preserve1, generated, original_preserve2]
     denoised_video_latent = torch.cat([original_preserve1_latent, generated_latent, original_preserve2_latent], dim=2)
@@ -6526,6 +6536,14 @@ def generate_v2v_join(
 
         denoised_video_latent = final_stage2_video_state.latent
         print(f">>> Stage 2 denoised latent: {denoised_video_latent.shape}")
+
+        # DEBUG: Check Stage 2 latent statistics for generate region
+        stage2_gen_latent = denoised_video_latent[:, :, gen_start_latent:gen_end_latent, :, :]
+        stage2_preserve1_latent = denoised_video_latent[:, :, :gen_start_latent, :, :]
+        stage2_preserve2_latent = denoised_video_latent[:, :, gen_end_latent:, :, :]
+        print(f">>> DEBUG Stage2 - Generate latent: min={stage2_gen_latent.min().item():.4f}, max={stage2_gen_latent.max().item():.4f}, mean={stage2_gen_latent.mean().item():.4f}")
+        print(f">>> DEBUG Stage2 - Preserve1 latent: min={stage2_preserve1_latent.min().item():.4f}, max={stage2_preserve1_latent.max().item():.4f}, mean={stage2_preserve1_latent.mean().item():.4f}")
+        print(f">>> DEBUG Stage2 - Preserve2 latent: min={stage2_preserve2_latent.min().item():.4f}, max={stage2_preserve2_latent.max().item():.4f}, mean={stage2_preserve2_latent.mean().item():.4f}")
 
         # Cleanup stage 2
         if stage2_block_swap_manager is not None:
