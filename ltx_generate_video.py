@@ -6039,6 +6039,15 @@ def generate_v2v_join(
         audio_latents_per_second = audio_latent.shape[2] / total_audio_duration
         print(f">>> Audio latent: {audio_latent.shape}, {audio_latents_per_second:.2f} latent frames/sec")
 
+        # CRITICAL: Zero out the transition region of audio latent (like video does)
+        # This ensures the model generates from pure noise for the transition
+        preserve1_audio_latent_frames = int(round(preserve1_sec * audio_latents_per_second))
+        preserve2_audio_latent_frames = int(round(preserve2_sec * audio_latents_per_second))
+        audio_gen_start_latent = preserve1_audio_latent_frames
+        audio_gen_end_latent = audio_latent.shape[2] - preserve2_audio_latent_frames
+        audio_latent[:, :, audio_gen_start_latent:audio_gen_end_latent, :] = 0.0
+        print(f">>> Audio latent zeroed for generation region: {audio_gen_start_latent}-{audio_gen_end_latent}")
+
         del audio_encoder, audio_processor, mel_spectrogram
         cleanup_memory()
 
