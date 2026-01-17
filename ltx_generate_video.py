@@ -6297,25 +6297,34 @@ def generate_v2v_join(
         ).to(dtype=torch.float32, device=device)
 
         # Stage 2 components
-        stage2_components = generator.stage_2_model_ledger.dit_components()
-        stage2_video_latent_shape = VideoLatentShape.from_torch_shape(upscaled_video_latent.shape)
+        stage2_components = generator.pipeline_components
+
+        # Stage 2 output shape (2x spatial resolution)
+        stage2_output_shape = VideoPixelShape(
+            batch=1,
+            frames=total_transition_frames,
+            height=stage1_height * 2,
+            width=stage1_width * 2,
+            fps=output_fps,
+        )
+
+        stage2_video_latent_shape = VideoLatentShape.from_pixel_shape(
+            shape=stage2_output_shape,
+            latent_channels=stage2_components.video_latent_channels,
+            scale_factors=stage2_components.video_scale_factors,
+        )
         stage2_video_tools = VideoLatentTools(
             patchifier=stage2_components.video_patchifier,
             target_shape=stage2_video_latent_shape,
+            fps=output_fps,
         )
 
-        # Create stage 2 denoise function
-        def stage2_denoise_fn(
-            video_state: LatentState,
-            audio_state: LatentState,
-            sigma: torch.Tensor,
-            step_index: int,
-        ) -> tuple[LatentState, LatentState]:
-            sigma = sigma.to(device=device, dtype=dtype)
-            cfg_states = cfg_guider.pre_step_video_audio(video_state, audio_state, video_context, None)
-            v_out, a_out = stage2_transformer(*cfg_states, sigma.reshape(1))
-            v_out, a_out = cfg_guider.post_step_video_audio(v_out, a_out)
-            return v_out, a_out
+        # Stage 2 denoising function (NO CFG, just positive context)
+        stage2_denoise_fn = simple_denoising_func(
+            video_context=v_context_p,
+            audio_context=a_context_p,
+            transformer=stage2_transformer,
+        )
 
         # Create stage 2 video state
         stage2_video_state = stage2_video_tools.create_initial_state(device, dtype, upscaled_video_latent)
@@ -6323,12 +6332,7 @@ def generate_v2v_join(
         stage2_video_state = stage2_noiser(stage2_video_state, noise_scale=1.0)
 
         # Dummy audio state for stage 2
-        stage2_audio_latent_shape = AudioLatentShape.from_video_pixel_shape(
-            shape=VideoPixelShape(
-                batch_size=1, channels=3, frames=total_transition_frames,
-                height=stage1_height * 2, width=stage1_width * 2
-            )
-        )
+        stage2_audio_latent_shape = AudioLatentShape.from_video_pixel_shape(stage2_output_shape)
         stage2_audio_tools = AudioLatentTools(
             patchifier=stage2_components.audio_patchifier,
             target_shape=stage2_audio_latent_shape,
