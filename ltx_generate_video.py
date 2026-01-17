@@ -6495,11 +6495,7 @@ def generate_v2v_join(
     del parts, v1_prefix, v2_suffix, transition_video
     cleanup_memory()
 
-    # Convert back to float for output compatibility
-    # Use in-place division to reduce peak memory
-    final_video = final_video.float()
-    final_video.div_(255.0)
-
+    # Return uint8 tensor - encode_video expects uint8 [0-255]
     return final_video, None
 
 
