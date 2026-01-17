@@ -6405,6 +6405,14 @@ def generate_v2v_join(
     # =========================================================================
     print(">>> Decoding transition video...")
 
+    # Clear model state dict caches to free CPU RAM before decoding
+    # The DIT and text encoder are no longer needed
+    print(">>> Clearing model caches to free RAM...")
+    generator.stage_1_model_ledger.clear_state_dict_cache()
+    if not generator.one_stage:
+        generator.stage_2_model_ledger.clear_state_dict_cache()
+    cleanup_memory()
+
     video_decoder = generator.stage_1_model_ledger.video_decoder() if generator.one_stage else generator.stage_2_model_ledger.video_decoder()
     tiling_config = TilingConfig.default()
 
@@ -6483,8 +6491,14 @@ def generate_v2v_join(
     final_video = torch.cat(parts, dim=0)
     print(f">>> Final joined video: {final_video.shape}")
 
+    # Free intermediate tensors immediately after concatenation
+    del parts, v1_prefix, v2_suffix, transition_video
+    cleanup_memory()
+
     # Convert back to float for output compatibility
-    final_video = final_video.float() / 255.0
+    # Use in-place division to reduce peak memory
+    final_video = final_video.float()
+    final_video.div_(255.0)
 
     return final_video, None
 
