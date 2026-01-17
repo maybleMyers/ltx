@@ -6133,6 +6133,10 @@ def generate_v2v_join(
     else:
         denoise_fn = simple_denoising_func(v_context_p, a_context_p, transformer)
 
+    from ltx_core.types import VideoLatentShape, AudioLatentShape
+    from ltx_core.tools import VideoLatentTools, AudioLatentTools
+    from ltx_pipelines.utils.helpers import euler_denoising_loop
+
     # Create video shape and latent tools
     output_shape = VideoPixelShape(
         batch=1,
