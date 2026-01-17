@@ -6253,6 +6253,10 @@ def generate_v2v_join(
     preserve2_state = dataclass_replace(preserve2_state, positions=preserve2_positions)
     print(f">>> Preserve2 position offset: {time_offset2:.3f}s")
 
+    # Store sequence lengths for extraction after denoising
+    preserve1_seq_len = preserve1_state.latent.shape[1]
+    generate_seq_len = generate_state.latent.shape[1]
+
     # Concatenate states with clean_latent for post-denoising blending
     video_state = LatentState(
         latent=torch.cat([preserve1_state.latent, generate_state.latent, preserve2_state.latent], dim=1),
@@ -6284,12 +6288,33 @@ def generate_v2v_join(
         latent_norm_fn=latent_norm_fn,
     )
 
-    # Unpatchify
-    final_video_state = video_tools.clear_conditioning(final_video_state)
-    final_video_state = video_tools.unpatchify(final_video_state)
+    # Extract ONLY the generate tokens from final_video_state (matching AV extension pattern)
+    generate_start = preserve1_seq_len
+    generate_end = preserve1_seq_len + generate_seq_len
 
-    denoised_video_latent = final_video_state.latent
-    print(f">>> Denoised video latent: {denoised_video_latent.shape}")
+    print(f">>> Extracting generate tokens: {generate_start} to {generate_end}")
+
+    generate_final_state = LatentState(
+        latent=final_video_state.latent[:, generate_start:generate_end, :],
+        denoise_mask=final_video_state.denoise_mask[:, generate_start:generate_end, :],
+        positions=final_video_state.positions[:, :, generate_start:generate_end, :],
+        clean_latent=final_video_state.clean_latent[:, generate_start:generate_end, :] if final_video_state.clean_latent is not None else None,
+    )
+
+    # Unpatchify ONLY the generate region with generate_tools
+    generate_final_state = generate_tools.clear_conditioning(generate_final_state)
+    generate_final_state = generate_tools.unpatchify(generate_final_state)
+
+    # Get ORIGINAL preserved latents from input (not model output!)
+    original_preserve1_latent = video_latent[:, :, :gen_start_latent, :, :]
+    original_preserve2_latent = video_latent[:, :, gen_end_latent:, :, :]
+
+    # Get generated latent (unpatchified)
+    generated_latent = generate_final_state.latent
+
+    # Reconstruct full video: [original_preserve1, generated, original_preserve2]
+    denoised_video_latent = torch.cat([original_preserve1_latent, generated_latent, original_preserve2_latent], dim=2)
+    print(f">>> Reconstructed: preserve1={original_preserve1_latent.shape[2]}, gen={generated_latent.shape[2]}, preserve2={original_preserve2_latent.shape[2]}")
 
     # Cleanup transformer
     if block_swap_manager is not None:
