@@ -6279,11 +6279,6 @@ def generate_v2v_join(
             stage2_transformer.velocity_model.scale_shift_table = torch.nn.Parameter(
                 stage2_transformer.velocity_model.scale_shift_table.to(device)
             )
-            # Move args preprocessors to GPU (needed for timestep embedding)
-            if hasattr(stage2_transformer.velocity_model, "video_args_preprocessor"):
-                stage2_transformer.velocity_model.video_args_preprocessor.to(device)
-            if hasattr(stage2_transformer.velocity_model, "audio_args_preprocessor"):
-                stage2_transformer.velocity_model.audio_args_preprocessor.to(device)
             if hasattr(stage2_transformer.velocity_model, "audio_patchify_proj"):
                 stage2_transformer.velocity_model.audio_patchify_proj.to(device)
             if hasattr(stage2_transformer.velocity_model, "audio_adaln_single"):
