@@ -6451,13 +6451,14 @@ def generate_v2v_join(
         else:
             stage2_transformer = generator.stage_2_model_ledger.transformer()
 
-        # Stage 2 sigmas
-        stage2_sigmas = LTX2Scheduler().execute(
-            steps=args.stage2_steps,
-            latent=upscaled_video_latent,
-            terminal=0.0,
-            stretch=True,
-        ).to(dtype=torch.float32, device=device)
+        # Stage 2 sigmas (pre-tuned for distilled model, same as AV extension)
+        # Using fixed values avoids sigma=0 issues from LTX2Scheduler
+        STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
+        num_stage2_sigmas = min(args.stage2_steps + 1, len(STAGE_2_DISTILLED_SIGMA_VALUES))
+        stage2_sigmas = torch.tensor(
+            STAGE_2_DISTILLED_SIGMA_VALUES[:num_stage2_sigmas],
+            dtype=torch.float32, device=device
+        )
 
         # Stage 2 components
         stage2_components = generator.pipeline_components
