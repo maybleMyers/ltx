@@ -6108,6 +6108,7 @@ def generate_v2v_join(
     effective_stg_blocks = args.stg_blocks if args.stg_blocks is not None else [29]
     stg_guider = STGGuider(args.stg_scale)
     stg_perturbation_config = build_stg_perturbation_config(
+        stg_scale=args.stg_scale,
         stg_blocks=effective_stg_blocks,
         stg_mode=args.stg_mode,
     )
