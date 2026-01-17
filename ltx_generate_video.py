@@ -6113,54 +6113,43 @@ def generate_v2v_join(
         stg_mode=args.stg_mode,
     )
 
-    # Build context
-    from ltx_core.model.components import TextContext
-    video_context = TextContext(
-        context=v_context_p,
-        negative_context=v_context_n if args.cfg_guidance_scale > 1.0 else None,
-    )
-
     # Get components
-    components = generator.stage_1_model_ledger.dit_components()
+    components = generator.pipeline_components
 
-    # Define denoising function
-    def denoise_fn(
-        video_state: LatentState,
-        audio_state: LatentState,
-        sigma: torch.Tensor,
-        step_index: int,
-    ) -> tuple[LatentState, LatentState]:
-        sigma = sigma.to(device=device, dtype=dtype)
-
-        cfg_states = cfg_guider.pre_step_video_audio(video_state, audio_state, video_context, None)
-        stg_states = stg_guider.pre_step_video_audio(*cfg_states)
-
-        v_out, a_out = transformer(
-            *stg_states,
-            sigma.reshape(1),
-            stg_perturbation_config=stg_perturbation_config if step_index >= 3 else None,
+    # Create the denoise function (CFG + STG combined)
+    use_cfg = args.cfg_guidance_scale > 1.0 and v_context_n is not None
+    use_stg = stg_guider.enabled() and stg_perturbation_config is not None
+    if use_cfg or use_stg:
+        denoise_fn = cfg_stg_denoising_func(
+            cfg_guider=cfg_guider,
+            stg_guider=stg_guider,
+            stg_perturbation_config=stg_perturbation_config,
+            v_context_p=v_context_p,
+            v_context_n=v_context_n,
+            a_context_p=a_context_p,
+            a_context_n=a_context_n,
+            transformer=transformer,
         )
-
-        v_out, a_out = stg_guider.post_step_video_audio(v_out, a_out)
-        v_out, a_out = cfg_guider.post_step_video_audio(v_out, a_out)
-
-        return v_out, a_out
+    else:
+        denoise_fn = simple_denoising_func(v_context_p, a_context_p, transformer)
 
     # Create video shape and latent tools
     output_shape = VideoPixelShape(
-        batch_size=1,
-        channels=3,
+        batch=1,
         frames=total_transition_frames,
         height=stage1_height,
         width=stage1_width,
+        fps=output_fps,
     )
-    video_latent_shape = VideoLatentShape.from_video_pixel_shape(
+    video_latent_shape = VideoLatentShape.from_pixel_shape(
         shape=output_shape,
-        generator=generator,
+        latent_channels=components.video_latent_channels,
+        scale_factors=components.video_scale_factors,
     )
     video_tools = VideoLatentTools(
         patchifier=components.video_patchifier,
         target_shape=video_latent_shape,
+        fps=output_fps,
     )
 
     # Create initial video state with mask
