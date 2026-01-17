@@ -6133,7 +6133,7 @@ def generate_v2v_join(
     else:
         denoise_fn = simple_denoising_func(v_context_p, a_context_p, transformer)
 
-    from ltx_core.types import VideoLatentShape, AudioLatentShape
+    from ltx_core.types import VideoLatentShape, AudioLatentShape, LatentState
     from ltx_core.tools import VideoLatentTools, AudioLatentTools
     from ltx_pipelines.utils.helpers import euler_denoising_loop
 
@@ -6156,18 +6156,110 @@ def generate_v2v_join(
         fps=output_fps,
     )
 
-    # Create initial video state with mask
-    video_state = video_tools.create_initial_state(device, dtype, video_latent)
+    # Split the combined latent into three regions: preserve1, generate, preserve2
+    # gen_start_latent and gen_end_latent are already computed in Step 7
+    preserve1_lat = video_latent[:, :, :gen_start_latent, :, :]
+    generate_lat = video_latent[:, :, gen_start_latent:gen_end_latent, :, :]
+    preserve2_lat = video_latent[:, :, gen_end_latent:, :, :]
 
-    # Patchify the mask
-    patchified_video_mask = video_tools.patchifier.patchify(video_mask)
-    video_state = dataclass_replace(
-        video_state,
-        denoise_mask=patchified_video_mask.to(dtype=torch.float32),
+    print(f">>> Split latents: preserve1={preserve1_lat.shape[2]}, gen={generate_lat.shape[2]}, preserve2={preserve2_lat.shape[2]}")
+
+    # Calculate pixel frame counts for each region
+    preserve1_pixel_frames = (preserve1_lat.shape[2] - 1) * time_scale_factor + 1
+    generate_pixel_frames = (generate_lat.shape[2] - 1) * time_scale_factor + 1
+    preserve2_pixel_frames = (preserve2_lat.shape[2] - 1) * time_scale_factor + 1
+
+    # Create VideoLatentTools for each region
+    preserve1_shape = VideoPixelShape(
+        batch=1, frames=preserve1_pixel_frames,
+        height=stage1_height, width=stage1_width, fps=output_fps,
+    )
+    preserve1_latent_shape = VideoLatentShape.from_pixel_shape(
+        shape=preserve1_shape,
+        latent_channels=components.video_latent_channels,
+        scale_factors=components.video_scale_factors,
+    )
+    preserve1_tools = VideoLatentTools(
+        patchifier=components.video_patchifier,
+        target_shape=preserve1_latent_shape,
+        fps=output_fps,
     )
 
-    # Add noise based on mask
-    video_state = noiser(video_state, noise_scale=1.0)
+    generate_shape = VideoPixelShape(
+        batch=1, frames=generate_pixel_frames,
+        height=stage1_height, width=stage1_width, fps=output_fps,
+    )
+    generate_latent_shape = VideoLatentShape.from_pixel_shape(
+        shape=generate_shape,
+        latent_channels=components.video_latent_channels,
+        scale_factors=components.video_scale_factors,
+    )
+    generate_tools = VideoLatentTools(
+        patchifier=components.video_patchifier,
+        target_shape=generate_latent_shape,
+        fps=output_fps,
+    )
+
+    preserve2_shape = VideoPixelShape(
+        batch=1, frames=preserve2_pixel_frames,
+        height=stage1_height, width=stage1_width, fps=output_fps,
+    )
+    preserve2_latent_shape = VideoLatentShape.from_pixel_shape(
+        shape=preserve2_shape,
+        latent_channels=components.video_latent_channels,
+        scale_factors=components.video_scale_factors,
+    )
+    preserve2_tools = VideoLatentTools(
+        patchifier=components.video_patchifier,
+        target_shape=preserve2_latent_shape,
+        fps=output_fps,
+    )
+
+    # Create states for each region with proper masking
+    # Preserve1: mask=0 (no denoising), no noise
+    preserve1_state = preserve1_tools.create_initial_state(device, dtype, preserve1_lat)
+    preserve1_state = dataclass_replace(
+        preserve1_state,
+        denoise_mask=torch.zeros_like(preserve1_state.denoise_mask),
+    )
+
+    # Generate: mask=1 (full denoising), add noise - ONLY this region gets noise
+    generate_state = generate_tools.create_initial_state(device, dtype, generate_lat)
+    generate_state = dataclass_replace(
+        generate_state,
+        denoise_mask=torch.ones_like(generate_state.denoise_mask),
+    )
+    generate_state = noiser(generate_state, noise_scale=1.0)
+
+    # Preserve2: mask=0 (no denoising), no noise
+    preserve2_state = preserve2_tools.create_initial_state(device, dtype, preserve2_lat)
+    preserve2_state = dataclass_replace(
+        preserve2_state,
+        denoise_mask=torch.zeros_like(preserve2_state.denoise_mask),
+    )
+
+    # Offset positions for temporal continuity
+    # Generate region comes after preserve1
+    generate_positions = generate_state.positions.clone()
+    time_offset1 = preserve1_pixel_frames / output_fps
+    generate_positions[:, 0, :, :] += time_offset1
+    generate_state = dataclass_replace(generate_state, positions=generate_positions)
+    print(f">>> Generate position offset: {time_offset1:.3f}s (preserve1 has {preserve1_pixel_frames} pixel frames)")
+
+    # Preserve2 comes after preserve1 + generate
+    preserve2_positions = preserve2_state.positions.clone()
+    time_offset2 = (preserve1_pixel_frames + generate_pixel_frames) / output_fps
+    preserve2_positions[:, 0, :, :] += time_offset2
+    preserve2_state = dataclass_replace(preserve2_state, positions=preserve2_positions)
+    print(f">>> Preserve2 position offset: {time_offset2:.3f}s")
+
+    # Concatenate states with clean_latent for post-denoising blending
+    video_state = LatentState(
+        latent=torch.cat([preserve1_state.latent, generate_state.latent, preserve2_state.latent], dim=1),
+        denoise_mask=torch.cat([preserve1_state.denoise_mask, generate_state.denoise_mask, preserve2_state.denoise_mask], dim=1),
+        positions=torch.cat([preserve1_state.positions, generate_state.positions, preserve2_state.positions], dim=2),
+        clean_latent=torch.cat([preserve1_state.clean_latent, generate_state.clean_latent, preserve2_state.clean_latent], dim=1),
+    )
 
     # Create dummy audio state (no audio generation for V2V join)
     audio_latent_shape = AudioLatentShape.from_video_pixel_shape(shape=output_shape)
