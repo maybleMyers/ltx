@@ -6361,6 +6361,142 @@ def generate_v2v_join(
         del spatial_upsampler
         cleanup_memory()
 
+        # =====================================================================
+        # 9A-FIX: Re-encode preserved frames at full (Stage 2) resolution
+        # =====================================================================
+        # The LatentUpsampler is a neural network that modifies ALL latent values,
+        # corrupting the preserved frames. We fix this by:
+        # 1. Re-loading the input videos at full (Stage 2) resolution
+        # 2. Encoding them to latent space
+        # 3. Replacing the upsampler output's preserved frames with original encoding
+        print(">>> Re-encoding preserved frames at full Stage 2 resolution...")
+
+        stage2_width = stage1_width * 2
+        stage2_height = stage1_height * 2
+
+        # Re-encode video1 preserved frames (0 to gen_start_latent)
+        print(f">>> Loading video1 preserved frames at {stage2_width}x{stage2_height}...")
+        video1_full_res_frames, _ = load_video_segment(
+            video1_path, v1_start_frame, v1_end_frame,
+            stage2_width, stage2_height, device, dtype
+        )
+
+        # Resample to match preserve1_frames if needed
+        if video1_full_res_frames.shape[0] != preserve1_frames:
+            indices = torch.linspace(0, video1_full_res_frames.shape[0] - 1, preserve1_frames).long()
+            video1_full_res_frames = video1_full_res_frames[indices]
+
+        print(f">>> Loaded {video1_full_res_frames.shape[0]} frames from video1")
+
+        # Convert to encoder format [1, C, F, H, W] and normalize to [-1, 1]
+        video1_full_input = video1_full_res_frames.permute(3, 0, 1, 2).unsqueeze(0) * 2.0 - 1.0
+        del video1_full_res_frames
+
+        # Encode video1 in chunks
+        encoder_dtype = next(video_encoder.parameters()).dtype
+        chunk_pixel_frames = 65
+        video1_latent_chunks = []
+        chunk_idx_v1 = 0
+
+        with torch.no_grad():
+            for start_f in range(0, video1_full_input.shape[2], chunk_pixel_frames - 1):
+                end_f = min(start_f + chunk_pixel_frames, video1_full_input.shape[2])
+                actual_frames = end_f - start_f
+
+                if actual_frames < 9:
+                    pad_frames = 9 - actual_frames
+                    chunk = video1_full_input[:, :, start_f:end_f, :, :]
+                    last_frame = chunk[:, :, -1:, :, :].expand(-1, -1, pad_frames, -1, -1)
+                    chunk = torch.cat([chunk, last_frame], dim=2)
+                else:
+                    chunk = video1_full_input[:, :, start_f:end_f, :, :]
+
+                chunk_latent = video_encoder(chunk.to(device=device, dtype=encoder_dtype))
+                chunk_latent = chunk_latent.to(dtype=dtype)
+
+                if chunk_idx_v1 > 0 and len(video1_latent_chunks) > 0:
+                    chunk_latent = chunk_latent[:, :, 1:, :, :]
+
+                video1_latent_chunks.append(chunk_latent)
+                chunk_idx_v1 += 1
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        video1_full_latent = torch.cat(video1_latent_chunks, dim=2)
+        del video1_full_input, video1_latent_chunks
+        print(f">>> Video1 full-res latent: {video1_full_latent.shape}")
+
+        # Re-encode video2 preserved frames (gen_end_latent to end)
+        print(f">>> Loading video2 preserved frames at {stage2_width}x{stage2_height}...")
+        video2_full_res_frames, _ = load_video_segment(
+            video2_path, v2_start_frame, v2_end_frame,
+            stage2_width, stage2_height, device, dtype
+        )
+
+        # Resample to match preserve2_frames if needed
+        if video2_full_res_frames.shape[0] != preserve2_frames:
+            indices = torch.linspace(0, video2_full_res_frames.shape[0] - 1, preserve2_frames).long()
+            video2_full_res_frames = video2_full_res_frames[indices]
+
+        print(f">>> Loaded {video2_full_res_frames.shape[0]} frames from video2")
+
+        # Convert to encoder format [1, C, F, H, W] and normalize to [-1, 1]
+        video2_full_input = video2_full_res_frames.permute(3, 0, 1, 2).unsqueeze(0) * 2.0 - 1.0
+        del video2_full_res_frames
+
+        # Encode video2 in chunks
+        video2_latent_chunks = []
+        chunk_idx_v2 = 0
+
+        with torch.no_grad():
+            for start_f in range(0, video2_full_input.shape[2], chunk_pixel_frames - 1):
+                end_f = min(start_f + chunk_pixel_frames, video2_full_input.shape[2])
+                actual_frames = end_f - start_f
+
+                if actual_frames < 9:
+                    pad_frames = 9 - actual_frames
+                    chunk = video2_full_input[:, :, start_f:end_f, :, :]
+                    last_frame = chunk[:, :, -1:, :, :].expand(-1, -1, pad_frames, -1, -1)
+                    chunk = torch.cat([chunk, last_frame], dim=2)
+                else:
+                    chunk = video2_full_input[:, :, start_f:end_f, :, :]
+
+                chunk_latent = video_encoder(chunk.to(device=device, dtype=encoder_dtype))
+                chunk_latent = chunk_latent.to(dtype=dtype)
+
+                if chunk_idx_v2 > 0 and len(video2_latent_chunks) > 0:
+                    chunk_latent = chunk_latent[:, :, 1:, :, :]
+
+                video2_latent_chunks.append(chunk_latent)
+                chunk_idx_v2 += 1
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        video2_full_latent = torch.cat(video2_latent_chunks, dim=2)
+        del video2_full_input, video2_latent_chunks
+        print(f">>> Video2 full-res latent: {video2_full_latent.shape}")
+
+        # Replace upsampler output with original full-res encodings for preserved regions
+        # This ensures preserved regions have accurate content, not neural upsampler artifacts
+        print(f">>> Replacing preserved regions with full-res encodings...")
+        print(f">>>   Preserve1: frames 0-{gen_start_latent} (video1_full_latent has {video1_full_latent.shape[2]} frames)")
+        print(f">>>   Preserve2: frames {gen_end_latent}-{upscaled_video_latent.shape[2]} (video2_full_latent has {video2_full_latent.shape[2]} frames)")
+
+        # Copy video1 preserved frames (handle potential size mismatch)
+        copy_len1 = min(gen_start_latent, video1_full_latent.shape[2])
+        upscaled_video_latent[:, :, :copy_len1, :, :] = video1_full_latent[:, :, :copy_len1, :, :]
+
+        # Copy video2 preserved frames
+        preserve2_len = upscaled_video_latent.shape[2] - gen_end_latent
+        copy_len2 = min(preserve2_len, video2_full_latent.shape[2])
+        upscaled_video_latent[:, :, gen_end_latent:gen_end_latent + copy_len2, :, :] = video2_full_latent[:, :, :copy_len2, :, :]
+
+        del video1_full_latent, video2_full_latent
+        cleanup_memory()
+        print(">>> Preserved regions replaced with full-res encodings")
+
         # Stage 2 transformer with refinement
         print(">>> Loading stage 2 transformer...")
         stage2_block_swap_manager = None
@@ -6490,12 +6626,39 @@ def generate_v2v_join(
             transformer=stage2_transformer,
         )
 
-        # Create stage 2 video state (refinement only, no preservation mask needed)
-        # Stage 2 refines the entire video including preserved regions - this is fine because
-        # the preserved regions already contain correct content from Stage 1
+        # Create stage 2 video state with preservation mask
+        # Unlike the original comment, we DO need a preservation mask for Stage 2 to prevent
+        # re-denoising the preserved regions which would corrupt them
         stage2_video_state = stage2_video_tools.create_initial_state(device, dtype, upscaled_video_latent)
+
+        # Create Stage 2 preservation mask (mask=0 for preserved, mask=1 for generate)
+        # Upscale Stage 1 video_mask to Stage 2 resolution (2x spatial)
+        F_latent = upscaled_video_latent.shape[2]
+        H_latent_s2 = upscaled_video_latent.shape[3]
+        W_latent_s2 = upscaled_video_latent.shape[4]
+        stage2_video_mask = torch.zeros((1, 1, F_latent, H_latent_s2, W_latent_s2), device=device, dtype=torch.float32)
+        stage2_video_mask[:, :, gen_start_latent:gen_end_latent, :, :] = 1.0
+
+        # Apply slope at boundaries (same as Stage 1 mask)
+        if slope_len > 0:
+            for i in range(min(slope_len, gen_end_latent - gen_start_latent)):
+                slope_value = (i + 1) / (slope_len + 1)
+                stage2_video_mask[:, :, gen_start_latent + i, :, :] = slope_value
+            for i in range(min(slope_len, gen_end_latent - gen_start_latent)):
+                slope_value = (i + 1) / (slope_len + 1)
+                stage2_video_mask[:, :, gen_end_latent - 1 - i, :, :] = slope_value
+
+        # Patchify and apply preservation mask
+        patchified_stage2_video_mask = stage2_video_tools.patchifier.patchify(stage2_video_mask)
+        stage2_video_state = dataclass_replace(
+            stage2_video_state,
+            denoise_mask=patchified_stage2_video_mask.to(dtype=torch.float32),
+        )
+        print(f">>> Stage 2 preservation mask created: generate region {gen_start_latent}-{gen_end_latent}")
+
+        # Apply noiser with correct noise scale (matches AV extension)
         stage2_noiser = GaussianNoiser(generator=torch.Generator(device=device).manual_seed(args.seed + 1))
-        stage2_video_state = stage2_noiser(stage2_video_state, noise_scale=1.0)
+        stage2_video_state = stage2_noiser(stage2_video_state, noise_scale=stage2_sigmas[0].item())
 
         # Dummy audio state for stage 2
         stage2_audio_latent_shape = AudioLatentShape.from_video_pixel_shape(stage2_output_shape)
