@@ -3106,6 +3106,10 @@ class LTXVideoGeneratorWithOffloading:
                     overlap_latent = overlap_pixels // 8
                     stride = chunk_size - overlap_pixels
 
+                    enc_tile_size = 17
+                    enc_tile_overlap = 8
+                    enc_tile_stride = enc_tile_size - enc_tile_overlap
+
                     print(f">>> V2V Sequential: {actual_frames} frames, chunk={chunk_size}, overlap={overlap_pixels}")
 
                     accumulated_latent = None
@@ -3121,21 +3125,7 @@ class LTXVideoGeneratorWithOffloading:
 
                         chunk_conditionings = list(stage_1_conditionings)
 
-                        chunk_tensor = video_tensor[:, :, frame_start:frame_end, :, :].to(device=self.device, dtype=dtype)
-                        with torch.no_grad():
-                            encoded_chunk = video_encoder(chunk_tensor)
-                        del chunk_tensor
-                        torch.cuda.empty_cache()
-
-                        if chunk_idx == 0:
-                            chunk_conditionings.append(
-                                VideoConditionByKeyframeIndex(
-                                    keyframes=encoded_chunk.cpu(),
-                                    frame_idx=0,
-                                    strength=refine_strength,
-                                )
-                            )
-                        else:
+                        if chunk_idx > 0:
                             overlap_from_prev = accumulated_latent[:, :, -overlap_latent:, :, :].to(self.device)
                             chunk_conditionings.append(
                                 VideoConditionByLatentIndex(
@@ -3144,17 +3134,45 @@ class LTXVideoGeneratorWithOffloading:
                                     latent_idx=0,
                                 )
                             )
-                            new_region = encoded_chunk[:, :, overlap_latent:, :, :]
-                            if new_region.shape[2] > 0:
-                                chunk_conditionings.append(
-                                    VideoConditionByKeyframeIndex(
-                                        keyframes=new_region.cpu(),
-                                        frame_idx=overlap_pixels,
-                                        strength=refine_strength,
-                                    )
+
+                        enc_frame_idx = 0
+                        while enc_frame_idx < valid_frames:
+                            enc_end = min(enc_frame_idx + enc_tile_size, valid_frames)
+                            enc_tile_frames = enc_end - enc_frame_idx
+                            enc_valid = ((enc_tile_frames - 1) // 8) * 8 + 1
+                            if enc_valid < 9:
+                                break
+                            enc_end = enc_frame_idx + enc_valid
+
+                            tile = video_tensor[:, :, frame_start + enc_frame_idx:frame_start + enc_end, :, :].to(device=self.device, dtype=dtype)
+                            with torch.no_grad():
+                                encoded_tile = video_encoder(tile)
+                            del tile
+                            torch.cuda.empty_cache()
+
+                            cond_frame_idx = enc_frame_idx
+                            if chunk_idx > 0 and enc_frame_idx < overlap_pixels:
+                                cond_frame_idx = overlap_pixels
+                                skip_latent = overlap_latent
+                                encoded_tile = encoded_tile[:, :, skip_latent:, :, :]
+                                if encoded_tile.shape[2] == 0:
+                                    del encoded_tile
+                                    enc_frame_idx += enc_tile_stride
+                                    continue
+
+                            chunk_conditionings.append(
+                                VideoConditionByKeyframeIndex(
+                                    keyframes=encoded_tile.cpu(),
+                                    frame_idx=cond_frame_idx,
+                                    strength=refine_strength,
                                 )
-                        del encoded_chunk
-                        torch.cuda.empty_cache()
+                            )
+                            del encoded_tile
+                            torch.cuda.empty_cache()
+
+                            enc_frame_idx += enc_tile_stride
+                            if enc_frame_idx >= valid_frames - 8:
+                                break
 
                         chunk_shape = VideoPixelShape(
                             batch=1,
