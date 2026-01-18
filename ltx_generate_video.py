@@ -3176,7 +3176,8 @@ class LTXVideoGeneratorWithOffloading:
                 else:
                     v2v_audio_latent = None
 
-            # V2A Mode: Freeze entire video, generate fresh audio
+            # V2A Mode: Freeze entire video, optionally preserve audio
+            v2a_preserved_audio_latent = None
             if v2a_mode and input_video:
                 from ltx_core.conditioning import VideoConditionByLatentIndex
                 print(f">>> V2A Mode: Encoding input video (video will be frozen)...")
@@ -3221,9 +3222,8 @@ class LTXVideoGeneratorWithOffloading:
                 print(f">>> V2A: {num_latent_frames} video frames frozen (stage 1) in {time.time() - v2a_start:.1f}s")
 
                 # V2A: Handle audio extraction based on strength
-                # Note: Currently strength is binary - <1.0 preserves audio, 1.0 generates fresh
                 if v2a_strength < 1.0 and not disable_audio:
-                    print(f">>> V2A: Extracting audio from input video (strength={v2a_strength})...")
+                    print(f">>> V2A: Extracting audio from input video (will preserve, strength={v2a_strength})...")
                     waveform, sample_rate = decode_audio_from_file(input_video, self.device)
 
                     if waveform is not None:
@@ -3259,17 +3259,15 @@ class LTXVideoGeneratorWithOffloading:
                             waveform_sample_rate=sample_rate
                         )
 
-                        v2v_audio_latent = audio_encoder(mel_spectrogram.to(dtype=torch.float32))
-                        v2v_audio_latent = v2v_audio_latent.to(dtype=dtype)
+                        v2a_preserved_audio_latent = audio_encoder(mel_spectrogram.to(dtype=torch.float32))
+                        v2a_preserved_audio_latent = v2a_preserved_audio_latent.to(dtype=dtype)
 
                         del audio_encoder, audio_processor
                         cleanup_memory()
-                        print(f">>> V2A: Audio extracted and will be preserved (strength={v2a_strength})")
+                        print(f">>> V2A: Audio extracted and will be preserved (skipping audio generation)")
                     else:
-                        v2v_audio_latent = None
                         print(">>> V2A: Input video has no audio track, will generate fresh audio")
                 else:
-                    v2v_audio_latent = None
                     print(">>> V2A: Audio will be generated fresh (strength=1.0)")
 
             # Depth Control: Add depth conditioning for IC-LoRA
@@ -3450,14 +3448,24 @@ class LTXVideoGeneratorWithOffloading:
 
                 if not disable_audio:
                     print(">>> Decoding audio...")
-                    # Load audio models only after video decoder is offloaded
                     audio_decoder = self.stage_1_model_ledger.audio_decoder()
                     vocoder = self.stage_1_model_ledger.vocoder()
-                    decoded_audio = vae_decode_audio(
-                        audio_state.latent,
-                        audio_decoder,
-                        vocoder,
-                    )
+
+                    # Use preserved audio if V2A mode extracted it
+                    if v2a_preserved_audio_latent is not None:
+                        print(">>> V2A: Decoding preserved audio from input video")
+                        decoded_audio = vae_decode_audio(
+                            v2a_preserved_audio_latent,
+                            audio_decoder,
+                            vocoder,
+                        )
+                    else:
+                        decoded_audio = vae_decode_audio(
+                            audio_state.latent,
+                            audio_decoder,
+                            vocoder,
+                        )
+
                     audio_decoder.to("cpu")
                     vocoder.to("cpu")
                     del audio_decoder, vocoder
@@ -4079,15 +4087,24 @@ class LTXVideoGeneratorWithOffloading:
 
         if not disable_audio:
             print(">>> Decoding audio...")
-            # Load audio models only after video decoder is offloaded
             audio_decoder = self.stage_2_model_ledger.audio_decoder()
             vocoder = self.stage_2_model_ledger.vocoder()
-            decoded_audio = vae_decode_audio(
-                audio_state.latent,
-                audio_decoder,
-                vocoder,
-            )
-            # Offload audio models
+
+            # Use preserved audio if V2A mode extracted it
+            if v2a_preserved_audio_latent is not None:
+                print(">>> V2A: Decoding preserved audio from input video")
+                decoded_audio = vae_decode_audio(
+                    v2a_preserved_audio_latent,
+                    audio_decoder,
+                    vocoder,
+                )
+            else:
+                decoded_audio = vae_decode_audio(
+                    audio_state.latent,
+                    audio_decoder,
+                    vocoder,
+                )
+
             audio_decoder.to("cpu")
             vocoder.to("cpu")
             del audio_decoder, vocoder
