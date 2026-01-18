@@ -2801,6 +2801,7 @@ class LTXVideoGeneratorWithOffloading:
 
             # Skip Phase 2, 3 - go directly to Phase 4 (Stage 2)
             block_swap_manager = None
+            depth_tensor = None  # Not used in refine-only mode
             video_encoder = None  # Not needed for refine-only
 
         # =====================================================================
