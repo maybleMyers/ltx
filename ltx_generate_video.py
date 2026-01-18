@@ -3360,34 +3360,34 @@ class LTXVideoGeneratorWithOffloading:
 
             # For one-stage, skip upsampling and stage 2 refinement
             if self.one_stage:
-                # Cleanup video encoder
                 video_encoder = None
                 cleanup_memory()
 
-                # Skip directly to VAE decoding (sequential loading to minimize peak memory)
-                print(">>> Decoding video...")
-                decode_start = time.time()
+                if v2a_mode:
+                    print(">>> V2A Mode: Skipping video decoding (will use original input video)")
+                    decoded_video = None
+                    decode_start = time.time()
+                else:
+                    print(">>> Decoding video...")
+                    decode_start = time.time()
 
-                # Load video decoder, decode, then offload
-                video_decoder = self.stage_1_model_ledger.video_decoder()
-                # vae_decode_video returns a generator - consume it immediately before offloading decoder
-                decoded_video_chunks = []
-                for chunk in vae_decode_video(
-                    video_state.latent,
-                    video_decoder,
-                    tiling_config,
-                ):
-                    decoded_video_chunks.append(chunk.cpu())  # Move chunks to CPU immediately
-                    del chunk
-                # Create a generator that yields the cached chunks for encode_video compatibility
-                def decoded_video_iter():
-                    for chunk in decoded_video_chunks:
-                        yield chunk.cuda()  # Move back to GPU when consumed
-                decoded_video = decoded_video_iter()
-                video_decoder.to("cpu")
-                del video_decoder
-                synchronize_and_cleanup()
-                phase_barrier("video_decoding_one_stage")
+                    video_decoder = self.stage_1_model_ledger.video_decoder()
+                    decoded_video_chunks = []
+                    for chunk in vae_decode_video(
+                        video_state.latent,
+                        video_decoder,
+                        tiling_config,
+                    ):
+                        decoded_video_chunks.append(chunk.cpu())
+                        del chunk
+                    def decoded_video_iter():
+                        for chunk in decoded_video_chunks:
+                            yield chunk.cuda()
+                    decoded_video = decoded_video_iter()
+                    video_decoder.to("cpu")
+                    del video_decoder
+                    synchronize_and_cleanup()
+                    phase_barrier("video_decoding_one_stage")
 
                 if not disable_audio:
                     print(">>> Decoding audio...")
@@ -3991,30 +3991,32 @@ class LTXVideoGeneratorWithOffloading:
         # =====================================================================
         # Phase 5: VAE Decoding (Sequential loading to minimize peak memory)
         # =====================================================================
-        print(">>> Decoding video...")
-        decode_start = time.time()
 
-        # Load video decoder, decode, then offload to free memory before audio
-        video_decoder = self.stage_2_model_ledger.video_decoder()
-        # vae_decode_video returns a generator - consume it immediately before offloading decoder
-        decoded_video_chunks = []
-        for chunk in vae_decode_video(
-            video_state.latent,
-            video_decoder,
-            tiling_config,
-        ):
-            decoded_video_chunks.append(chunk.cpu())  # Move chunks to CPU immediately
-            del chunk
-        # Create a generator that yields the cached chunks for encode_video compatibility
-        def decoded_video_iter():
-            for chunk in decoded_video_chunks:
-                yield chunk.cuda()  # Move back to GPU when consumed
-        decoded_video = decoded_video_iter()
-        # Offload video decoder before loading audio models
-        video_decoder.to("cpu")
-        del video_decoder
-        synchronize_and_cleanup()
-        phase_barrier("video_decoding_two_stage")
+        if v2a_mode:
+            print(">>> V2A Mode: Skipping video decoding (will use original input video)")
+            decoded_video = None
+            decode_start = time.time()
+        else:
+            print(">>> Decoding video...")
+            decode_start = time.time()
+
+            video_decoder = self.stage_2_model_ledger.video_decoder()
+            decoded_video_chunks = []
+            for chunk in vae_decode_video(
+                video_state.latent,
+                video_decoder,
+                tiling_config,
+            ):
+                decoded_video_chunks.append(chunk.cpu())
+                del chunk
+            def decoded_video_iter():
+                for chunk in decoded_video_chunks:
+                    yield chunk.cuda()
+            decoded_video = decoded_video_iter()
+            video_decoder.to("cpu")
+            del video_decoder
+            synchronize_and_cleanup()
+            phase_barrier("video_decoding_two_stage")
 
         if not disable_audio:
             print(">>> Decoding audio...")
@@ -8154,14 +8156,42 @@ def main():
     print(f">>> Encoding video to {args.output_path}...")
     encode_start = time.time()
 
-    encode_video(
-        video=video,
-        fps=args.frame_rate,
-        audio=audio,
-        audio_sample_rate=AUDIO_SAMPLE_RATE if audio is not None else None,
-        output_path=args.output_path,
-        video_chunks_number=video_chunks_number,
-    )
+    if args.v2a_mode and args.input_video:
+        import subprocess
+        import tempfile
+        import os
+        import torchaudio
+
+        print(">>> V2A Mode: Combining original video with generated audio...")
+
+        temp_audio = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+        temp_audio_path = temp_audio.name
+        temp_audio.close()
+
+        torchaudio.save(temp_audio_path, audio.cpu(), AUDIO_SAMPLE_RATE)
+
+        subprocess.run([
+            'ffmpeg', '-y',
+            '-i', args.input_video,
+            '-i', temp_audio_path,
+            '-c:v', 'copy',
+            '-c:a', 'aac',
+            '-map', '0:v:0',
+            '-map', '1:a:0',
+            '-shortest',
+            args.output_path
+        ], check=True)
+
+        os.unlink(temp_audio_path)
+    else:
+        encode_video(
+            video=video,
+            fps=args.frame_rate,
+            audio=audio,
+            audio_sample_rate=AUDIO_SAMPLE_RATE if audio is not None else None,
+            output_path=args.output_path,
+            video_chunks_number=video_chunks_number,
+        )
 
     print(f">>> Video saved in {time.time() - encode_start:.1f}s")
 
