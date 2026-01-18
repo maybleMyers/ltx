@@ -1689,6 +1689,18 @@ Examples:
         default=10,
         help="Number of refinement steps for refine-only mode. Default: 10",
     )
+    v2v_group.add_argument(
+        "--v2v-chunk-frames",
+        type=int,
+        default=121,
+        help="Frames per chunk for sequential V2V (8k+1). Default: 121",
+    )
+    v2v_group.add_argument(
+        "--v2v-overlap-frames",
+        type=int,
+        default=24,
+        help="Overlap frames between chunks (divisible by 8). Default: 24",
+    )
 
     # ==========================================================================
     # V2A Mode (Video-to-Audio)
@@ -2526,6 +2538,21 @@ class LTXVideoGeneratorWithOffloading:
             device=self.device,
         )
 
+    @staticmethod
+    def _linear_blend_latents(
+        latent1: torch.Tensor,
+        latent2: torch.Tensor,
+        overlap_frames: int,
+    ) -> torch.Tensor:
+        alpha = torch.linspace(1, 0, overlap_frames, device=latent1.device, dtype=latent1.dtype)
+        alpha = alpha.view(1, 1, -1, 1, 1)
+        pre_overlap = latent1[:, :, :-overlap_frames, :, :]
+        overlap_1 = latent1[:, :, -overlap_frames:, :, :]
+        overlap_2 = latent2[:, :, :overlap_frames, :, :]
+        post_overlap = latent2[:, :, overlap_frames:, :, :]
+        blended = alpha * overlap_1 + (1 - alpha) * overlap_2
+        return torch.cat([pre_overlap, blended, post_overlap], dim=2)
+
     @torch.inference_mode()
     def generate(
         self,
@@ -2577,6 +2604,9 @@ class LTXVideoGeneratorWithOffloading:
         # V2A mode (video-to-audio: freeze video, generate audio)
         v2a_mode: bool = False,
         v2a_strength: float = 1.0,
+        # Sequential V2V chunk processing
+        v2v_chunk_frames: int = 121,
+        v2v_overlap_frames: int = 24,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor | None, str | None]:
         """
         Generate video with optional audio.
@@ -3051,15 +3081,14 @@ class LTXVideoGeneratorWithOffloading:
 
             # V2V: Add video conditioning from input video (like ic_lora pipeline)
             # Uses tiled encoding to handle long videos without OOM
-            v2v_audio_latent = None  # Will be set if input_video has audio
-            # V2V Mode: Add video conditioning for refinement
-            # Skip if V2A mode is active (V2A will handle video freezing)
+            v2v_audio_latent = None
+            v2v_sequential_latent = None
+            v2v_sequential_audio_state = None
             if input_video and not self.refine_only and not v2a_mode:
-                from ltx_core.conditioning import VideoConditionByKeyframeIndex
-                print(f">>> V2V: Loading and encoding input video with tiled encoding...")
+                from ltx_core.conditioning import VideoConditionByKeyframeIndex, VideoConditionByLatentIndex
+                print(f">>> V2V: Loading and encoding input video...")
                 v2v_start = time.time()
 
-                # Load input video at stage 1 resolution - keep on CPU to save GPU memory
                 video_tensor = load_video_conditioning(
                     video_path=input_video,
                     height=stage_1_output_shape.height,
@@ -3069,60 +3098,149 @@ class LTXVideoGeneratorWithOffloading:
                     device=torch.device("cpu"),
                 )
 
-                # Tiled encoding parameters (matching decoder's default temporal tiling)
-                # tile_size must be 8k+1 for valid VAE input
-                # Use small tiles since transformer is already in GPU memory
-                tile_size = 17  # 2 latent frames + 1 - minimal size for memory safety
-                tile_overlap = 8  # Overlap in pixel frames (divisible by 8)
-                tile_stride = tile_size - tile_overlap  # Non-overlapping portion
-
                 actual_frames = video_tensor.shape[2]
-                num_chunks = 0
 
-                # Encode video in overlapping tiles
-                frame_idx = 0
-                while frame_idx < actual_frames:
-                    # Calculate chunk bounds
-                    chunk_end = min(frame_idx + tile_size, actual_frames)
-                    chunk_frames = chunk_end - frame_idx
+                if self.one_stage:
+                    chunk_size = v2v_chunk_frames
+                    overlap_pixels = v2v_overlap_frames
+                    overlap_latent = overlap_pixels // 8
+                    stride = chunk_size - overlap_pixels
 
-                    # Ensure valid frame count (8k+1) for VAE
-                    valid_frames = ((chunk_frames - 1) // 8) * 8 + 1
-                    if valid_frames < 9:  # Need at least 9 frames for meaningful encoding
-                        break
-                    chunk_end = frame_idx + valid_frames
+                    print(f">>> V2V Sequential: {actual_frames} frames, chunk={chunk_size}, overlap={overlap_pixels}")
 
-                    # Extract chunk and move to GPU for encoding
-                    chunk = video_tensor[:, :, frame_idx:chunk_end, :, :].to(device=self.device, dtype=dtype)
-                    with torch.no_grad():
-                        encoded_chunk = video_encoder(chunk)
-                    del chunk
-                    torch.cuda.empty_cache()
+                    accumulated_latent = None
+                    frame_start = 0
+                    chunk_idx = 0
 
-                    # Move encoded latent to CPU to free GPU memory
-                    encoded_chunk_cpu = encoded_chunk.cpu()
-                    del encoded_chunk
-                    torch.cuda.empty_cache()
+                    while frame_start < actual_frames:
+                        frame_end = min(frame_start + chunk_size, actual_frames)
+                        valid_frames = ((frame_end - frame_start - 1) // 8) * 8 + 1
+                        if valid_frames < 9:
+                            break
+                        frame_end = frame_start + valid_frames
 
-                    # Add as keyframe conditioning with frame offset
-                    stage_1_conditionings.append(
-                        VideoConditionByKeyframeIndex(
-                            keyframes=encoded_chunk_cpu,
-                            frame_idx=frame_idx,
-                            strength=refine_strength,
+                        chunk_conditionings = list(image_conditionings)
+
+                        chunk_tensor = video_tensor[:, :, frame_start:frame_end, :, :].to(device=self.device, dtype=dtype)
+                        with torch.no_grad():
+                            encoded_chunk = video_encoder(chunk_tensor)
+                        del chunk_tensor
+                        torch.cuda.empty_cache()
+
+                        if chunk_idx == 0:
+                            chunk_conditionings.append(
+                                VideoConditionByKeyframeIndex(
+                                    keyframes=encoded_chunk.cpu(),
+                                    frame_idx=0,
+                                    strength=refine_strength,
+                                )
+                            )
+                        else:
+                            overlap_from_prev = accumulated_latent[:, :, -overlap_latent:, :, :].to(self.device)
+                            chunk_conditionings.append(
+                                VideoConditionByLatentIndex(
+                                    latent=overlap_from_prev,
+                                    strength=0.95,
+                                    latent_idx=0,
+                                )
+                            )
+                            new_region = encoded_chunk[:, :, overlap_latent:, :, :]
+                            if new_region.shape[2] > 0:
+                                chunk_conditionings.append(
+                                    VideoConditionByKeyframeIndex(
+                                        keyframes=new_region.cpu(),
+                                        frame_idx=overlap_pixels,
+                                        strength=refine_strength,
+                                    )
+                                )
+                        del encoded_chunk
+                        torch.cuda.empty_cache()
+
+                        chunk_shape = VideoPixelShape(
+                            batch=1,
+                            frames=valid_frames,
+                            width=stage_1_output_shape.width,
+                            height=stage_1_output_shape.height,
+                            fps=frame_rate,
                         )
-                    )
-                    num_chunks += 1
 
-                    # Move to next tile (with overlap)
-                    frame_idx += tile_stride
-                    if frame_idx >= actual_frames - 8:  # Don't create tiny final chunks
-                        break
+                        chunk_video_state, chunk_audio_state = denoise_audio_video(
+                            output_shape=chunk_shape,
+                            conditionings=chunk_conditionings,
+                            noiser=noiser,
+                            sigmas=sigmas,
+                            stepper=stepper,
+                            denoising_loop_fn=first_stage_denoising_loop,
+                            components=self.pipeline_components,
+                            dtype=dtype,
+                            device=self.device,
+                            initial_audio_latent=None,
+                            audio_conditionings=None,
+                            audio_noise_scale=1.0,
+                        )
 
-                # Clean up video tensor
-                del video_tensor
+                        chunk_latent = chunk_video_state.latent.cpu()
 
-                print(f">>> V2V: Added {num_chunks} video conditioning chunks (strength={refine_strength}) in {time.time() - v2v_start:.1f}s")
+                        if accumulated_latent is None:
+                            accumulated_latent = chunk_latent
+                        else:
+                            accumulated_latent = self._linear_blend_latents(
+                                accumulated_latent, chunk_latent, overlap_latent
+                            )
+
+                        print(f">>> V2V Sequential: Chunk {chunk_idx+1} done (frames {frame_start}-{frame_end})")
+
+                        frame_start += stride
+                        chunk_idx += 1
+
+                    del video_tensor
+
+                    v2v_sequential_latent = accumulated_latent
+                    v2v_sequential_audio_state = chunk_audio_state if chunk_idx > 0 else None
+                    print(f">>> V2V Sequential: {chunk_idx} chunks processed in {time.time() - v2v_start:.1f}s")
+
+                else:
+                    tile_size = 17
+                    tile_overlap = 8
+                    tile_stride = tile_size - tile_overlap
+
+                    num_chunks = 0
+                    frame_idx = 0
+                    while frame_idx < actual_frames:
+                        chunk_end = min(frame_idx + tile_size, actual_frames)
+                        chunk_frames = chunk_end - frame_idx
+
+                        valid_frames = ((chunk_frames - 1) // 8) * 8 + 1
+                        if valid_frames < 9:
+                            break
+                        chunk_end = frame_idx + valid_frames
+
+                        chunk = video_tensor[:, :, frame_idx:chunk_end, :, :].to(device=self.device, dtype=dtype)
+                        with torch.no_grad():
+                            encoded_chunk = video_encoder(chunk)
+                        del chunk
+                        torch.cuda.empty_cache()
+
+                        encoded_chunk_cpu = encoded_chunk.cpu()
+                        del encoded_chunk
+                        torch.cuda.empty_cache()
+
+                        stage_1_conditionings.append(
+                            VideoConditionByKeyframeIndex(
+                                keyframes=encoded_chunk_cpu,
+                                frame_idx=frame_idx,
+                                strength=refine_strength,
+                            )
+                        )
+                        num_chunks += 1
+
+                        frame_idx += tile_stride
+                        if frame_idx >= actual_frames - 8:
+                            break
+
+                    del video_tensor
+
+                    print(f">>> V2V: Added {num_chunks} video conditioning chunks (strength={refine_strength}) in {time.time() - v2v_start:.1f}s")
 
                 # Extract and encode audio from input video to preserve it
                 # Skip if V2A mode is active (V2A will handle audio extraction)
@@ -3372,26 +3490,55 @@ class LTXVideoGeneratorWithOffloading:
                     print(">>> Warning: Could not load audio file")
 
             stage_label = "One-stage" if self.one_stage else "Stage 1"
-            print(f">>> {stage_label}: Generating at {stage_1_output_shape.width}x{stage_1_output_shape.height}...")
 
-            # For V2A mode with audio refinement, adjust noise scale based on strength
-            # strength 0.0 = no noise (keep original), strength 1.0 = full noise (regenerate)
-            audio_noise_scale = v2a_strength if v2a_preserved_audio_latent is not None else 1.0
+            if v2v_sequential_latent is not None:
+                print(f">>> {stage_label}: Using pre-computed sequential V2V result...")
 
-            video_state, audio_state = denoise_audio_video(
-                output_shape=stage_1_output_shape,
-                conditionings=stage_1_conditionings,
-                noiser=noiser,
-                sigmas=sigmas,
-                stepper=stepper,
-                denoising_loop_fn=first_stage_denoising_loop,
-                components=self.pipeline_components,
-                dtype=dtype,
-                device=self.device,
-                initial_audio_latent=v2a_preserved_audio_latent,
-                audio_conditionings=audio_conditionings if audio_conditionings else None,
-                audio_noise_scale=audio_noise_scale,
-            )
+                seq_latent = v2v_sequential_latent.to(device=self.device, dtype=dtype)
+                video_state = LatentState(
+                    latent=seq_latent,
+                    denoise_mask=torch.zeros(1, seq_latent.shape[1] * seq_latent.shape[3] * seq_latent.shape[4], device=self.device, dtype=dtype),
+                    positions=torch.zeros(1, seq_latent.shape[1] * seq_latent.shape[3] * seq_latent.shape[4], 3, device=self.device, dtype=torch.long),
+                    clean_latent=seq_latent.clone(),
+                )
+
+                if v2v_sequential_audio_state is not None:
+                    audio_state = v2v_sequential_audio_state
+                else:
+                    audio_noise_scale = v2a_strength if v2a_preserved_audio_latent is not None else 1.0
+                    _, audio_state = denoise_audio_video(
+                        output_shape=stage_1_output_shape,
+                        conditionings=[],
+                        noiser=noiser,
+                        sigmas=sigmas,
+                        stepper=stepper,
+                        denoising_loop_fn=first_stage_denoising_loop,
+                        components=self.pipeline_components,
+                        dtype=dtype,
+                        device=self.device,
+                        initial_audio_latent=v2a_preserved_audio_latent,
+                        audio_conditionings=audio_conditionings if audio_conditionings else None,
+                        audio_noise_scale=audio_noise_scale,
+                    )
+            else:
+                print(f">>> {stage_label}: Generating at {stage_1_output_shape.width}x{stage_1_output_shape.height}...")
+
+                audio_noise_scale = v2a_strength if v2a_preserved_audio_latent is not None else 1.0
+
+                video_state, audio_state = denoise_audio_video(
+                    output_shape=stage_1_output_shape,
+                    conditionings=stage_1_conditionings,
+                    noiser=noiser,
+                    sigmas=sigmas,
+                    stepper=stepper,
+                    denoising_loop_fn=first_stage_denoising_loop,
+                    components=self.pipeline_components,
+                    dtype=dtype,
+                    device=self.device,
+                    initial_audio_latent=v2a_preserved_audio_latent,
+                    audio_conditionings=audio_conditionings if audio_conditionings else None,
+                    audio_noise_scale=audio_noise_scale,
+                )
 
             print(f">>> {stage_label} completed in {time.time() - stage1_start:.1f}s", flush=True)
 
@@ -8196,23 +8343,21 @@ def main():
             anchor_decay=args.anchor_decay,
             audio=args.audio,
             audio_strength=args.audio_strength,
-            # STG parameters
             stg_scale=args.stg_scale,
             stg_blocks=args.stg_blocks,
             stg_mode=args.stg_mode,
             preview_callback=preview_callback,
             preview_callback_interval=args.preview_interval,
-            # Depth Control (IC-LoRA) parameters
             depth_video=args.depth_video,
             depth_image=args.depth_image,
             estimate_depth=args.estimate_depth,
             depth_strength=args.depth_strength,
             depth_stage2=args.depth_stage2,
-            # Latent normalization (fixes overbaking/audio clipping)
             latent_norm_fn=latent_norm_fn,
-            # V2A mode (freeze video, generate audio)
             v2a_mode=args.v2a_mode,
             v2a_strength=args.v2a_strength,
+            v2v_chunk_frames=args.v2v_chunk_frames,
+            v2v_overlap_frames=args.v2v_overlap_frames,
         )
 
     # Encode and save video

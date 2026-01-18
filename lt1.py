@@ -964,6 +964,8 @@ def generate_ltx_video(
     input_video: str,
     refine_strength: float,
     refine_steps: int,
+    v2v_chunk_frames: int,
+    v2v_overlap_frames: int,
     # Audio & prompt
     disable_audio: bool,
     audio_input: str,
@@ -1172,6 +1174,8 @@ def generate_ltx_video(
             command.extend(["--input-video", str(input_video)])
             command.extend(["--refine-strength", str(float(refine_strength))])
             command.extend(["--refine-steps", str(int(refine_steps))])
+            command.extend(["--v2v-chunk-frames", str(int(v2v_chunk_frames))])
+            command.extend(["--v2v-overlap-frames", str(int(v2v_overlap_frames))])
 
         # Image conditioning (I2V)
         if mode == "i2v" and input_image:
@@ -2085,6 +2089,17 @@ def create_interface():
                                     minimum=1, maximum=30, value=10, step=1,
                                     label="Refine Steps",
                                     info="Number of refinement denoising steps"
+                                )
+                            with gr.Row():
+                                v2v_chunk_frames = gr.Slider(
+                                    minimum=25, maximum=257, value=121, step=8,
+                                    label="V2V Chunk Frames",
+                                    info="Frames per chunk for sequential V2V (8k+1)"
+                                )
+                                v2v_overlap_frames = gr.Slider(
+                                    minimum=8, maximum=64, value=24, step=8,
+                                    label="V2V Overlap Frames",
+                                    info="Overlap frames between chunks (divisible by 8)"
                                 )
 
                         # Depth Control (IC-LoRA)
@@ -3148,7 +3163,7 @@ Audio is synchronized with the video extension.
                 input_image, image_frame_idx, image_strength,
                 end_image, end_image_strength,
                 anchor_image, anchor_interval, anchor_strength, anchor_decay,
-                input_video, refine_strength, refine_steps,
+                input_video, refine_strength, refine_steps, v2v_chunk_frames, v2v_overlap_frames,
                 disable_audio, audio_input, audio_strength, enhance_prompt,
                 offload, enable_fp8,
                 enable_dit_block_swap, dit_blocks_in_memory,
@@ -3257,6 +3272,8 @@ Audio is synchronized with the video extension.
                 # Refine settings
                 gr.update(value=metadata.get("refine_strength", 0.3)),  # refine_strength
                 gr.update(value=metadata.get("refine_steps", 10)),  # refine_steps
+                gr.update(value=metadata.get("v2v_chunk_frames", 121)),  # v2v_chunk_frames
+                gr.update(value=metadata.get("v2v_overlap_frames", 24)),  # v2v_overlap_frames
                 # Audio and prompt
                 gr.update(value=metadata.get("disable_audio", False)),  # disable_audio
                 gr.update(value=metadata.get("audio_strength", 1.0)),  # audio_strength
@@ -3292,7 +3309,7 @@ Audio is synchronized with the video extension.
                 # Anchor conditioning
                 anchor_interval, anchor_strength, anchor_decay,
                 # Refine settings
-                refine_strength, refine_steps,
+                refine_strength, refine_steps, v2v_chunk_frames, v2v_overlap_frames,
                 # Audio and prompt
                 disable_audio, audio_strength, enhance_prompt,
                 # Memory optimization
@@ -3456,7 +3473,7 @@ Audio is synchronized with the video extension.
             # Anchor conditioning
             anchor_interval, anchor_strength, anchor_decay,
             # Refine settings
-            refine_strength, refine_steps,
+            refine_strength, refine_steps, v2v_chunk_frames, v2v_overlap_frames,
             # Audio and prompt
             disable_audio, audio_strength, enhance_prompt,
             # Memory optimization
@@ -3500,7 +3517,7 @@ Audio is synchronized with the video extension.
             # Anchor conditioning
             "anchor_interval", "anchor_strength", "anchor_decay",
             # Refine settings
-            "refine_strength", "refine_steps",
+            "refine_strength", "refine_steps", "v2v_chunk_frames", "v2v_overlap_frames",
             # Audio and prompt
             "disable_audio", "audio_strength", "enhance_prompt",
             # Memory optimization
