@@ -3119,7 +3119,7 @@ class LTXVideoGeneratorWithOffloading:
                             break
                         frame_end = frame_start + valid_frames
 
-                        chunk_conditionings = list(image_conditionings)
+                        chunk_conditionings = list(stage_1_conditionings)
 
                         chunk_tensor = video_tensor[:, :, frame_start:frame_end, :, :].to(device=self.device, dtype=dtype)
                         with torch.no_grad():

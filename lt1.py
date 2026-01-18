@@ -3259,7 +3259,7 @@ Audio is synchronized with the video extension.
                 # STG parameters
                 gr.update(value=metadata.get("stg_scale", 0.0)),  # stg_scale
                 gr.update(value=metadata.get("stg_blocks", "29")),  # stg_blocks
-                gr.update(value=metadata.get("stg_mode", "stg_av")),  # stg_mode
+                gr.update(value=metadata.get("stg_mode", "stg_av") or "stg_av"),  # stg_mode
                 # Image conditioning
                 gr.update(value=first_frame),  # input_image - use extracted first frame
                 gr.update(value=image_frame_idx),  # image_frame_idx
