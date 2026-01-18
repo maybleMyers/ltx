@@ -8160,7 +8160,8 @@ def main():
         import subprocess
         import tempfile
         import os
-        import torchaudio
+        import numpy as np
+        from scipy.io import wavfile
 
         print(">>> V2A Mode: Combining original video with generated audio...")
 
@@ -8168,7 +8169,10 @@ def main():
         temp_audio_path = temp_audio.name
         temp_audio.close()
 
-        torchaudio.save(temp_audio_path, audio.cpu(), AUDIO_SAMPLE_RATE)
+        audio_np = audio.cpu().numpy().T
+        audio_np = np.clip(audio_np, -1.0, 1.0)
+        audio_int16 = (audio_np * 32767).astype(np.int16)
+        wavfile.write(temp_audio_path, AUDIO_SAMPLE_RATE, audio_int16)
 
         subprocess.run([
             'ffmpeg', '-y',
