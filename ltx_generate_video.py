@@ -5948,7 +5948,7 @@ def generate_v2v_join(
             preserve1_audio = torch.zeros(1, 2, preserve1_audio_samples, device=device, dtype=dtype)
 
         # Transition audio: use input audio if provided, else silence
-        original_transition_audio = None  # Will be set if using input audio
+        original_combined_audio = None  # Will be set if using input audio
         if use_input_audio:
             print(f">>> Using input audio for transition section (strength={audio_strength})...")
             # Prepare input audio waveform for transition section only
@@ -5966,10 +5966,6 @@ def generate_v2v_join(
             # Ensure correct dtype
             transition_audio = transition_audio.to(dtype)
             print(f">>> Transition audio from input: {transition_audio.shape}")
-
-            # Store original input audio for blending (before VAE processing)
-            original_transition_audio = transition_audio.clone()
-            print(f">>> Saved original input audio for blending: {original_transition_audio.shape}")
         else:
             # Silent placeholder for transition (model will generate)
             transition_audio = torch.zeros(1, 2, transition_audio_samples, device=device, dtype=dtype)
@@ -5991,6 +5987,11 @@ def generate_v2v_join(
 
         combined_audio_waveform = torch.cat([preserve1_audio, transition_audio, preserve2_audio], dim=-1)
         print(f">>> Combined audio waveform: {combined_audio_waveform.shape}")
+
+        # Store full combined audio for waveform blending (before VAE)
+        if use_input_audio:
+            original_combined_audio = combined_audio_waveform.clone()
+            print(f">>> Saved full combined audio for blending: {original_combined_audio.shape}")
 
     # =========================================================================
     # Step 6: Encode to latent space
@@ -7073,8 +7074,8 @@ def generate_v2v_join(
                 transition_audio_part = transition_audio_part.unsqueeze(0)
 
             # Blend with original input audio if available
-            if use_input_audio and original_transition_audio is not None:
-                orig_audio = original_transition_audio.cpu()
+            if use_input_audio and original_combined_audio is not None:
+                orig_audio = original_combined_audio.cpu()
                 if orig_audio.dim() == 2:
                     orig_audio = orig_audio.unsqueeze(0)
 
