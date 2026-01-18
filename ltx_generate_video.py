@@ -6079,14 +6079,18 @@ def generate_v2v_join(
         audio_latents_per_second = audio_latent.shape[2] / total_audio_duration
         print(f">>> Audio latent: {audio_latent.shape}, {audio_latents_per_second:.2f} latent frames/sec")
 
-        # ALWAYS zero the generation region (matches normal i2v behavior)
-        # This ensures clean generation from noise, we blend original audio at the end
-        preserve1_audio_latent_frames = int(round(preserve1_sec * audio_latents_per_second))
-        preserve2_audio_latent_frames = int(round(preserve2_sec * audio_latents_per_second))
-        audio_gen_start_latent = preserve1_audio_latent_frames
-        audio_gen_end_latent = audio_latent.shape[2] - preserve2_audio_latent_frames
-        audio_latent[:, :, audio_gen_start_latent:audio_gen_end_latent, :] = 0.0
-        print(f">>> Audio latent zeroed for generation region: {audio_gen_start_latent}-{audio_gen_end_latent}")
+        if use_input_audio:
+            # When using input audio, keep the full latent - don't zero any region
+            # The audio_strength will control how much this audio influences the generation
+            print(f">>> Using full input audio latent (strength={audio_strength})")
+        else:
+            # Zero out the transition region of audio latent for generation
+            preserve1_audio_latent_frames = int(round(preserve1_sec * audio_latents_per_second))
+            preserve2_audio_latent_frames = int(round(preserve2_sec * audio_latents_per_second))
+            audio_gen_start_latent = preserve1_audio_latent_frames
+            audio_gen_end_latent = audio_latent.shape[2] - preserve2_audio_latent_frames
+            audio_latent[:, :, audio_gen_start_latent:audio_gen_end_latent, :] = 0.0
+            print(f">>> Audio latent zeroed for generation region: {audio_gen_start_latent}-{audio_gen_end_latent}")
 
         del audio_encoder, audio_processor, mel_spectrogram
         cleanup_memory()
@@ -6447,26 +6451,35 @@ def generate_v2v_join(
 
         B_a, C_a, F_audio, mel_bins = audio_latent.shape
 
-        # ALWAYS use mask=1.0 for full generation (matches normal i2v behavior)
-        # audio_strength is applied later in waveform blending, not in the mask
         preserve1_audio_latent = int(round(preserve1_sec * audio_latents_per_second))
         preserve2_audio_latent = int(round(preserve2_sec * audio_latents_per_second))
         audio_gen_start = preserve1_audio_latent
         audio_gen_end = F_audio - preserve2_audio_latent
 
-        # Create audio mask: 0 = preserve, 1 = generate (full generation)
+        # Create audio mask: 0 = preserve, 1 = generate
         audio_mask = torch.zeros((B_a, 1, F_audio, 1), device=device, dtype=torch.float32)
-        audio_mask[:, :, audio_gen_start:audio_gen_end, :] = 1.0
-
-        # Apply slope at boundaries
-        if slope_len > 0:
-            for i in range(min(slope_len, audio_gen_end - audio_gen_start)):
-                slope_value = (i + 1) / (slope_len + 1)
-                audio_mask[:, :, audio_gen_start + i, :] = slope_value
-                audio_mask[:, :, audio_gen_end - 1 - i, :] = slope_value
 
         if use_input_audio:
-            print(f">>> Audio mask: full generation, will blend with input audio at strength={audio_strength}")
+            # mask = 1.0 - strength: strength=1 -> mask=0 (preserve), strength=0 -> mask=1 (generate)
+            transition_mask_value = 1.0 - audio_strength
+            audio_mask[:, :, audio_gen_start:audio_gen_end, :] = transition_mask_value
+            # Apply slope with transition_mask_value
+            if slope_len > 0:
+                for i in range(min(slope_len, audio_gen_end - audio_gen_start)):
+                    slope_value = (i + 1) / (slope_len + 1) * transition_mask_value
+                    audio_mask[:, :, audio_gen_start + i, :] = slope_value
+                    audio_mask[:, :, audio_gen_end - 1 - i, :] = slope_value
+            print(f">>> Audio mask: transition_mask_value={transition_mask_value} (from audio_strength={audio_strength})")
+        else:
+            # Full generation when no input audio
+            audio_mask[:, :, audio_gen_start:audio_gen_end, :] = 1.0
+            # Apply slope at boundaries
+            if slope_len > 0:
+                for i in range(min(slope_len, audio_gen_end - audio_gen_start)):
+                    slope_value = (i + 1) / (slope_len + 1)
+                    audio_mask[:, :, audio_gen_start + i, :] = slope_value
+                    audio_mask[:, :, audio_gen_end - 1 - i, :] = slope_value
+
         print(f">>> Audio mask: preserve {0}-{audio_gen_start}, generate {audio_gen_start}-{audio_gen_end}, preserve {audio_gen_end}-{F_audio}")
 
         audio_state = audio_tools.create_initial_state(device, dtype, audio_latent)
