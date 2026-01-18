@@ -3250,8 +3250,13 @@ class LTXVideoGeneratorWithOffloading:
 
                         print(f">>> [Audio Debug] shape={waveform.shape}, min={waveform.min():.4f}, max={waveform.max():.4f}, mean={waveform.mean():.4f}")
 
-                        mel_spec = audio_processor(waveform)
-                        v2v_audio_latent = audio_encoder(mel_spec)
+                        mel_spectrogram = audio_processor.waveform_to_mel(
+                            waveform.to(dtype=torch.float32),
+                            waveform_sample_rate=sample_rate
+                        )
+
+                        v2v_audio_latent = audio_encoder(mel_spectrogram.to(dtype=torch.float32))
+                        v2v_audio_latent = v2v_audio_latent.to(dtype=dtype)
 
                         del audio_encoder, audio_processor
                         cleanup_memory()
