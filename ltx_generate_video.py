@@ -3051,7 +3051,9 @@ class LTXVideoGeneratorWithOffloading:
             # V2V: Add video conditioning from input video (like ic_lora pipeline)
             # Uses tiled encoding to handle long videos without OOM
             v2v_audio_latent = None  # Will be set if input_video has audio
-            if input_video and not self.refine_only:
+            # V2V Mode: Add video conditioning for refinement
+            # Skip if V2A mode is active (V2A will handle video freezing)
+            if input_video and not self.refine_only and not v2a_mode:
                 from ltx_core.conditioning import VideoConditionByKeyframeIndex
                 print(f">>> V2V: Loading and encoding input video with tiled encoding...")
                 v2v_start = time.time()
@@ -3122,7 +3124,8 @@ class LTXVideoGeneratorWithOffloading:
                 print(f">>> V2V: Added {num_chunks} video conditioning chunks (strength={refine_strength}) in {time.time() - v2v_start:.1f}s")
 
                 # Extract and encode audio from input video to preserve it
-                if not disable_audio:
+                # Skip if V2A mode is active (V2A will handle audio extraction)
+                if not disable_audio and not v2a_mode:
                     print(">>> V2V: Extracting audio from input video...")
                     waveform, sample_rate = decode_audio_from_file(input_video, self.device)
 
@@ -3218,8 +3221,8 @@ class LTXVideoGeneratorWithOffloading:
                 print(f">>> V2A: {num_latent_frames} video frames frozen (stage 1) in {time.time() - v2a_start:.1f}s")
 
                 # V2A: Handle audio extraction based on strength
+                # Note: Currently strength is binary - <1.0 preserves audio, 1.0 generates fresh
                 if v2a_strength < 1.0 and not disable_audio:
-                    from ltx_core.conditioning import AudioConditionByLatent
                     print(f">>> V2A: Extracting audio from input video (strength={v2a_strength})...")
                     waveform, sample_rate = decode_audio_from_file(input_video, self.device)
 
@@ -3256,23 +3259,18 @@ class LTXVideoGeneratorWithOffloading:
                             waveform_sample_rate=sample_rate
                         )
 
-                        audio_latent = audio_encoder(mel_spectrogram.to(dtype=torch.float32))
-                        audio_latent = audio_latent.to(dtype=dtype)
+                        v2v_audio_latent = audio_encoder(mel_spectrogram.to(dtype=torch.float32))
+                        v2v_audio_latent = v2v_audio_latent.to(dtype=dtype)
 
-                        stage_1_conditionings.append(
-                            AudioConditionByLatent(
-                                latent=audio_latent.cpu(),
-                                strength=v2a_strength,
-                            )
-                        )
-
-                        del audio_encoder, audio_processor, audio_latent
+                        del audio_encoder, audio_processor
                         cleanup_memory()
-                        print(f">>> V2A: Audio conditioning added with strength {v2a_strength}")
+                        print(f">>> V2A: Audio extracted and will be preserved (strength={v2a_strength})")
                     else:
+                        v2v_audio_latent = None
                         print(">>> V2A: Input video has no audio track, will generate fresh audio")
                 else:
-                    print(">>> V2A: Audio will be generated fresh (not extracted from input)")
+                    v2v_audio_latent = None
+                    print(">>> V2A: Audio will be generated fresh (strength=1.0)")
 
             # Depth Control: Add depth conditioning for IC-LoRA
             depth_tensor = None
