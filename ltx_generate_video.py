@@ -3219,6 +3219,7 @@ class LTXVideoGeneratorWithOffloading:
 
                 # V2A: Handle audio extraction based on strength
                 if v2a_strength < 1.0 and not disable_audio:
+                    from ltx_core.conditioning import AudioConditionByLatent
                     print(f">>> V2A: Extracting audio from input video (strength={v2a_strength})...")
                     waveform, sample_rate = decode_audio_from_file(input_video, self.device)
 
@@ -3255,17 +3256,22 @@ class LTXVideoGeneratorWithOffloading:
                             waveform_sample_rate=sample_rate
                         )
 
-                        v2v_audio_latent = audio_encoder(mel_spectrogram.to(dtype=torch.float32))
-                        v2v_audio_latent = v2v_audio_latent.to(dtype=dtype)
+                        audio_latent = audio_encoder(mel_spectrogram.to(dtype=torch.float32))
+                        audio_latent = audio_latent.to(dtype=dtype)
 
-                        del audio_encoder, audio_processor
+                        stage_1_conditionings.append(
+                            AudioConditionByLatent(
+                                latent=audio_latent.cpu(),
+                                strength=v2a_strength,
+                            )
+                        )
+
+                        del audio_encoder, audio_processor, audio_latent
                         cleanup_memory()
-                        print(f">>> V2A: Audio extracted and will be refined with strength {v2a_strength}")
+                        print(f">>> V2A: Audio conditioning added with strength {v2a_strength}")
                     else:
-                        v2v_audio_latent = None
-                        print(">>> V2A: Input video has no audio track")
+                        print(">>> V2A: Input video has no audio track, will generate fresh audio")
                 else:
-                    v2v_audio_latent = None
                     print(">>> V2A: Audio will be generated fresh (not extracted from input)")
 
             # Depth Control: Add depth conditioning for IC-LoRA
@@ -8323,6 +8329,9 @@ def main():
         "estimate_depth": args.estimate_depth,
         "depth_strength": args.depth_strength if (args.depth_video or args.depth_image or args.estimate_depth) else None,
         "depth_stage2": args.depth_stage2 if (args.depth_video or args.depth_image or args.estimate_depth) else None,
+        # V2A Mode metadata
+        "v2a_mode": args.v2a_mode,
+        "v2a_strength": args.v2a_strength if args.v2a_mode else None,
         # Video continuation metadata
         "freeze_frames": args.freeze_frames if args.freeze_frames > 0 else None,
         "freeze_transition": args.freeze_transition if args.freeze_frames > 0 else None,
