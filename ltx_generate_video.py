@@ -5557,8 +5557,20 @@ def generate_av_extension(
         full_res_input = full_res_input * 2.0 - 1.0  # Normalize to [-1, 1]
 
         # Encode in temporal chunks (same logic as Stage 1)
+        # But use smaller chunks for high resolution to avoid OOM
+        # Base: 65 frames works at 512x512. Scale inversely with pixel count.
         encoder_dtype = next(video_encoder.parameters()).dtype
-        chunk_pixel_frames = 65
+        base_resolution = 512 * 512
+        current_resolution = stage2_width * stage2_height
+        resolution_ratio = current_resolution / base_resolution
+        # Scale chunk size inversely with resolution ratio
+        # Valid sizes: 9 (1*8+1), 17 (2*8+1), 25 (3*8+1), 33 (4*8+1), ..., 65 (8*8+1)
+        base_chunk = 65
+        scaled_chunk = int(base_chunk / resolution_ratio)
+        # Round down to nearest 8*k+1 format, minimum 9
+        k = max(1, (scaled_chunk - 1) // 8)
+        chunk_pixel_frames = k * 8 + 1
+        print(f">>> Using chunk size {chunk_pixel_frames} for {stage2_width}x{stage2_height} encoding")
         total_pixel_frames_full = full_res_input.shape[2]
 
         full_res_latent_chunks = []
