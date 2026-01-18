@@ -3260,7 +3260,7 @@ class LTXVideoGeneratorWithOffloading:
                         )
 
                         v2a_preserved_audio_latent = audio_encoder(mel_spectrogram.to(dtype=torch.float32))
-                        v2a_preserved_audio_latent = v2a_preserved_audio_latent.to(dtype=dtype)
+                        v2a_preserved_audio_latent = v2a_preserved_audio_latent.to(dtype=dtype).cpu()
 
                         del audio_encoder, audio_processor
                         cleanup_memory()
