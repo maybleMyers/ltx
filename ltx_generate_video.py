@@ -3123,6 +3123,16 @@ class LTXVideoGeneratorWithOffloading:
                             break
                         frame_end = frame_start + valid_frames
 
+                        chunk_latent_frames = (valid_frames - 1) // 8 + 1
+                        min_chunk_latent = overlap_latent + 1
+                        if chunk_idx > 0 and chunk_latent_frames < min_chunk_latent:
+                            needed_frames = (min_chunk_latent - 1) * 8 + 1
+                            frame_start = frame_end - needed_frames
+                            if frame_start < 0:
+                                break
+                            valid_frames = needed_frames
+                            chunk_latent_frames = min_chunk_latent
+
                         chunk_conditionings = list(stage_1_conditionings)
 
                         if chunk_idx > 0:
