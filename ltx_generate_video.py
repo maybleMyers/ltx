@@ -1700,6 +1700,13 @@ Examples:
         help="Video-to-Audio mode: preserve input video exactly and generate new audio. "
              "Requires --input-video.",
     )
+    v2a_group.add_argument(
+        "--v2a-strength",
+        type=float,
+        default=1.0,
+        help="Strength for refining existing audio (0.0=keep original, 1.0=full regeneration). "
+             "Only used if input video has audio. Default: 1.0",
+    )
 
     # ==========================================================================
     # SVI Pro (Multi-Clip) Mode
@@ -2569,6 +2576,7 @@ class LTXVideoGeneratorWithOffloading:
         latent_norm_fn: Callable | None = None,
         # V2A mode (video-to-audio: freeze video, generate audio)
         v2a_mode: bool = False,
+        v2a_strength: float = 1.0,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor | None, str | None]:
         """
         Generate video with optional audio.
@@ -3209,9 +3217,51 @@ class LTXVideoGeneratorWithOffloading:
                 num_latent_frames = (actual_frames - 1) // latent_stride + 1
                 print(f">>> V2A: {num_latent_frames} video frames frozen (stage 1) in {time.time() - v2a_start:.1f}s")
 
-                # Clear any V2V audio - we want fresh audio generation
-                v2v_audio_latent = None
-                print(">>> V2A: Audio will be generated fresh (not extracted from input)")
+                # V2A: Handle audio extraction based on strength
+                if v2a_strength < 1.0 and not disable_audio:
+                    print(f">>> V2A: Extracting audio from input video (strength={v2a_strength})...")
+                    waveform, sample_rate = decode_audio_from_file(input_video, self.device)
+
+                    if waveform is not None:
+                        expected_duration = float(num_frames) / float(frame_rate)
+                        expected_samples = int(expected_duration * sample_rate)
+
+                        if waveform.shape[-1] > expected_samples:
+                            waveform = waveform[..., :expected_samples]
+                            print(f">>> V2A: Trimmed audio to {expected_samples} samples ({expected_duration:.3f}s)")
+                        elif waveform.shape[-1] < expected_samples:
+                            padding = expected_samples - waveform.shape[-1]
+                            waveform = torch.nn.functional.pad(waveform, (0, padding))
+                            print(f">>> V2A: Padded audio by {padding} samples to {expected_samples} total ({expected_duration:.3f}s)")
+
+                        audio_encoder = self.stage_1_model_ledger.audio_encoder()
+                        audio_processor = AudioProcessor(
+                            sample_rate=audio_encoder.sample_rate,
+                            mel_bins=audio_encoder.mel_bins,
+                            mel_hop_length=audio_encoder.mel_hop_length,
+                            n_fft=audio_encoder.n_fft,
+                        ).to(self.device)
+
+                        if waveform.dim() == 3:
+                            num_frames_audio, channels, samples_per_frame = waveform.shape
+                            waveform = waveform.permute(1, 0, 2).reshape(channels, -1).unsqueeze(0)
+                        elif waveform.dim() == 2:
+                            waveform = waveform.unsqueeze(0)
+
+                        print(f">>> [Audio Debug] shape={waveform.shape}, min={waveform.min():.4f}, max={waveform.max():.4f}, mean={waveform.mean():.4f}")
+
+                        mel_spec = audio_processor(waveform)
+                        v2v_audio_latent = audio_encoder(mel_spec)
+
+                        del audio_encoder, audio_processor
+                        cleanup_memory()
+                        print(f">>> V2A: Audio extracted and will be refined with strength {v2a_strength}")
+                    else:
+                        v2v_audio_latent = None
+                        print(">>> V2A: Input video has no audio track")
+                else:
+                    v2v_audio_latent = None
+                    print(">>> V2A: Audio will be generated fresh (not extracted from input)")
 
             # Depth Control: Add depth conditioning for IC-LoRA
             depth_tensor = None
@@ -8150,6 +8200,7 @@ def main():
             latent_norm_fn=latent_norm_fn,
             # V2A mode (freeze video, generate audio)
             v2a_mode=args.v2a_mode,
+            v2a_strength=args.v2a_strength,
         )
 
     # Encode and save video

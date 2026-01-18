@@ -1034,6 +1034,7 @@ def generate_ltx_video(
     latent_norm_audio_only: bool,
     # V2A Mode (Video-to-Audio)
     v2a_mode: bool,
+    v2a_strength: float,
     # Video Joining
     v2v_join_video1: str,
     v2v_join_video2: str,
@@ -1224,6 +1225,7 @@ def generate_ltx_video(
         # V2A Mode (Video-to-Audio)
         if v2a_mode:
             command.append("--v2a-mode")
+            command.extend(["--v2a-strength", str(v2a_strength)])
 
         # Video Joining
         if v2v_join_video1 and v2v_join_video2:
@@ -2481,6 +2483,14 @@ Audio is synchronized with the video extension.
                                 value=False,
                                 info="Freeze video, generate audio only (requires input video)"
                             )
+                            v2a_strength = gr.Slider(
+                                minimum=0.0,
+                                maximum=1.0,
+                                step=0.01,
+                                value=1.0,
+                                label="V2A Strength",
+                                info="0.0 = keep original audio, 1.0 = full regeneration (only if input has audio)"
+                            )
 
                         # Video Joining
                         with gr.Accordion("Video Joining", open=False):
@@ -3170,7 +3180,7 @@ Audio is synchronized with the video extension.
                 latent_norm_percentile, latent_norm_clip_outliers,
                 latent_norm_video_only, latent_norm_audio_only,
                 # V2A Mode
-                v2a_mode,
+                v2a_mode, v2a_strength,
                 # Video Joining
                 v2v_join_video1, v2v_join_video2,
                 v2v_join_frames_check1, v2v_join_frames_check2,
@@ -3466,7 +3476,7 @@ Audio is synchronized with the video extension.
             # Scale slider
             scale_slider,
             # V2A Mode
-            v2a_mode,
+            v2a_mode, v2a_strength,
             # Video Joining (video paths not saved, only parameters)
             v2v_join_frames_check1, v2v_join_frames_check2,
             v2v_join_preserve1, v2v_join_preserve2,
@@ -3510,7 +3520,7 @@ Audio is synchronized with the video extension.
             # Scale slider
             "scale_slider",
             # V2A Mode
-            "v2a_mode",
+            "v2a_mode", "v2a_strength",
             # Video Joining
             "v2v_join_frames_check1", "v2v_join_frames_check2",
             "v2v_join_preserve1", "v2v_join_preserve2",
