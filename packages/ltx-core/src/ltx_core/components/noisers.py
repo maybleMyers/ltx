@@ -32,5 +32,4 @@ class GaussianNoiser(Noiser):
         return replace(
             latent_state,
             latent=latent.to(latent_state.latent.dtype),
-            denoise_mask=scaled_mask,
         )
