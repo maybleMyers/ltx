@@ -622,6 +622,165 @@ def time_to_audio_latent_idx(
     return max(0, min(audio_idx, audio_latent_frame_count))
 
 
+# =============================================================================
+# V2V Join Helper Functions
+# =============================================================================
+
+def variance_of_laplacian(image):
+    """Calculate image sharpness using Laplacian variance."""
+    import cv2
+    return cv2.Laplacian(image, cv2.CV_64F).var()
+
+
+def extract_best_transition_frame_from_end(video_path: str, frames_to_check: int = 30) -> int:
+    """
+    Extract the sharpest frame from the last N frames for smooth transition.
+
+    Args:
+        video_path: Path to video file
+        frames_to_check: Number of frames from end to analyze
+
+    Returns:
+        Frame index (0-based) of the sharpest frame, or -1 on error
+    """
+    import cv2
+
+    print(f">>> Finding best transition frame from last {frames_to_check} frames of video1...")
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(">>> ERROR: Failed to open video file")
+        return -1
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    start_frame = max(0, total_frames - frames_to_check)
+
+    best_frame_idx = total_frames - 1  # Default to last frame
+    max_sharpness = -1
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+    for frame_idx in range(start_frame, total_frames):
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # Calculate sharpness on grayscale
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        sharpness = variance_of_laplacian(gray)
+
+        if sharpness > max_sharpness:
+            max_sharpness = sharpness
+            best_frame_idx = frame_idx
+
+    cap.release()
+
+    print(f">>> Best transition frame from end: {best_frame_idx} (sharpness: {max_sharpness:.2f})")
+    return best_frame_idx
+
+
+def extract_best_transition_frame_from_start(video_path: str, frames_to_check: int = 30) -> int:
+    """
+    Extract the sharpest frame from the first N frames for smooth transition.
+
+    Args:
+        video_path: Path to video file
+        frames_to_check: Number of frames from start to analyze
+
+    Returns:
+        Frame index (0-based) of the sharpest frame
+    """
+    import cv2
+
+    print(f">>> Finding best transition frame from first {frames_to_check} frames of video2...")
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(">>> ERROR: Failed to open video file")
+        return 0
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    end_frame = min(total_frames, frames_to_check)
+
+    best_frame_idx = 0
+    max_sharpness = -1
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+    for frame_idx in range(end_frame):
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # Calculate sharpness on grayscale
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        sharpness = variance_of_laplacian(gray)
+
+        if sharpness > max_sharpness:
+            max_sharpness = sharpness
+            best_frame_idx = frame_idx
+
+    cap.release()
+
+    print(f">>> Best transition frame from start: {best_frame_idx} (sharpness: {max_sharpness:.2f})")
+    return best_frame_idx
+
+
+def load_video_segment(
+    video_path: str,
+    start_frame: int,
+    end_frame: int,
+    width: int,
+    height: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, float]:
+    """
+    Load a segment of video frames and resize to target dimensions.
+
+    Args:
+        video_path: Path to video file
+        start_frame: Starting frame index (inclusive)
+        end_frame: Ending frame index (exclusive)
+        width: Target width
+        height: Target height
+        device: Target device
+        dtype: Target dtype
+
+    Returns:
+        Tuple of (frames tensor [F, H, W, C] normalized 0-1, fps)
+    """
+    import cv2
+    import numpy as np
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Failed to open video: {video_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+    frames = []
+    for _ in range(end_frame - start_frame):
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_LANCZOS4)
+        frames.append(frame)
+
+    cap.release()
+
+    if len(frames) == 0:
+        raise RuntimeError(f"No frames loaded from {video_path}")
+
+    # Convert to tensor [F, H, W, C] normalized to 0-1
+    frames_tensor = torch.from_numpy(np.stack(frames)).float() / 255.0
+    frames_tensor = frames_tensor.to(device=device, dtype=dtype)
+
+    return frames_tensor, fps
+
+
 def create_av_noise_mask(
     video_latent: torch.Tensor,
     audio_latent: torch.Tensor | None,
@@ -1532,6 +1691,24 @@ Examples:
     )
 
     # ==========================================================================
+    # V2A Mode (Video-to-Audio)
+    # ==========================================================================
+    v2a_group = parser.add_argument_group("V2A Mode (Video-to-Audio)")
+    v2a_group.add_argument(
+        "--v2a-mode",
+        action="store_true",
+        help="Video-to-Audio mode: preserve input video exactly and generate new audio. "
+             "Requires --input-video.",
+    )
+    v2a_group.add_argument(
+        "--v2a-strength",
+        type=float,
+        default=1.0,
+        help="Strength for refining existing audio (0.0=keep original, 1.0=full regeneration). "
+             "Only used if input video has audio. Default: 1.0",
+    )
+
+    # ==========================================================================
     # SVI Pro (Multi-Clip) Mode
     # ==========================================================================
     svi_group = parser.add_argument_group("SVI Pro (Multi-Clip) Mode")
@@ -1748,6 +1925,65 @@ Examples:
         "--av-no-stage2",
         action="store_true",
         help="Skip stage 2 refinement for AV extension (faster but lower quality).",
+    )
+
+    # ==========================================================================
+    # V2V Join Mode
+    # ==========================================================================
+    v2v_join_group = parser.add_argument_group("V2V Join Mode")
+    v2v_join_group.add_argument(
+        "--v2v-join-video1",
+        type=resolve_path,
+        default=None,
+        help="First video for V2V join (transition will be generated from end of this video).",
+    )
+    v2v_join_group.add_argument(
+        "--v2v-join-video2",
+        type=resolve_path,
+        default=None,
+        help="Second video for V2V join (transition will connect to start of this video).",
+    )
+    v2v_join_group.add_argument(
+        "--v2v-join-frames-check1",
+        type=int,
+        default=30,
+        help="Number of frames to check from end of video1 for sharpest transition point (default: 30).",
+    )
+    v2v_join_group.add_argument(
+        "--v2v-join-frames-check2",
+        type=int,
+        default=30,
+        help="Number of frames to check from start of video2 for sharpest transition point (default: 30).",
+    )
+    v2v_join_group.add_argument(
+        "--v2v-join-preserve1",
+        type=float,
+        default=5.0,
+        help="Seconds to preserve from end of video1 in transition (default: 5.0).",
+    )
+    v2v_join_group.add_argument(
+        "--v2v-join-preserve2",
+        type=float,
+        default=5.0,
+        help="Seconds to preserve from start of video2 in transition (default: 5.0).",
+    )
+    v2v_join_group.add_argument(
+        "--v2v-join-transition-time",
+        type=float,
+        default=10.0,
+        help="Total seconds for generated transition between preserved sections (default: 10.0).",
+    )
+    v2v_join_group.add_argument(
+        "--v2v-join-steps",
+        type=int,
+        default=8,
+        help="Denoising steps for V2V join transition generation (default: 8).",
+    )
+    v2v_join_group.add_argument(
+        "--v2v-join-terminal",
+        type=float,
+        default=0.1,
+        help="Terminal sigma for V2V join partial denoising (default: 0.1).",
     )
 
     # ==========================================================================
@@ -2338,6 +2574,9 @@ class LTXVideoGeneratorWithOffloading:
         depth_stage2: bool = False,
         # Latent normalization (fixes overbaking/audio clipping)
         latent_norm_fn: Callable | None = None,
+        # V2A mode (video-to-audio: freeze video, generate audio)
+        v2a_mode: bool = False,
+        v2a_strength: float = 1.0,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor | None, str | None]:
         """
         Generate video with optional audio.
@@ -2562,6 +2801,7 @@ class LTXVideoGeneratorWithOffloading:
 
             # Skip Phase 2, 3 - go directly to Phase 4 (Stage 2)
             block_swap_manager = None
+            depth_tensor = None  # Not used in refine-only mode
             video_encoder = None  # Not needed for refine-only
 
         # =====================================================================
@@ -2812,7 +3052,9 @@ class LTXVideoGeneratorWithOffloading:
             # V2V: Add video conditioning from input video (like ic_lora pipeline)
             # Uses tiled encoding to handle long videos without OOM
             v2v_audio_latent = None  # Will be set if input_video has audio
-            if input_video and not self.refine_only:
+            # V2V Mode: Add video conditioning for refinement
+            # Skip if V2A mode is active (V2A will handle video freezing)
+            if input_video and not self.refine_only and not v2a_mode:
                 from ltx_core.conditioning import VideoConditionByKeyframeIndex
                 print(f">>> V2V: Loading and encoding input video with tiled encoding...")
                 v2v_start = time.time()
@@ -2883,7 +3125,8 @@ class LTXVideoGeneratorWithOffloading:
                 print(f">>> V2V: Added {num_chunks} video conditioning chunks (strength={refine_strength}) in {time.time() - v2v_start:.1f}s")
 
                 # Extract and encode audio from input video to preserve it
-                if not disable_audio:
+                # Skip if V2A mode is active (V2A will handle audio extraction)
+                if not disable_audio and not v2a_mode:
                     print(">>> V2V: Extracting audio from input video...")
                     waveform, sample_rate = decode_audio_from_file(input_video, self.device)
 
@@ -2933,6 +3176,100 @@ class LTXVideoGeneratorWithOffloading:
                         print(">>> V2V: Input video has no audio track")
                 else:
                     v2v_audio_latent = None
+
+            # V2A Mode: Freeze entire video, optionally preserve audio
+            v2a_preserved_audio_latent = None
+            if v2a_mode and input_video:
+                from ltx_core.conditioning import VideoConditionByLatentIndex
+                print(f">>> V2A Mode: Encoding input video (video will be frozen)...")
+                v2a_start = time.time()
+
+                # Load input video at stage 1 resolution
+                video_tensor = load_video_conditioning(
+                    video_path=input_video,
+                    height=stage_1_output_shape.height,
+                    width=stage_1_output_shape.width,
+                    frame_cap=num_frames,
+                    dtype=dtype,
+                    device=torch.device("cpu"),
+                )
+
+                actual_frames = video_tensor.shape[2]
+                latent_stride = 8  # VAE temporal compression factor
+
+                # Encode each latent frame position (every 8th pixel frame)
+                for frame_idx in range(0, actual_frames, latent_stride):
+                    latent_idx = frame_idx // latent_stride
+                    frame = video_tensor[:, :, frame_idx:frame_idx+1, :, :].to(device=self.device, dtype=dtype)
+
+                    with torch.no_grad():
+                        encoded_frame = video_encoder(frame)
+
+                    # strength=1.0 → denoise_mask=0 (frozen)
+                    stage_1_conditionings.append(
+                        VideoConditionByLatentIndex(
+                            latent=encoded_frame.cpu(),
+                            strength=1.0,
+                            latent_idx=latent_idx,
+                        )
+                    )
+                    del frame, encoded_frame
+                    torch.cuda.empty_cache()
+
+                del video_tensor
+                cleanup_memory()
+
+                num_latent_frames = (actual_frames - 1) // latent_stride + 1
+                print(f">>> V2A: {num_latent_frames} video frames frozen (stage 1) in {time.time() - v2a_start:.1f}s")
+
+                # V2A: Handle audio extraction based on strength
+                if v2a_strength < 1.0 and not disable_audio:
+                    print(f">>> V2A: Extracting audio from input video (will refine with strength={v2a_strength})...")
+                    waveform, sample_rate = decode_audio_from_file(input_video, self.device)
+
+                    if waveform is not None:
+                        expected_duration = float(num_frames) / float(frame_rate)
+                        expected_samples = int(expected_duration * sample_rate)
+
+                        if waveform.shape[-1] > expected_samples:
+                            waveform = waveform[..., :expected_samples]
+                            print(f">>> V2A: Trimmed audio to {expected_samples} samples ({expected_duration:.3f}s)")
+                        elif waveform.shape[-1] < expected_samples:
+                            padding = expected_samples - waveform.shape[-1]
+                            waveform = torch.nn.functional.pad(waveform, (0, padding))
+                            print(f">>> V2A: Padded audio by {padding} samples to {expected_samples} total ({expected_duration:.3f}s)")
+
+                        audio_encoder = self.stage_1_model_ledger.audio_encoder()
+                        audio_processor = AudioProcessor(
+                            sample_rate=audio_encoder.sample_rate,
+                            mel_bins=audio_encoder.mel_bins,
+                            mel_hop_length=audio_encoder.mel_hop_length,
+                            n_fft=audio_encoder.n_fft,
+                        ).to(self.device)
+
+                        if waveform.dim() == 3:
+                            num_frames_audio, channels, samples_per_frame = waveform.shape
+                            waveform = waveform.permute(1, 0, 2).reshape(channels, -1).unsqueeze(0)
+                        elif waveform.dim() == 2:
+                            waveform = waveform.unsqueeze(0)
+
+                        print(f">>> [Audio Debug] shape={waveform.shape}, min={waveform.min():.4f}, max={waveform.max():.4f}, mean={waveform.mean():.4f}")
+
+                        mel_spectrogram = audio_processor.waveform_to_mel(
+                            waveform.to(dtype=torch.float32),
+                            waveform_sample_rate=sample_rate
+                        )
+
+                        v2a_preserved_audio_latent = audio_encoder(mel_spectrogram.to(dtype=torch.float32))
+                        v2a_preserved_audio_latent = v2a_preserved_audio_latent.to(dtype=dtype)
+
+                        del audio_encoder, audio_processor
+                        cleanup_memory()
+                        print(f">>> V2A: Audio encoded and will be refined during generation (strength={v2a_strength})")
+                    else:
+                        print(">>> V2A: Input video has no audio track, will generate fresh audio")
+                else:
+                    print(">>> V2A: Audio will be generated fresh (strength=1.0)")
 
             # Depth Control: Add depth conditioning for IC-LoRA
             depth_tensor = None
@@ -3036,6 +3373,11 @@ class LTXVideoGeneratorWithOffloading:
 
             stage_label = "One-stage" if self.one_stage else "Stage 1"
             print(f">>> {stage_label}: Generating at {stage_1_output_shape.width}x{stage_1_output_shape.height}...")
+
+            # For V2A mode with audio refinement, adjust noise scale based on strength
+            # strength 0.0 = no noise (keep original), strength 1.0 = full noise (regenerate)
+            audio_noise_scale = v2a_strength if v2a_preserved_audio_latent is not None else 1.0
+
             video_state, audio_state = denoise_audio_video(
                 output_shape=stage_1_output_shape,
                 conditionings=stage_1_conditionings,
@@ -3046,7 +3388,9 @@ class LTXVideoGeneratorWithOffloading:
                 components=self.pipeline_components,
                 dtype=dtype,
                 device=self.device,
+                initial_audio_latent=v2a_preserved_audio_latent,
                 audio_conditionings=audio_conditionings if audio_conditionings else None,
+                audio_noise_scale=audio_noise_scale,
             )
 
             print(f">>> {stage_label} completed in {time.time() - stage1_start:.1f}s", flush=True)
@@ -3081,38 +3425,37 @@ class LTXVideoGeneratorWithOffloading:
 
             # For one-stage, skip upsampling and stage 2 refinement
             if self.one_stage:
-                # Cleanup video encoder
                 video_encoder = None
                 cleanup_memory()
 
-                # Skip directly to VAE decoding (sequential loading to minimize peak memory)
-                print(">>> Decoding video...")
-                decode_start = time.time()
+                if v2a_mode:
+                    print(">>> V2A Mode: Skipping video decoding (will use original input video)")
+                    decoded_video = None
+                    decode_start = time.time()
+                else:
+                    print(">>> Decoding video...")
+                    decode_start = time.time()
 
-                # Load video decoder, decode, then offload
-                video_decoder = self.stage_1_model_ledger.video_decoder()
-                # vae_decode_video returns a generator - consume it immediately before offloading decoder
-                decoded_video_chunks = []
-                for chunk in vae_decode_video(
-                    video_state.latent,
-                    video_decoder,
-                    tiling_config,
-                ):
-                    decoded_video_chunks.append(chunk.cpu())  # Move chunks to CPU immediately
-                    del chunk
-                # Create a generator that yields the cached chunks for encode_video compatibility
-                def decoded_video_iter():
-                    for chunk in decoded_video_chunks:
-                        yield chunk.cuda()  # Move back to GPU when consumed
-                decoded_video = decoded_video_iter()
-                video_decoder.to("cpu")
-                del video_decoder
-                synchronize_and_cleanup()
-                phase_barrier("video_decoding_one_stage")
+                    video_decoder = self.stage_1_model_ledger.video_decoder()
+                    decoded_video_chunks = []
+                    for chunk in vae_decode_video(
+                        video_state.latent,
+                        video_decoder,
+                        tiling_config,
+                    ):
+                        decoded_video_chunks.append(chunk.cpu())
+                        del chunk
+                    def decoded_video_iter():
+                        for chunk in decoded_video_chunks:
+                            yield chunk.cuda()
+                    decoded_video = decoded_video_iter()
+                    video_decoder.to("cpu")
+                    del video_decoder
+                    synchronize_and_cleanup()
+                    phase_barrier("video_decoding_one_stage")
 
                 if not disable_audio:
                     print(">>> Decoding audio...")
-                    # Load audio models only after video decoder is offloaded
                     audio_decoder = self.stage_1_model_ledger.audio_decoder()
                     vocoder = self.stage_1_model_ledger.vocoder()
                     decoded_audio = vae_decode_audio(
@@ -3432,6 +3775,53 @@ class LTXVideoGeneratorWithOffloading:
         # Note: V2V video conditioning is NOT applied to stage 2 (matching ic_lora.py)
         # Stage 2 only refines the upscaled latent from stage 1 - video guidance already applied there
 
+        # V2A Mode: Add frozen video conditioning for stage 2
+        # Unlike V2V, V2A needs conditioning at stage 2 to keep video exactly frozen
+        if v2a_mode and input_video:
+            from ltx_core.conditioning import VideoConditionByLatentIndex
+            print(f">>> V2A Stage 2: Encoding video at full resolution...")
+            v2a_s2_start = time.time()
+
+            # Load video encoder for stage 2 if needed
+            if stage_2_video_encoder is None:
+                stage_2_video_encoder = self.stage_1_model_ledger.video_encoder()
+
+            # Load input video at stage 2 (full) resolution
+            video_tensor = load_video_conditioning(
+                video_path=input_video,
+                height=stage_2_output_shape.height,
+                width=stage_2_output_shape.width,
+                frame_cap=num_frames,
+                dtype=dtype,
+                device=torch.device("cpu"),
+            )
+
+            actual_frames = video_tensor.shape[2]
+            latent_stride = 8
+
+            for frame_idx in range(0, actual_frames, latent_stride):
+                latent_idx = frame_idx // latent_stride
+                frame = video_tensor[:, :, frame_idx:frame_idx+1, :, :].to(device=self.device, dtype=dtype)
+
+                with torch.no_grad():
+                    encoded_frame = stage_2_video_encoder(frame)
+
+                stage_2_conditionings.append(
+                    VideoConditionByLatentIndex(
+                        latent=encoded_frame.cpu(),
+                        strength=1.0,
+                        latent_idx=latent_idx,
+                    )
+                )
+                del frame, encoded_frame
+                torch.cuda.empty_cache()
+
+            del video_tensor
+            cleanup_memory()
+
+            num_latent_frames = (actual_frames - 1) // latent_stride + 1
+            print(f">>> V2A: {num_latent_frames} video frames frozen (stage 2) in {time.time() - v2a_s2_start:.1f}s")
+
         # SVI Pro: Add motion latent conditionings for stage 2
         if _motion_latent is not None and _num_motion_latent > 0:
             motion_cond = VideoConditionByMotionLatent(
@@ -3665,34 +4055,35 @@ class LTXVideoGeneratorWithOffloading:
         # =====================================================================
         # Phase 5: VAE Decoding (Sequential loading to minimize peak memory)
         # =====================================================================
-        print(">>> Decoding video...")
-        decode_start = time.time()
 
-        # Load video decoder, decode, then offload to free memory before audio
-        video_decoder = self.stage_2_model_ledger.video_decoder()
-        # vae_decode_video returns a generator - consume it immediately before offloading decoder
-        decoded_video_chunks = []
-        for chunk in vae_decode_video(
-            video_state.latent,
-            video_decoder,
-            tiling_config,
-        ):
-            decoded_video_chunks.append(chunk.cpu())  # Move chunks to CPU immediately
-            del chunk
-        # Create a generator that yields the cached chunks for encode_video compatibility
-        def decoded_video_iter():
-            for chunk in decoded_video_chunks:
-                yield chunk.cuda()  # Move back to GPU when consumed
-        decoded_video = decoded_video_iter()
-        # Offload video decoder before loading audio models
-        video_decoder.to("cpu")
-        del video_decoder
-        synchronize_and_cleanup()
-        phase_barrier("video_decoding_two_stage")
+        if v2a_mode:
+            print(">>> V2A Mode: Skipping video decoding (will use original input video)")
+            decoded_video = None
+            decode_start = time.time()
+        else:
+            print(">>> Decoding video...")
+            decode_start = time.time()
+
+            video_decoder = self.stage_2_model_ledger.video_decoder()
+            decoded_video_chunks = []
+            for chunk in vae_decode_video(
+                video_state.latent,
+                video_decoder,
+                tiling_config,
+            ):
+                decoded_video_chunks.append(chunk.cpu())
+                del chunk
+            def decoded_video_iter():
+                for chunk in decoded_video_chunks:
+                    yield chunk.cuda()
+            decoded_video = decoded_video_iter()
+            video_decoder.to("cpu")
+            del video_decoder
+            synchronize_and_cleanup()
+            phase_barrier("video_decoding_two_stage")
 
         if not disable_audio:
             print(">>> Decoding audio...")
-            # Load audio models only after video decoder is offloaded
             audio_decoder = self.stage_2_model_ledger.audio_decoder()
             vocoder = self.stage_2_model_ledger.vocoder()
             decoded_audio = vae_decode_audio(
@@ -3700,7 +4091,6 @@ class LTXVideoGeneratorWithOffloading:
                 audio_decoder,
                 vocoder,
             )
-            # Offload audio models
             audio_decoder.to("cpu")
             vocoder.to("cpu")
             del audio_decoder, vocoder
@@ -5320,6 +5710,1473 @@ def generate_av_extension(
 
 
 # =============================================================================
+# V2V Join Generation (Video-to-Video Transition)
+# =============================================================================
+
+def generate_v2v_join(
+    generator: "LTXVideoGeneratorWithOffloading",
+    args,
+    video1_path: str,
+    video2_path: str,
+    frames_check1: int = 30,
+    frames_check2: int = 30,
+    preserve1_sec: float = 5.0,
+    preserve2_sec: float = 5.0,
+    transition_sec: float = 10.0,
+    extend_steps: int = 8,
+    terminal: float = 0.1,
+    slope_len: int = 3,
+    skip_stage2: bool = False,
+    latent_norm_fn: Callable | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """
+    Join two videos by generating a smooth transition between them.
+
+    This function:
+    1. Finds optimal transition points in both videos using sharpness detection
+    2. Preserves sections from the end of video1 and start of video2
+    3. Generates a transition between them using masked denoising
+    4. Concatenates everything into a final joined video
+
+    Args:
+        generator: LTXVideoGeneratorWithOffloading instance
+        args: Command line arguments
+        video1_path: Path to first video
+        video2_path: Path to second video
+        frames_check1: Number of frames to check for sharpness at end of video1
+        frames_check2: Number of frames to check for sharpness at start of video2
+        preserve1_sec: Seconds to preserve from end of video1
+        preserve2_sec: Seconds to preserve from start of video2
+        transition_sec: Total seconds for generated transition between preserved sections
+        extend_steps: Number of denoising steps
+        terminal: Terminal sigma for partial denoising
+        slope_len: Transition slope length at mask boundaries
+        skip_stage2: Whether to skip stage 2 refinement
+        latent_norm_fn: Optional latent normalization function
+
+    Returns:
+        Tuple of (video_tensor [F, H, W, C], audio_tensor or None)
+    """
+    import cv2
+    import numpy as np
+    from dataclasses import replace as dataclass_replace
+    from ltx_core.types import LatentState, VideoPixelShape
+
+    device = generator.device
+    dtype = generator.dtype
+
+    print("=" * 60)
+    print("V2V Join Mode (Video-to-Video Transition)")
+    print("=" * 60)
+
+    # =========================================================================
+    # Step 1: Analyze both videos
+    # =========================================================================
+    print(">>> Analyzing input videos...")
+
+    cap1 = cv2.VideoCapture(video1_path)
+    if not cap1.isOpened():
+        raise RuntimeError(f"Failed to open video1: {video1_path}")
+    total_frames1 = int(cap1.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps1 = cap1.get(cv2.CAP_PROP_FPS)
+    width1 = int(cap1.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height1 = int(cap1.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    duration1 = total_frames1 / fps1
+    cap1.release()
+
+    cap2 = cv2.VideoCapture(video2_path)
+    if not cap2.isOpened():
+        raise RuntimeError(f"Failed to open video2: {video2_path}")
+    total_frames2 = int(cap2.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps2 = cap2.get(cv2.CAP_PROP_FPS)
+    width2 = int(cap2.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height2 = int(cap2.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    duration2 = total_frames2 / fps2
+    cap2.release()
+
+    print(f">>> Video1: {total_frames1} frames at {fps1:.1f} fps, {width1}x{height1}, {duration1:.2f}s")
+    print(f">>> Video2: {total_frames2} frames at {fps2:.1f} fps, {width2}x{height2}, {duration2:.2f}s")
+
+    # =========================================================================
+    # Step 2.5: Handle audio input
+    # =========================================================================
+    audio1_waveform, audio1_sample_rate = None, None
+    audio2_waveform, audio2_sample_rate = None, None
+    input_audio_waveform, input_audio_sample_rate = None, None
+    audio_strength = getattr(args, 'audio_strength', 1.0)
+
+    # Check if explicit audio file is provided
+    if hasattr(args, 'audio') and args.audio is not None:
+        print(f">>> Loading audio from input file: {args.audio}")
+        try:
+            waveform, sample_rate = decode_audio_from_file(args.audio, device)
+            if waveform is not None:
+                input_audio_waveform = waveform
+                input_audio_sample_rate = sample_rate
+                print(f">>> Input audio: {waveform.shape}, {sample_rate}Hz, strength={audio_strength}")
+        except Exception as e:
+            print(f">>> Failed to load audio file: {e}")
+
+    # ALWAYS extract audio from input videos (for preserved sections and prefix/suffix)
+    print(">>> Extracting audio from input videos...")
+    try:
+        waveform1, sample_rate1 = decode_audio_from_file(video1_path, device)
+        if waveform1 is not None:
+            audio1_waveform, audio1_sample_rate = waveform1, sample_rate1
+            print(f">>> Video1 audio: {waveform1.shape}, {sample_rate1}Hz")
+    except Exception as e:
+        print(f">>> No audio in video1: {e}")
+
+    try:
+        waveform2, sample_rate2 = decode_audio_from_file(video2_path, device)
+        if waveform2 is not None:
+            audio2_waveform, audio2_sample_rate = waveform2, sample_rate2
+            print(f">>> Video2 audio: {waveform2.shape}, {sample_rate2}Hz")
+    except Exception as e:
+        print(f">>> No audio in video2: {e}")
+
+    has_audio = input_audio_waveform is not None or audio1_waveform is not None or audio2_waveform is not None
+    use_input_audio = input_audio_waveform is not None
+
+    # =========================================================================
+    # Step 2: Find best transition frames using sharpness detection
+    # =========================================================================
+    best_frame1 = extract_best_transition_frame_from_end(video1_path, frames_check1)
+    best_frame2 = extract_best_transition_frame_from_start(video2_path, frames_check2)
+
+    if best_frame1 < 0:
+        best_frame1 = total_frames1 - 1
+        print(f">>> Using last frame of video1: {best_frame1}")
+
+    # =========================================================================
+    # Step 3: Calculate segment boundaries
+    # =========================================================================
+    output_fps = args.frame_rate
+
+    # Frames to preserve from each video (in output fps)
+    preserve1_frames = int(round(preserve1_sec * output_fps))
+    preserve2_frames = int(round(preserve2_sec * output_fps))
+
+    # Ensure 8n+1 format for VAE
+    preserve1_frames = ((preserve1_frames - 1) // 8) * 8 + 1
+    preserve2_frames = ((preserve2_frames - 1) // 8) * 8 + 1
+
+    # Total transition frames (preserved1 + generated + preserved2)
+    total_transition_frames = int(round((preserve1_sec + transition_sec + preserve2_sec) * output_fps))
+    total_transition_frames = ((total_transition_frames - 1) // 8) * 8 + 1
+
+    # Generated frames = total - preserved sections
+    generated_frames = total_transition_frames - preserve1_frames - preserve2_frames
+    if generated_frames < 9:
+        # Minimum 9 frames for generation
+        generated_frames = 9
+        total_transition_frames = preserve1_frames + generated_frames + preserve2_frames
+        total_transition_frames = ((total_transition_frames - 1) // 8) * 8 + 1
+
+    print(f">>> Transition structure:")
+    print(f">>>   Preserve from video1: {preserve1_frames} frames ({preserve1_frames / output_fps:.2f}s)")
+    print(f">>>   Generate transition: {generated_frames} frames ({generated_frames / output_fps:.2f}s)")
+    print(f">>>   Preserve from video2: {preserve2_frames} frames ({preserve2_frames / output_fps:.2f}s)")
+    print(f">>>   Total transition: {total_transition_frames} frames ({total_transition_frames / output_fps:.2f}s)")
+
+    # Calculate which frames to extract from source videos
+    # Video1: extract preserve1_frames ending at best_frame1
+    v1_start_frame = max(0, best_frame1 - int(preserve1_frames * fps1 / output_fps) + 1)
+    v1_end_frame = best_frame1 + 1  # +1 because end is exclusive
+
+    # Video2: extract preserve2_frames starting at best_frame2
+    v2_start_frame = best_frame2
+    v2_end_frame = min(total_frames2, best_frame2 + int(preserve2_frames * fps2 / output_fps))
+
+    # Also calculate prefix (before transition) and suffix (after transition)
+    v1_prefix_end = v1_start_frame  # All frames before transition start
+    v2_suffix_start = v2_end_frame  # All frames after transition end
+
+    print(f">>> Video1 extraction: frames {v1_start_frame}-{v1_end_frame} (prefix ends at {v1_prefix_end})")
+    print(f">>> Video2 extraction: frames {v2_start_frame}-{v2_end_frame} (suffix starts at {v2_suffix_start})")
+
+    # Calculate audio timing if we have audio
+    if has_audio:
+        audio_sample_rate = audio1_sample_rate or audio2_sample_rate or 24000
+        preserve1_audio_samples = int(round(preserve1_sec * audio_sample_rate))
+        transition_audio_samples = int(round(transition_sec * audio_sample_rate))
+        preserve2_audio_samples = int(round(preserve2_sec * audio_sample_rate))
+        total_audio_samples = preserve1_audio_samples + transition_audio_samples + preserve2_audio_samples
+
+        v1_audio_start_sample = int(round(v1_start_frame / fps1 * audio_sample_rate))
+        v1_audio_end_sample = int(round(v1_end_frame / fps1 * audio_sample_rate))
+        v2_audio_start_sample = int(round(v2_start_frame / fps2 * audio_sample_rate))
+        v2_audio_end_sample = int(round(v2_end_frame / fps2 * audio_sample_rate))
+
+        print(f">>> Audio timing: preserve1={preserve1_audio_samples}, transition={transition_audio_samples}, preserve2={preserve2_audio_samples}")
+
+    # =========================================================================
+    # Step 4: Load video segments
+    # =========================================================================
+    print(">>> Loading video segments...")
+
+    # Determine output resolution
+    out_width = args.width
+    out_height = args.height
+
+    # Use half resolution for two-stage pipeline
+    if not generator.one_stage:
+        stage1_width = out_width // 2
+        stage1_height = out_height // 2
+    else:
+        stage1_width = out_width
+        stage1_height = out_height
+
+    # Ensure dimensions are divisible by 32
+    stage1_width = (stage1_width // 32) * 32
+    stage1_height = (stage1_height // 32) * 32
+
+    # Load preserved section from video1 (end section)
+    frames1, _ = load_video_segment(
+        video1_path, v1_start_frame, v1_end_frame,
+        stage1_width, stage1_height, device, dtype
+    )
+    print(f">>> Loaded video1 segment: {frames1.shape}")
+
+    # Load preserved section from video2 (start section)
+    frames2, _ = load_video_segment(
+        video2_path, v2_start_frame, v2_end_frame,
+        stage1_width, stage1_height, device, dtype
+    )
+    print(f">>> Loaded video2 segment: {frames2.shape}")
+
+    # Resample to match output fps and target frame counts
+    # Video1 preserved frames
+    if frames1.shape[0] != preserve1_frames:
+        indices = torch.linspace(0, frames1.shape[0] - 1, preserve1_frames).long()
+        frames1 = frames1[indices]
+        print(f">>> Resampled video1 segment to {frames1.shape[0]} frames")
+
+    # Video2 preserved frames
+    if frames2.shape[0] != preserve2_frames:
+        indices = torch.linspace(0, frames2.shape[0] - 1, preserve2_frames).long()
+        frames2 = frames2[indices]
+        print(f">>> Resampled video2 segment to {frames2.shape[0]} frames")
+
+    # =========================================================================
+    # Step 5: Create combined input for transition
+    # =========================================================================
+    # The transition region will be: [preserved1 | zeros_for_generation | preserved2]
+    # We need to create a tensor with the full transition length
+
+    # Create empty frames for generation region (initialized with interpolation)
+    print(">>> Creating transition frame buffer...")
+
+    # Linear interpolation between last frame of video1 and first frame of video2
+    # for the generation region as initialization
+    last_frame1 = frames1[-1:].clone()
+    first_frame2 = frames2[:1].clone()
+
+    # Create interpolated frames for generation region
+    gen_frames = []
+    for i in range(generated_frames):
+        alpha = i / max(generated_frames - 1, 1)
+        interp_frame = last_frame1 * (1 - alpha) + first_frame2 * alpha
+        gen_frames.append(interp_frame)
+    gen_frames_tensor = torch.cat(gen_frames, dim=0)
+
+    # Combine all frames: [preserved1 | interpolated_gen | preserved2]
+    combined_frames = torch.cat([frames1, gen_frames_tensor, frames2], dim=0)
+    print(f">>> Combined frame buffer: {combined_frames.shape}")
+
+    # Free memory
+    del frames1, frames2, gen_frames_tensor, gen_frames
+    cleanup_memory()
+
+    # =========================================================================
+    # Step 5.5: Extract and combine audio segments
+    # =========================================================================
+    combined_audio_waveform = None
+    if has_audio:
+        print(">>> Combining audio segments...")
+
+        # Extract preserve1 audio from video1 (always needed for preserved section)
+        if audio1_waveform is not None:
+            audio1_total = audio1_waveform.shape[-1]
+            v1_start = max(0, v1_audio_start_sample)
+            v1_end = min(v1_audio_end_sample, audio1_total)
+            preserve1_audio = audio1_waveform[..., v1_start:v1_end]
+            if preserve1_audio.dim() == 2:
+                preserve1_audio = preserve1_audio.unsqueeze(0)
+            # Resample if needed
+            if preserve1_audio.shape[-1] != preserve1_audio_samples:
+                preserve1_audio = torch.nn.functional.interpolate(
+                    preserve1_audio.float(), size=preserve1_audio_samples, mode='linear'
+                ).to(dtype)
+        else:
+            preserve1_audio = torch.zeros(1, 2, preserve1_audio_samples, device=device, dtype=dtype)
+
+        # Transition audio: use input audio if provided, else silence
+        original_combined_audio = None  # Will be set if using input audio
+        if use_input_audio:
+            print(f">>> Using input audio for transition section (strength={audio_strength})...")
+            # Prepare input audio waveform for transition section only
+            transition_audio = input_audio_waveform
+            if transition_audio.dim() == 2:
+                transition_audio = transition_audio.unsqueeze(0)
+            # Resample/tile input audio to match transition duration
+            if transition_audio.shape[-1] != transition_audio_samples:
+                if transition_audio.shape[-1] < transition_audio_samples:
+                    # Loop/tile to fill transition duration
+                    num_repeats = (transition_audio_samples + transition_audio.shape[-1] - 1) // transition_audio.shape[-1]
+                    transition_audio = transition_audio.repeat(1, 1, num_repeats)
+                # Crop to exact size
+                transition_audio = transition_audio[..., :transition_audio_samples]
+            # Ensure correct dtype
+            transition_audio = transition_audio.to(dtype)
+            print(f">>> Transition audio from input: {transition_audio.shape}")
+        else:
+            # Silent placeholder for transition (model will generate)
+            transition_audio = torch.zeros(1, 2, transition_audio_samples, device=device, dtype=dtype)
+
+        # Extract preserve2 audio from video2 (always needed for preserved section)
+        if audio2_waveform is not None:
+            audio2_total = audio2_waveform.shape[-1]
+            v2_start = max(0, v2_audio_start_sample)
+            v2_end = min(v2_audio_end_sample, audio2_total)
+            preserve2_audio = audio2_waveform[..., v2_start:v2_end]
+            if preserve2_audio.dim() == 2:
+                preserve2_audio = preserve2_audio.unsqueeze(0)
+            if preserve2_audio.shape[-1] != preserve2_audio_samples:
+                preserve2_audio = torch.nn.functional.interpolate(
+                    preserve2_audio.float(), size=preserve2_audio_samples, mode='linear'
+                ).to(dtype)
+        else:
+            preserve2_audio = torch.zeros(1, 2, preserve2_audio_samples, device=device, dtype=dtype)
+
+        combined_audio_waveform = torch.cat([preserve1_audio, transition_audio, preserve2_audio], dim=-1)
+        print(f">>> Combined audio waveform: {combined_audio_waveform.shape}")
+
+        # Store full combined audio for waveform blending (before VAE)
+        if use_input_audio:
+            original_combined_audio = combined_audio_waveform.clone()
+            print(f">>> Saved full combined audio for blending: {original_combined_audio.shape}")
+
+    # =========================================================================
+    # Step 6: Encode to latent space
+    # =========================================================================
+    print(">>> Encoding frames to latent space...")
+
+    video_encoder = generator.stage_1_model_ledger.video_encoder()
+    encoder_dtype = next(video_encoder.parameters()).dtype
+    time_scale_factor = video_encoder.downscale_index_formula[0] if hasattr(video_encoder, 'downscale_index_formula') else 8
+
+    # Convert from [F, H, W, C] to [1, C, F, H, W] and normalize to [-1, 1]
+    video_input = combined_frames.permute(3, 0, 1, 2).unsqueeze(0)  # [1, C, F, H, W]
+    video_input = video_input * 2.0 - 1.0
+
+    del combined_frames
+    cleanup_memory()
+
+    # Encode in temporal chunks to avoid OOM
+    chunk_pixel_frames = 65  # 8*8+1 = 65 frames per chunk
+    total_pixel_frames = video_input.shape[2]
+
+    latent_chunks = []
+    chunk_idx = 0
+
+    with torch.no_grad():
+        for start_frame in range(0, total_pixel_frames, chunk_pixel_frames - 1):
+            end_frame = min(start_frame + chunk_pixel_frames, total_pixel_frames)
+            actual_frames = end_frame - start_frame
+
+            # Ensure we have at least 9 frames (minimum for VAE)
+            if actual_frames < 9:
+                pad_frames = 9 - actual_frames
+                chunk = video_input[:, :, start_frame:end_frame, :, :]
+                last_frame = chunk[:, :, -1:, :, :].expand(-1, -1, pad_frames, -1, -1)
+                chunk = torch.cat([chunk, last_frame], dim=2)
+            else:
+                chunk = video_input[:, :, start_frame:end_frame, :, :]
+
+            chunk_latent = video_encoder(chunk.to(device=device, dtype=encoder_dtype))
+            chunk_latent = chunk_latent.to(dtype=dtype)
+
+            # Skip first latent frame for non-first chunks (temporal overlap)
+            if chunk_idx > 0 and len(latent_chunks) > 0:
+                chunk_latent = chunk_latent[:, :, 1:, :, :]
+
+            latent_chunks.append(chunk_latent)
+            chunk_idx += 1
+
+            print(f">>> Encoded chunk {chunk_idx}: frames {start_frame}-{end_frame} -> {chunk_latent.shape[2]} latent frames")
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    video_latent = torch.cat(latent_chunks, dim=2)
+    print(f">>> Full video latent: {video_latent.shape}")
+
+    # Free encoder
+    video_encoder.to("cpu")
+    del video_encoder, latent_chunks, video_input
+    cleanup_memory()
+
+    # =========================================================================
+    # Step 6.5: Encode audio to latent space
+    # =========================================================================
+    audio_latent = None
+    audio_latents_per_second = None
+
+    if combined_audio_waveform is not None:
+        print(">>> Encoding audio to latent space...")
+        audio_encoder = generator.stage_1_model_ledger.audio_encoder()
+        audio_processor = AudioProcessor(
+            sample_rate=audio_encoder.sample_rate,
+            mel_bins=audio_encoder.mel_bins,
+            mel_hop_length=audio_encoder.mel_hop_length,
+            n_fft=audio_encoder.n_fft,
+        ).to(device)
+
+        mel_spectrogram = audio_processor.waveform_to_mel(
+            combined_audio_waveform.float(), waveform_sample_rate=audio_sample_rate
+        )
+
+        with torch.no_grad():
+            audio_latent = audio_encoder(mel_spectrogram.float().to(device)).to(dtype)
+
+        total_audio_duration = total_audio_samples / audio_sample_rate
+        audio_latents_per_second = audio_latent.shape[2] / total_audio_duration
+        print(f">>> Audio latent: {audio_latent.shape}, {audio_latents_per_second:.2f} latent frames/sec")
+
+        if use_input_audio:
+            # When using input audio, keep the full latent - don't zero any region
+            # The audio_strength will control how much this audio influences the generation
+            print(f">>> Using full input audio latent (strength={audio_strength})")
+        else:
+            # Zero out the transition region of audio latent for generation
+            preserve1_audio_latent_frames = int(round(preserve1_sec * audio_latents_per_second))
+            preserve2_audio_latent_frames = int(round(preserve2_sec * audio_latents_per_second))
+            audio_gen_start_latent = preserve1_audio_latent_frames
+            audio_gen_end_latent = audio_latent.shape[2] - preserve2_audio_latent_frames
+            audio_latent[:, :, audio_gen_start_latent:audio_gen_end_latent, :] = 0.0
+            print(f">>> Audio latent zeroed for generation region: {audio_gen_start_latent}-{audio_gen_end_latent}")
+
+        del audio_encoder, audio_processor, mel_spectrogram
+        cleanup_memory()
+
+    # =========================================================================
+    # Step 7: Create noise mask for V2V join
+    # =========================================================================
+    print(">>> Creating V2V join noise mask...")
+
+    B, C, F_latent, H_latent, W_latent = video_latent.shape
+
+    # Calculate latent frame indices for preserved/generation boundaries
+    # preserve1_frames -> latent frames
+    preserve1_latent = (preserve1_frames - 1) // time_scale_factor + 1
+    # preserve2_frames -> latent frames
+    preserve2_latent = (preserve2_frames - 1) // time_scale_factor + 1
+    # Generation region is everything in between
+    gen_start_latent = preserve1_latent
+    gen_end_latent = F_latent - preserve2_latent
+
+    print(f">>> Latent mask: preserve1=0-{gen_start_latent}, gen={gen_start_latent}-{gen_end_latent}, preserve2={gen_end_latent}-{F_latent}")
+
+    # Create mask: 0 = preserve (no denoising), 1 = generate (full denoising)
+    video_mask = torch.zeros((B, 1, F_latent, H_latent, W_latent), device=device, dtype=torch.float32)
+
+    # Set generation region to 1
+    video_mask[:, :, gen_start_latent:gen_end_latent, :, :] = 1.0
+
+    # Apply slope at boundaries for smooth blending
+    if slope_len > 0:
+        # Slope at start of generation (transition from preserve1 to gen)
+        for i in range(min(slope_len, gen_end_latent - gen_start_latent)):
+            slope_value = (i + 1) / (slope_len + 1)
+            video_mask[:, :, gen_start_latent + i, :, :] = slope_value
+
+        # Slope at end of generation (transition from gen to preserve2)
+        for i in range(min(slope_len, gen_end_latent - gen_start_latent)):
+            slope_value = (i + 1) / (slope_len + 1)
+            video_mask[:, :, gen_end_latent - 1 - i, :, :] = slope_value
+
+    print(f">>> Video mask created with slope_len={slope_len}")
+
+    # =========================================================================
+    # Step 8: Run masked denoising (similar to AV extension)
+    # =========================================================================
+    print(">>> Running masked denoising...")
+
+    # Offload latents to CPU for model loading
+    video_latent = video_latent.cpu()
+    video_mask = video_mask.cpu()
+    cleanup_memory()
+
+    # Load text encoder and encode prompts
+    text_encoder = generator.stage_1_model_ledger.text_encoder()
+    print(">>> Encoding prompts...")
+    if args.cfg_guidance_scale > 1.0:
+        context_p, context_n = encode_text(text_encoder, prompts=[args.prompt, args.negative_prompt])
+        v_context_p, a_context_p = context_p
+        v_context_n, a_context_n = context_n
+    else:
+        context_p = encode_text(text_encoder, prompts=[args.prompt])[0]
+        v_context_p, a_context_p = context_p
+        v_context_n, a_context_n = None, None
+
+    del text_encoder
+    cleanup_memory()
+
+    # Reload latents to GPU
+    video_latent = video_latent.to(device=device, dtype=dtype)
+    video_mask = video_mask.to(device=device)
+
+    # Load transformer
+    block_swap_manager = None
+    if generator.enable_dit_block_swap:
+        print(f">>> Loading DiT transformer with block swapping ({generator.dit_blocks_in_memory} blocks in GPU)...")
+        from ltx_core.loader.sft_loader import SafetensorsStateDictLoader
+
+        has_loras = hasattr(generator.stage_1_model_ledger, 'loras') and generator.stage_1_model_ledger.loras
+
+        if has_loras:
+            stage_1_ledger_no_lora = ModelLedger(
+                dtype=generator.dtype,
+                device=torch.device("cpu"),
+                checkpoint_path=generator.stage_1_model_ledger.checkpoint_path,
+                gemma_root_path=generator.stage_1_model_ledger.gemma_root_path,
+                spatial_upsampler_path=generator.stage_1_model_ledger.spatial_upsampler_path,
+                vae_path=generator.stage_1_model_ledger.vae_path,
+                loras=(),
+                fp8transformer=generator.stage_1_model_ledger.fp8transformer,
+            )
+            transformer = stage_1_ledger_no_lora.transformer()
+
+            loras = generator.stage_1_model_ledger.loras
+            print(f">>> Applying {len(loras)} LoRA(s)...")
+            lora_loader = SafetensorsStateDictLoader()
+            lora_state_dicts = []
+            lora_strengths = []
+            for lora in loras:
+                lora_sd = lora_loader.load(lora.path, sd_ops=lora.sd_ops, device=torch.device("cpu"))
+                lora_state_dicts.append(lora_sd)
+                lora_strengths.append(lora.strength)
+
+            apply_loras_chunked_gpu(
+                model=transformer,
+                lora_state_dicts=lora_state_dicts,
+                lora_strengths=lora_strengths,
+                gpu_device=device,
+                dtype=dtype,
+            )
+            del lora_state_dicts
+            cleanup_memory()
+        else:
+            original_device = generator.stage_1_model_ledger.device
+            generator.stage_1_model_ledger.device = torch.device("cpu")
+            transformer = generator.stage_1_model_ledger.transformer()
+            generator.stage_1_model_ledger.device = original_device
+
+        # Move non-block components to GPU
+        transformer.velocity_model.patchify_proj.to(device)
+        transformer.velocity_model.adaln_single.to(device)
+        transformer.velocity_model.caption_projection.to(device)
+        transformer.velocity_model.norm_out.to(device)
+        transformer.velocity_model.proj_out.to(device)
+        transformer.velocity_model.scale_shift_table = torch.nn.Parameter(
+            transformer.velocity_model.scale_shift_table.to(device)
+        )
+
+        if hasattr(transformer.velocity_model, "audio_patchify_proj"):
+            transformer.velocity_model.audio_patchify_proj.to(device)
+        if hasattr(transformer.velocity_model, "audio_adaln_single"):
+            transformer.velocity_model.audio_adaln_single.to(device)
+        if hasattr(transformer.velocity_model, "audio_caption_projection"):
+            transformer.velocity_model.audio_caption_projection.to(device)
+        if hasattr(transformer.velocity_model, "audio_norm_out"):
+            transformer.velocity_model.audio_norm_out.to(device)
+        if hasattr(transformer.velocity_model, "audio_proj_out"):
+            transformer.velocity_model.audio_proj_out.to(device)
+        if hasattr(transformer.velocity_model, "audio_scale_shift_table"):
+            transformer.velocity_model.audio_scale_shift_table = torch.nn.Parameter(
+                transformer.velocity_model.audio_scale_shift_table.to(device)
+            )
+
+        if hasattr(transformer.velocity_model, "av_ca_video_scale_shift_adaln_single"):
+            transformer.velocity_model.av_ca_video_scale_shift_adaln_single.to(device)
+        if hasattr(transformer.velocity_model, "av_ca_audio_scale_shift_adaln_single"):
+            transformer.velocity_model.av_ca_audio_scale_shift_adaln_single.to(device)
+        if hasattr(transformer.velocity_model, "av_ca_a2v_gate_adaln_single"):
+            transformer.velocity_model.av_ca_a2v_gate_adaln_single.to(device)
+        if hasattr(transformer.velocity_model, "av_ca_v2a_gate_adaln_single"):
+            transformer.velocity_model.av_ca_v2a_gate_adaln_single.to(device)
+
+        if getattr(generator, 'enable_activation_offload', False):
+            block_swap_manager = enable_block_swap_with_activation_offload(
+                transformer,
+                blocks_in_memory=generator.dit_blocks_in_memory,
+                device=device,
+                verbose=True,
+                temporal_chunk_size=getattr(generator, 'temporal_chunk_size', 0),
+            )
+        else:
+            block_swap_manager = enable_block_swap(
+                transformer,
+                blocks_in_memory=generator.dit_blocks_in_memory,
+                device=device,
+            )
+    else:
+        transformer = generator.stage_1_model_ledger.transformer()
+
+    # Create sigmas schedule
+    sigmas = LTX2Scheduler().execute(
+        steps=extend_steps,
+        latent=video_latent,
+        terminal=terminal,
+        stretch=True,
+    ).to(dtype=torch.float32, device=device)
+
+    # Initialize diffusion components
+    generator_torch = torch.Generator(device=device).manual_seed(args.seed)
+    noiser = GaussianNoiser(generator=generator_torch)
+    stepper = EulerDiffusionStep()
+    cfg_guider = CFGGuider(args.cfg_guidance_scale)
+    effective_stg_blocks = args.stg_blocks if args.stg_blocks is not None else [29]
+    stg_guider = STGGuider(args.stg_scale)
+    stg_perturbation_config = build_stg_perturbation_config(
+        stg_scale=args.stg_scale,
+        stg_blocks=effective_stg_blocks,
+        stg_mode=args.stg_mode,
+    )
+
+    # Get components
+    components = generator.pipeline_components
+
+    # Create the denoise function (CFG + STG combined)
+    use_cfg = args.cfg_guidance_scale > 1.0 and v_context_n is not None
+    use_stg = stg_guider.enabled() and stg_perturbation_config is not None
+    if use_cfg or use_stg:
+        denoise_fn = cfg_stg_denoising_func(
+            cfg_guider=cfg_guider,
+            stg_guider=stg_guider,
+            stg_perturbation_config=stg_perturbation_config,
+            v_context_p=v_context_p,
+            v_context_n=v_context_n,
+            a_context_p=a_context_p,
+            a_context_n=a_context_n,
+            transformer=transformer,
+        )
+    else:
+        denoise_fn = simple_denoising_func(v_context_p, a_context_p, transformer)
+
+    from ltx_core.types import VideoLatentShape, AudioLatentShape, LatentState
+    from ltx_core.tools import VideoLatentTools, AudioLatentTools
+    from ltx_pipelines.utils.helpers import euler_denoising_loop
+
+    # Create video shape and latent tools
+    output_shape = VideoPixelShape(
+        batch=1,
+        frames=total_transition_frames,
+        height=stage1_height,
+        width=stage1_width,
+        fps=output_fps,
+    )
+    video_latent_shape = VideoLatentShape.from_pixel_shape(
+        shape=output_shape,
+        latent_channels=components.video_latent_channels,
+        scale_factors=components.video_scale_factors,
+    )
+    video_tools = VideoLatentTools(
+        patchifier=components.video_patchifier,
+        target_shape=video_latent_shape,
+        fps=output_fps,
+    )
+
+    # Split the combined latent into three regions: preserve1, generate, preserve2
+    # gen_start_latent and gen_end_latent are already computed in Step 7
+    preserve1_lat = video_latent[:, :, :gen_start_latent, :, :]
+    # CRITICAL FIX: Use ZEROS for generate region, NOT encoded interpolated frames!
+    # The diffusion model expects to start from PURE NOISE for generation regions.
+    # Starting from interpolated_latent + noise confuses the model and causes black output.
+    # Pattern: zeros + noise = pure noise (same as AV extension working code)
+    generate_lat = torch.zeros_like(video_latent[:, :, gen_start_latent:gen_end_latent, :, :])
+    preserve2_lat = video_latent[:, :, gen_end_latent:, :, :]
+
+    print(f">>> Split latents: preserve1={preserve1_lat.shape[2]}, gen={generate_lat.shape[2]} (ZEROS), preserve2={preserve2_lat.shape[2]}")
+
+    # Calculate pixel frame counts for each region
+    preserve1_pixel_frames = (preserve1_lat.shape[2] - 1) * time_scale_factor + 1
+    generate_pixel_frames = (generate_lat.shape[2] - 1) * time_scale_factor + 1
+    preserve2_pixel_frames = (preserve2_lat.shape[2] - 1) * time_scale_factor + 1
+
+    # Create VideoLatentTools for each region
+    preserve1_shape = VideoPixelShape(
+        batch=1, frames=preserve1_pixel_frames,
+        height=stage1_height, width=stage1_width, fps=output_fps,
+    )
+    preserve1_latent_shape = VideoLatentShape.from_pixel_shape(
+        shape=preserve1_shape,
+        latent_channels=components.video_latent_channels,
+        scale_factors=components.video_scale_factors,
+    )
+    preserve1_tools = VideoLatentTools(
+        patchifier=components.video_patchifier,
+        target_shape=preserve1_latent_shape,
+        fps=output_fps,
+    )
+
+    generate_shape = VideoPixelShape(
+        batch=1, frames=generate_pixel_frames,
+        height=stage1_height, width=stage1_width, fps=output_fps,
+    )
+    generate_latent_shape = VideoLatentShape.from_pixel_shape(
+        shape=generate_shape,
+        latent_channels=components.video_latent_channels,
+        scale_factors=components.video_scale_factors,
+    )
+    generate_tools = VideoLatentTools(
+        patchifier=components.video_patchifier,
+        target_shape=generate_latent_shape,
+        fps=output_fps,
+    )
+
+    preserve2_shape = VideoPixelShape(
+        batch=1, frames=preserve2_pixel_frames,
+        height=stage1_height, width=stage1_width, fps=output_fps,
+    )
+    preserve2_latent_shape = VideoLatentShape.from_pixel_shape(
+        shape=preserve2_shape,
+        latent_channels=components.video_latent_channels,
+        scale_factors=components.video_scale_factors,
+    )
+    preserve2_tools = VideoLatentTools(
+        patchifier=components.video_patchifier,
+        target_shape=preserve2_latent_shape,
+        fps=output_fps,
+    )
+
+    # Create states for each region with proper masking
+    # Preserve1: mask=0 (no denoising), no noise
+    preserve1_state = preserve1_tools.create_initial_state(device, dtype, preserve1_lat)
+    preserve1_state = dataclass_replace(
+        preserve1_state,
+        denoise_mask=torch.zeros_like(preserve1_state.denoise_mask),
+    )
+
+    # Generate: mask=1 (full denoising), add noise - ONLY this region gets noise
+    generate_state = generate_tools.create_initial_state(device, dtype, generate_lat)
+    generate_state = dataclass_replace(
+        generate_state,
+        denoise_mask=torch.ones_like(generate_state.denoise_mask),
+    )
+    generate_state = noiser(generate_state, noise_scale=1.0)
+
+    # DEBUG: Verify generate_state has proper noise (should be ~N(0,1) for pure noise)
+    print(f">>> DEBUG - Noisy generate latent: mean={generate_state.latent.mean().item():.4f}, std={generate_state.latent.std().item():.4f}")
+    print(f">>> DEBUG - Preserve1 latent (clean): mean={preserve1_state.latent.mean().item():.4f}, std={preserve1_state.latent.std().item():.4f}")
+    print(f">>> DEBUG - Generate mask: all ones = {(generate_state.denoise_mask == 1.0).all().item()}")
+
+    # Preserve2: mask=0 (no denoising), no noise
+    preserve2_state = preserve2_tools.create_initial_state(device, dtype, preserve2_lat)
+    preserve2_state = dataclass_replace(
+        preserve2_state,
+        denoise_mask=torch.zeros_like(preserve2_state.denoise_mask),
+    )
+
+    # Offset positions for temporal continuity
+    # Generate region comes after preserve1
+    generate_positions = generate_state.positions.clone()
+    time_offset1 = preserve1_pixel_frames / output_fps
+    generate_positions[:, 0, :, :] += time_offset1
+    generate_state = dataclass_replace(generate_state, positions=generate_positions)
+    print(f">>> Generate position offset: {time_offset1:.3f}s (preserve1 has {preserve1_pixel_frames} pixel frames)")
+
+    # Preserve2 comes after preserve1 + generate
+    preserve2_positions = preserve2_state.positions.clone()
+    time_offset2 = (preserve1_pixel_frames + generate_pixel_frames) / output_fps
+    preserve2_positions[:, 0, :, :] += time_offset2
+    preserve2_state = dataclass_replace(preserve2_state, positions=preserve2_positions)
+    print(f">>> Preserve2 position offset: {time_offset2:.3f}s")
+
+    # Store sequence lengths for extraction after denoising
+    preserve1_seq_len = preserve1_state.latent.shape[1]
+    generate_seq_len = generate_state.latent.shape[1]
+
+    # Concatenate states with clean_latent for post-denoising blending
+    video_state = LatentState(
+        latent=torch.cat([preserve1_state.latent, generate_state.latent, preserve2_state.latent], dim=1),
+        denoise_mask=torch.cat([preserve1_state.denoise_mask, generate_state.denoise_mask, preserve2_state.denoise_mask], dim=1),
+        positions=torch.cat([preserve1_state.positions, generate_state.positions, preserve2_state.positions], dim=2),
+        clean_latent=torch.cat([preserve1_state.clean_latent, generate_state.clean_latent, preserve2_state.clean_latent], dim=1),
+    )
+
+    # Create audio state (with proper audio handling if available)
+    if audio_latent is not None:
+        audio_latent_shape = AudioLatentShape.from_torch_shape(audio_latent.shape)
+        audio_tools = AudioLatentTools(
+            patchifier=components.audio_patchifier,
+            target_shape=audio_latent_shape,
+        )
+
+        B_a, C_a, F_audio, mel_bins = audio_latent.shape
+
+        preserve1_audio_latent = int(round(preserve1_sec * audio_latents_per_second))
+        preserve2_audio_latent = int(round(preserve2_sec * audio_latents_per_second))
+        audio_gen_start = preserve1_audio_latent
+        audio_gen_end = F_audio - preserve2_audio_latent
+
+        # Create audio mask: 0 = preserve, 1 = generate
+        audio_mask = torch.zeros((B_a, 1, F_audio, 1), device=device, dtype=torch.float32)
+
+        if use_input_audio:
+            # mask = 1.0 - strength: strength=1 -> mask=0 (preserve), strength=0 -> mask=1 (generate)
+            transition_mask_value = 1.0 - audio_strength
+            audio_mask[:, :, audio_gen_start:audio_gen_end, :] = transition_mask_value
+            # Apply slope with transition_mask_value
+            if slope_len > 0:
+                for i in range(min(slope_len, audio_gen_end - audio_gen_start)):
+                    slope_value = (i + 1) / (slope_len + 1) * transition_mask_value
+                    audio_mask[:, :, audio_gen_start + i, :] = slope_value
+                    audio_mask[:, :, audio_gen_end - 1 - i, :] = slope_value
+            print(f">>> Audio mask: transition_mask_value={transition_mask_value} (from audio_strength={audio_strength})")
+        else:
+            # Full generation when no input audio
+            audio_mask[:, :, audio_gen_start:audio_gen_end, :] = 1.0
+            # Apply slope at boundaries
+            if slope_len > 0:
+                for i in range(min(slope_len, audio_gen_end - audio_gen_start)):
+                    slope_value = (i + 1) / (slope_len + 1)
+                    audio_mask[:, :, audio_gen_start + i, :] = slope_value
+                    audio_mask[:, :, audio_gen_end - 1 - i, :] = slope_value
+
+        print(f">>> Audio mask: preserve {0}-{audio_gen_start}, generate {audio_gen_start}-{audio_gen_end}, preserve {audio_gen_end}-{F_audio}")
+
+        audio_state = audio_tools.create_initial_state(device, dtype, audio_latent)
+        patchified_audio_mask = audio_tools.patchifier.patchify(audio_mask)
+        audio_state = dataclass_replace(audio_state, denoise_mask=patchified_audio_mask.float())
+        audio_state = noiser(audio_state, noise_scale=1.0)
+    else:
+        # Fallback: dummy state
+        audio_latent_shape = AudioLatentShape.from_video_pixel_shape(shape=output_shape)
+        audio_tools = AudioLatentTools(patchifier=components.audio_patchifier, target_shape=audio_latent_shape)
+        audio_state = audio_tools.create_initial_state(device, dtype, None)
+        audio_state = dataclass_replace(audio_state, denoise_mask=torch.zeros_like(audio_state.denoise_mask))
+        audio_state = noiser(audio_state, noise_scale=1.0)
+
+    # Run denoising loop
+    final_video_state, final_audio_state = euler_denoising_loop(
+        sigmas=sigmas,
+        video_state=video_state,
+        audio_state=audio_state,
+        stepper=stepper,
+        denoise_fn=denoise_fn,
+        latent_norm_fn=latent_norm_fn,
+    )
+
+    # Extract ONLY the generate tokens from final_video_state (matching AV extension pattern)
+    generate_start = preserve1_seq_len
+    generate_end = preserve1_seq_len + generate_seq_len
+
+    print(f">>> Extracting generate tokens: {generate_start} to {generate_end}")
+
+    generate_final_state = LatentState(
+        latent=final_video_state.latent[:, generate_start:generate_end, :],
+        denoise_mask=final_video_state.denoise_mask[:, generate_start:generate_end, :],
+        positions=final_video_state.positions[:, :, generate_start:generate_end, :],
+        clean_latent=final_video_state.clean_latent[:, generate_start:generate_end, :] if final_video_state.clean_latent is not None else None,
+    )
+
+    # Unpatchify ONLY the generate region with generate_tools
+    generate_final_state = generate_tools.clear_conditioning(generate_final_state)
+    generate_final_state = generate_tools.unpatchify(generate_final_state)
+
+    # Get ORIGINAL preserved latents from input (not model output!)
+    original_preserve1_latent = video_latent[:, :, :gen_start_latent, :, :]
+    original_preserve2_latent = video_latent[:, :, gen_end_latent:, :, :]
+
+    # Get generated latent (unpatchified)
+    generated_latent = generate_final_state.latent
+
+    # DEBUG: Check latent statistics to diagnose black video issue
+    print(f">>> DEBUG - Generated latent stats: min={generated_latent.min().item():.4f}, max={generated_latent.max().item():.4f}, mean={generated_latent.mean().item():.4f}, std={generated_latent.std().item():.4f}")
+    print(f">>> DEBUG - Preserve1 latent stats: min={original_preserve1_latent.min().item():.4f}, max={original_preserve1_latent.max().item():.4f}, mean={original_preserve1_latent.mean().item():.4f}")
+    print(f">>> DEBUG - Preserve2 latent stats: min={original_preserve2_latent.min().item():.4f}, max={original_preserve2_latent.max().item():.4f}, mean={original_preserve2_latent.mean().item():.4f}")
+
+    # Reconstruct full video: [original_preserve1, generated, original_preserve2]
+    denoised_video_latent = torch.cat([original_preserve1_latent, generated_latent, original_preserve2_latent], dim=2)
+    print(f">>> Reconstructed: preserve1={original_preserve1_latent.shape[2]}, gen={generated_latent.shape[2]}, preserve2={original_preserve2_latent.shape[2]}")
+
+    # Extract denoised audio latent
+    denoised_audio_latent = None
+    if audio_latent is not None:
+        final_audio_state = audio_tools.clear_conditioning(final_audio_state)
+        final_audio_state = audio_tools.unpatchify(final_audio_state)
+        denoised_audio_latent = final_audio_state.latent
+        print(f">>> Denoised audio latent: {denoised_audio_latent.shape}")
+
+    # Cleanup transformer
+    if block_swap_manager is not None:
+        offload_all_blocks(transformer)
+        transformer.velocity_model._block_swap_offloader = None
+        transformer.velocity_model._blocks_ref = None
+        block_swap_manager = None
+    del transformer
+    cleanup_memory()
+    phase_barrier("v2v_join_denoising")
+
+    # =========================================================================
+    # Step 9: Stage 2 Refinement (if enabled)
+    # =========================================================================
+    if not skip_stage2 and not generator.one_stage:
+        print(">>> Stage 2 refinement...")
+
+        from ltx_core.model.upsampler import upsample_video as upsample_latent_fn
+
+        video_encoder = generator.stage_1_model_ledger.video_encoder()
+        spatial_upsampler = generator.stage_2_model_ledger.spatial_upsampler()
+
+        print(">>> Upsampling latents (2x)...")
+        upscaled_video_latent = upsample_latent_fn(
+            latent=denoised_video_latent,
+            video_encoder=video_encoder,
+            upsampler=spatial_upsampler,
+        )
+
+        del spatial_upsampler
+        cleanup_memory()
+
+        # =====================================================================
+        # 9A-FIX: Re-encode preserved frames at full (Stage 2) resolution
+        # =====================================================================
+        # The LatentUpsampler is a neural network that modifies ALL latent values,
+        # corrupting the preserved frames. We fix this by:
+        # 1. Re-loading the input videos at full (Stage 2) resolution
+        # 2. Encoding them to latent space
+        # 3. Replacing the upsampler output's preserved frames with original encoding
+        print(">>> Re-encoding preserved frames at full Stage 2 resolution...")
+
+        stage2_width = stage1_width * 2
+        stage2_height = stage1_height * 2
+
+        # Re-encode video1 preserved frames (0 to gen_start_latent)
+        print(f">>> Loading video1 preserved frames at {stage2_width}x{stage2_height}...")
+        video1_full_res_frames, _ = load_video_segment(
+            video1_path, v1_start_frame, v1_end_frame,
+            stage2_width, stage2_height, device, dtype
+        )
+
+        # Resample to match preserve1_frames if needed
+        if video1_full_res_frames.shape[0] != preserve1_frames:
+            indices = torch.linspace(0, video1_full_res_frames.shape[0] - 1, preserve1_frames).long()
+            video1_full_res_frames = video1_full_res_frames[indices]
+
+        print(f">>> Loaded {video1_full_res_frames.shape[0]} frames from video1")
+
+        # Convert to encoder format [1, C, F, H, W] and normalize to [-1, 1]
+        video1_full_input = video1_full_res_frames.permute(3, 0, 1, 2).unsqueeze(0) * 2.0 - 1.0
+        del video1_full_res_frames
+
+        # Encode video1 in chunks
+        encoder_dtype = next(video_encoder.parameters()).dtype
+        chunk_pixel_frames = 65
+        video1_latent_chunks = []
+        chunk_idx_v1 = 0
+
+        with torch.no_grad():
+            for start_f in range(0, video1_full_input.shape[2], chunk_pixel_frames - 1):
+                end_f = min(start_f + chunk_pixel_frames, video1_full_input.shape[2])
+                actual_frames = end_f - start_f
+
+                if actual_frames < 9:
+                    pad_frames = 9 - actual_frames
+                    chunk = video1_full_input[:, :, start_f:end_f, :, :]
+                    last_frame = chunk[:, :, -1:, :, :].expand(-1, -1, pad_frames, -1, -1)
+                    chunk = torch.cat([chunk, last_frame], dim=2)
+                else:
+                    chunk = video1_full_input[:, :, start_f:end_f, :, :]
+
+                chunk_latent = video_encoder(chunk.to(device=device, dtype=encoder_dtype))
+                chunk_latent = chunk_latent.to(dtype=dtype)
+
+                if chunk_idx_v1 > 0 and len(video1_latent_chunks) > 0:
+                    chunk_latent = chunk_latent[:, :, 1:, :, :]
+
+                video1_latent_chunks.append(chunk_latent)
+                chunk_idx_v1 += 1
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        video1_full_latent = torch.cat(video1_latent_chunks, dim=2)
+        del video1_full_input, video1_latent_chunks
+        print(f">>> Video1 full-res latent: {video1_full_latent.shape}")
+
+        # Re-encode video2 preserved frames (gen_end_latent to end)
+        print(f">>> Loading video2 preserved frames at {stage2_width}x{stage2_height}...")
+        video2_full_res_frames, _ = load_video_segment(
+            video2_path, v2_start_frame, v2_end_frame,
+            stage2_width, stage2_height, device, dtype
+        )
+
+        # Resample to match preserve2_frames if needed
+        if video2_full_res_frames.shape[0] != preserve2_frames:
+            indices = torch.linspace(0, video2_full_res_frames.shape[0] - 1, preserve2_frames).long()
+            video2_full_res_frames = video2_full_res_frames[indices]
+
+        print(f">>> Loaded {video2_full_res_frames.shape[0]} frames from video2")
+
+        # Convert to encoder format [1, C, F, H, W] and normalize to [-1, 1]
+        video2_full_input = video2_full_res_frames.permute(3, 0, 1, 2).unsqueeze(0) * 2.0 - 1.0
+        del video2_full_res_frames
+
+        # Encode video2 in chunks
+        video2_latent_chunks = []
+        chunk_idx_v2 = 0
+
+        with torch.no_grad():
+            for start_f in range(0, video2_full_input.shape[2], chunk_pixel_frames - 1):
+                end_f = min(start_f + chunk_pixel_frames, video2_full_input.shape[2])
+                actual_frames = end_f - start_f
+
+                if actual_frames < 9:
+                    pad_frames = 9 - actual_frames
+                    chunk = video2_full_input[:, :, start_f:end_f, :, :]
+                    last_frame = chunk[:, :, -1:, :, :].expand(-1, -1, pad_frames, -1, -1)
+                    chunk = torch.cat([chunk, last_frame], dim=2)
+                else:
+                    chunk = video2_full_input[:, :, start_f:end_f, :, :]
+
+                chunk_latent = video_encoder(chunk.to(device=device, dtype=encoder_dtype))
+                chunk_latent = chunk_latent.to(dtype=dtype)
+
+                if chunk_idx_v2 > 0 and len(video2_latent_chunks) > 0:
+                    chunk_latent = chunk_latent[:, :, 1:, :, :]
+
+                video2_latent_chunks.append(chunk_latent)
+                chunk_idx_v2 += 1
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        video2_full_latent = torch.cat(video2_latent_chunks, dim=2)
+        del video2_full_input, video2_latent_chunks
+        print(f">>> Video2 full-res latent: {video2_full_latent.shape}")
+
+        # Replace upsampler output with original full-res encodings for preserved regions
+        # This ensures preserved regions have accurate content, not neural upsampler artifacts
+        print(f">>> Replacing preserved regions with full-res encodings...")
+        print(f">>>   Preserve1: frames 0-{gen_start_latent} (video1_full_latent has {video1_full_latent.shape[2]} frames)")
+        print(f">>>   Preserve2: frames {gen_end_latent}-{upscaled_video_latent.shape[2]} (video2_full_latent has {video2_full_latent.shape[2]} frames)")
+
+        # Copy video1 preserved frames (handle potential size mismatch)
+        copy_len1 = min(gen_start_latent, video1_full_latent.shape[2])
+        upscaled_video_latent[:, :, :copy_len1, :, :] = video1_full_latent[:, :, :copy_len1, :, :]
+
+        # Copy video2 preserved frames
+        preserve2_len = upscaled_video_latent.shape[2] - gen_end_latent
+        copy_len2 = min(preserve2_len, video2_full_latent.shape[2])
+        upscaled_video_latent[:, :, gen_end_latent:gen_end_latent + copy_len2, :, :] = video2_full_latent[:, :, :copy_len2, :, :]
+
+        del video1_full_latent, video2_full_latent
+        cleanup_memory()
+        print(">>> Preserved regions replaced with full-res encodings")
+
+        # Stage 2 transformer with refinement
+        print(">>> Loading stage 2 transformer...")
+        stage2_block_swap_manager = None
+
+        if generator.enable_refiner_block_swap:
+            from ltx_core.loader.sft_loader import SafetensorsStateDictLoader
+
+            stage_2_ledger_no_lora = ModelLedger(
+                dtype=generator.dtype,
+                device=torch.device("cpu"),
+                checkpoint_path=generator.stage_2_model_ledger.checkpoint_path if hasattr(generator.stage_2_model_ledger, 'checkpoint_path') else generator.stage_1_model_ledger.checkpoint_path,
+                gemma_root_path=generator.stage_2_model_ledger.gemma_root_path if hasattr(generator.stage_2_model_ledger, 'gemma_root_path') else generator.stage_1_model_ledger.gemma_root_path,
+                spatial_upsampler_path=generator.stage_2_model_ledger.spatial_upsampler_path if hasattr(generator.stage_2_model_ledger, 'spatial_upsampler_path') else generator.stage_1_model_ledger.spatial_upsampler_path,
+                vae_path=generator.stage_2_model_ledger.vae_path if hasattr(generator.stage_2_model_ledger, 'vae_path') else generator.stage_1_model_ledger.vae_path,
+                loras=(),
+                fp8transformer=generator.stage_2_model_ledger.fp8transformer if hasattr(generator.stage_2_model_ledger, 'fp8transformer') else generator.stage_1_model_ledger.fp8transformer,
+            )
+            stage2_transformer = stage_2_ledger_no_lora.transformer()
+
+            if hasattr(generator.stage_2_model_ledger, 'loras') and generator.stage_2_model_ledger.loras:
+                loras = generator.stage_2_model_ledger.loras
+                print(f">>> Applying {len(loras)} LoRA(s) for stage 2...")
+                lora_loader = SafetensorsStateDictLoader()
+                lora_state_dicts = []
+                lora_strengths = []
+                for lora in loras:
+                    lora_sd = lora_loader.load(lora.path, sd_ops=lora.sd_ops, device=torch.device("cpu"))
+                    lora_state_dicts.append(lora_sd)
+                    lora_strengths.append(lora.strength)
+
+                apply_loras_chunked_gpu(
+                    model=stage2_transformer,
+                    lora_state_dicts=lora_state_dicts,
+                    lora_strengths=lora_strengths,
+                    gpu_device=device,
+                    dtype=dtype,
+                )
+                del lora_state_dicts
+                cleanup_memory()
+
+            # Move non-block components to GPU
+            stage2_transformer.velocity_model.patchify_proj.to(device)
+            stage2_transformer.velocity_model.adaln_single.to(device)
+            stage2_transformer.velocity_model.caption_projection.to(device)
+            stage2_transformer.velocity_model.norm_out.to(device)
+            stage2_transformer.velocity_model.proj_out.to(device)
+            stage2_transformer.velocity_model.scale_shift_table = torch.nn.Parameter(
+                stage2_transformer.velocity_model.scale_shift_table.to(device)
+            )
+            if hasattr(stage2_transformer.velocity_model, "audio_patchify_proj"):
+                stage2_transformer.velocity_model.audio_patchify_proj.to(device)
+            if hasattr(stage2_transformer.velocity_model, "audio_adaln_single"):
+                stage2_transformer.velocity_model.audio_adaln_single.to(device)
+            if hasattr(stage2_transformer.velocity_model, "audio_caption_projection"):
+                stage2_transformer.velocity_model.audio_caption_projection.to(device)
+            if hasattr(stage2_transformer.velocity_model, "audio_norm_out"):
+                stage2_transformer.velocity_model.audio_norm_out.to(device)
+            if hasattr(stage2_transformer.velocity_model, "audio_proj_out"):
+                stage2_transformer.velocity_model.audio_proj_out.to(device)
+            if hasattr(stage2_transformer.velocity_model, "audio_scale_shift_table"):
+                stage2_transformer.velocity_model.audio_scale_shift_table = torch.nn.Parameter(
+                    stage2_transformer.velocity_model.audio_scale_shift_table.to(device)
+                )
+            if hasattr(stage2_transformer.velocity_model, "av_ca_video_scale_shift_adaln_single"):
+                stage2_transformer.velocity_model.av_ca_video_scale_shift_adaln_single.to(device)
+            if hasattr(stage2_transformer.velocity_model, "av_ca_audio_scale_shift_adaln_single"):
+                stage2_transformer.velocity_model.av_ca_audio_scale_shift_adaln_single.to(device)
+            if hasattr(stage2_transformer.velocity_model, "av_ca_a2v_gate_adaln_single"):
+                stage2_transformer.velocity_model.av_ca_a2v_gate_adaln_single.to(device)
+            if hasattr(stage2_transformer.velocity_model, "av_ca_v2a_gate_adaln_single"):
+                stage2_transformer.velocity_model.av_ca_v2a_gate_adaln_single.to(device)
+
+            # Use activation offload for extreme memory savings
+            if getattr(generator, 'enable_activation_offload', False):
+                stage2_block_swap_manager = enable_block_swap_with_activation_offload(
+                    stage2_transformer,
+                    blocks_in_memory=generator.refiner_blocks_in_memory,
+                    device=device,
+                    verbose=True,
+                    temporal_chunk_size=getattr(generator, 'temporal_chunk_size', 0),
+                )
+            else:
+                stage2_block_swap_manager = enable_block_swap(
+                    stage2_transformer,
+                    blocks_in_memory=generator.refiner_blocks_in_memory,
+                    device=device,
+                )
+        else:
+            stage2_transformer = generator.stage_2_model_ledger.transformer()
+
+        # Stage 2 sigmas (pre-tuned for distilled model, same as AV extension)
+        # Using fixed values avoids sigma=0 issues from LTX2Scheduler
+        STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
+        num_stage2_sigmas = min(args.stage2_steps + 1, len(STAGE_2_DISTILLED_SIGMA_VALUES))
+        stage2_sigmas = torch.tensor(
+            STAGE_2_DISTILLED_SIGMA_VALUES[:num_stage2_sigmas],
+            dtype=torch.float32, device=device
+        )
+
+        # Stage 2 components
+        stage2_components = generator.pipeline_components
+
+        # Stage 2 output shape (2x spatial resolution)
+        stage2_output_shape = VideoPixelShape(
+            batch=1,
+            frames=total_transition_frames,
+            height=stage1_height * 2,
+            width=stage1_width * 2,
+            fps=output_fps,
+        )
+
+        stage2_video_latent_shape = VideoLatentShape.from_pixel_shape(
+            shape=stage2_output_shape,
+            latent_channels=stage2_components.video_latent_channels,
+            scale_factors=stage2_components.video_scale_factors,
+        )
+        stage2_video_tools = VideoLatentTools(
+            patchifier=stage2_components.video_patchifier,
+            target_shape=stage2_video_latent_shape,
+            fps=output_fps,
+        )
+
+        # Stage 2 denoising function (NO CFG, just positive context)
+        stage2_denoise_fn = simple_denoising_func(
+            video_context=v_context_p,
+            audio_context=a_context_p,
+            transformer=stage2_transformer,
+        )
+
+        # Create stage 2 video state with preservation mask
+        # Unlike the original comment, we DO need a preservation mask for Stage 2 to prevent
+        # re-denoising the preserved regions which would corrupt them
+        stage2_video_state = stage2_video_tools.create_initial_state(device, dtype, upscaled_video_latent)
+
+        # Create Stage 2 preservation mask (mask=0 for preserved, mask=1 for generate)
+        # Upscale Stage 1 video_mask to Stage 2 resolution (2x spatial)
+        F_latent = upscaled_video_latent.shape[2]
+        H_latent_s2 = upscaled_video_latent.shape[3]
+        W_latent_s2 = upscaled_video_latent.shape[4]
+        stage2_video_mask = torch.zeros((1, 1, F_latent, H_latent_s2, W_latent_s2), device=device, dtype=torch.float32)
+        stage2_video_mask[:, :, gen_start_latent:gen_end_latent, :, :] = 1.0
+
+        # Apply slope at boundaries (same as Stage 1 mask)
+        if slope_len > 0:
+            for i in range(min(slope_len, gen_end_latent - gen_start_latent)):
+                slope_value = (i + 1) / (slope_len + 1)
+                stage2_video_mask[:, :, gen_start_latent + i, :, :] = slope_value
+            for i in range(min(slope_len, gen_end_latent - gen_start_latent)):
+                slope_value = (i + 1) / (slope_len + 1)
+                stage2_video_mask[:, :, gen_end_latent - 1 - i, :, :] = slope_value
+
+        # Patchify and apply preservation mask
+        patchified_stage2_video_mask = stage2_video_tools.patchifier.patchify(stage2_video_mask)
+        stage2_video_state = dataclass_replace(
+            stage2_video_state,
+            denoise_mask=patchified_stage2_video_mask.to(dtype=torch.float32),
+        )
+        print(f">>> Stage 2 preservation mask created: generate region {gen_start_latent}-{gen_end_latent}")
+
+        # Apply noiser with correct noise scale (matches AV extension)
+        stage2_noiser = GaussianNoiser(generator=torch.Generator(device=device).manual_seed(args.seed + 1))
+        stage2_video_state = stage2_noiser(stage2_video_state, noise_scale=stage2_sigmas[0].item())
+
+        # Stage 2 audio state (with proper audio if available)
+        if denoised_audio_latent is not None:
+            stage2_audio_latent_shape = AudioLatentShape.from_torch_shape(denoised_audio_latent.shape)
+            stage2_audio_tools = AudioLatentTools(
+                patchifier=stage2_components.audio_patchifier,
+                target_shape=stage2_audio_latent_shape,
+            )
+            stage2_audio_state = stage2_audio_tools.create_initial_state(device, dtype, denoised_audio_latent)
+            stage2_audio_state = dataclass_replace(
+                stage2_audio_state, denoise_mask=torch.zeros_like(stage2_audio_state.denoise_mask)
+            )
+            stage2_audio_state = stage2_noiser(stage2_audio_state, noise_scale=stage2_sigmas[0].item())
+        else:
+            stage2_audio_latent_shape = AudioLatentShape.from_video_pixel_shape(stage2_output_shape)
+            stage2_audio_tools = AudioLatentTools(
+                patchifier=stage2_components.audio_patchifier,
+                target_shape=stage2_audio_latent_shape,
+            )
+            stage2_audio_state = stage2_audio_tools.create_initial_state(device, dtype, None)
+            stage2_audio_state = stage2_noiser(stage2_audio_state, noise_scale=1.0)
+
+        # Run stage 2 denoising
+        final_stage2_video_state, final_stage2_audio = euler_denoising_loop(
+            sigmas=stage2_sigmas,
+            video_state=stage2_video_state,
+            audio_state=stage2_audio_state,
+            stepper=stepper,
+            denoise_fn=stage2_denoise_fn,
+            latent_norm_fn=latent_norm_fn,
+        )
+
+        final_stage2_video_state = stage2_video_tools.clear_conditioning(final_stage2_video_state)
+        final_stage2_video_state = stage2_video_tools.unpatchify(final_stage2_video_state)
+
+        denoised_video_latent = final_stage2_video_state.latent
+        print(f">>> Stage 2 denoised latent: {denoised_video_latent.shape}")
+
+        # Extract Stage 2 audio latent
+        if denoised_audio_latent is not None:
+            final_stage2_audio = stage2_audio_tools.clear_conditioning(final_stage2_audio)
+            final_stage2_audio = stage2_audio_tools.unpatchify(final_stage2_audio)
+            denoised_audio_latent = final_stage2_audio.latent
+            print(f">>> Stage 2 audio latent: {denoised_audio_latent.shape}")
+
+        # DEBUG: Check Stage 2 latent statistics for generate region
+        stage2_gen_latent = denoised_video_latent[:, :, gen_start_latent:gen_end_latent, :, :]
+        stage2_preserve1_latent = denoised_video_latent[:, :, :gen_start_latent, :, :]
+        stage2_preserve2_latent = denoised_video_latent[:, :, gen_end_latent:, :, :]
+        print(f">>> DEBUG Stage2 - Generate latent: min={stage2_gen_latent.min().item():.4f}, max={stage2_gen_latent.max().item():.4f}, mean={stage2_gen_latent.mean().item():.4f}")
+        print(f">>> DEBUG Stage2 - Preserve1 latent: min={stage2_preserve1_latent.min().item():.4f}, max={stage2_preserve1_latent.max().item():.4f}, mean={stage2_preserve1_latent.mean().item():.4f}")
+        print(f">>> DEBUG Stage2 - Preserve2 latent: min={stage2_preserve2_latent.min().item():.4f}, max={stage2_preserve2_latent.max().item():.4f}, mean={stage2_preserve2_latent.mean().item():.4f}")
+
+        # Cleanup stage 2
+        if stage2_block_swap_manager is not None:
+            offload_all_blocks(stage2_transformer)
+            stage2_transformer.velocity_model._block_swap_offloader = None
+            stage2_transformer.velocity_model._blocks_ref = None
+        del stage2_transformer
+        cleanup_memory()
+
+        del video_encoder
+        cleanup_memory()
+        phase_barrier("v2v_join_stage2")
+
+    # =========================================================================
+    # Step 10: Decode transition video
+    # =========================================================================
+    print(">>> Decoding transition video...")
+
+    # Clear model state dict caches to free CPU RAM before decoding
+    # The DIT and text encoder are no longer needed
+    print(">>> Clearing model caches to free RAM...")
+    generator.stage_1_model_ledger.clear_state_dict_cache()
+    if not generator.one_stage:
+        generator.stage_2_model_ledger.clear_state_dict_cache()
+    cleanup_memory()
+
+    video_decoder = generator.stage_1_model_ledger.video_decoder() if generator.one_stage else generator.stage_2_model_ledger.video_decoder()
+    tiling_config = TilingConfig.default()
+
+    decoded_video_chunks = []
+    for chunk in vae_decode_video(
+        denoised_video_latent,
+        video_decoder,
+        tiling_config,
+    ):
+        decoded_video_chunks.append(chunk.cpu())
+        del chunk
+    transition_video = torch.cat(decoded_video_chunks, dim=0)  # [F, H, W, C]
+
+    del video_decoder, decoded_video_chunks, denoised_video_latent
+    cleanup_memory()
+
+    print(f">>> Transition video decoded: {transition_video.shape}")
+
+    # =========================================================================
+    # Step 10.5: Decode audio
+    # =========================================================================
+    decoded_transition_audio = None
+    if denoised_audio_latent is not None:
+        print(">>> Decoding audio...")
+        audio_decoder = generator.stage_1_model_ledger.audio_decoder()
+        vocoder = generator.stage_1_model_ledger.vocoder()
+        decoded_transition_audio = vae_decode_audio(denoised_audio_latent, audio_decoder, vocoder)
+        print(f">>> Decoded transition audio: {decoded_transition_audio.shape}")
+        del audio_decoder, vocoder
+        cleanup_memory()
+
+    # =========================================================================
+    # Step 11: Load prefix and suffix, concatenate final video
+    # =========================================================================
+    print(">>> Loading video prefix and suffix...")
+
+    # Determine final output resolution
+    final_width = args.width
+    final_height = args.height
+
+    # Load video1 prefix (all frames before preserved section)
+    if v1_prefix_end > 0:
+        v1_prefix, _ = load_video_segment(
+            video1_path, 0, v1_prefix_end,
+            final_width, final_height, torch.device("cpu"), torch.float32
+        )
+        # Convert from 0-1 to 0-255 uint8
+        v1_prefix = (v1_prefix * 255).to(torch.uint8)
+        print(f">>> Video1 prefix: {v1_prefix.shape}")
+    else:
+        v1_prefix = None
+
+    # Load video2 suffix (all frames after preserved section)
+    if v2_suffix_start < total_frames2:
+        v2_suffix, _ = load_video_segment(
+            video2_path, v2_suffix_start, total_frames2,
+            final_width, final_height, torch.device("cpu"), torch.float32
+        )
+        # Convert from 0-1 to 0-255 uint8
+        v2_suffix = (v2_suffix * 255).to(torch.uint8)
+        print(f">>> Video2 suffix: {v2_suffix.shape}")
+    else:
+        v2_suffix = None
+
+    # Resize transition video to final resolution if needed
+    if transition_video.shape[1] != final_height or transition_video.shape[2] != final_width:
+        print(f">>> Resizing transition from {transition_video.shape[2]}x{transition_video.shape[1]} to {final_width}x{final_height}")
+        transition_resized = []
+        for i in range(transition_video.shape[0]):
+            frame = transition_video[i].numpy()
+            if frame.dtype == np.float32 or frame.dtype == np.float64:
+                frame = (frame * 255).astype(np.uint8)
+            frame_resized = cv2.resize(frame, (final_width, final_height), interpolation=cv2.INTER_LANCZOS4)
+            transition_resized.append(torch.from_numpy(frame_resized))
+        transition_video = torch.stack(transition_resized, dim=0)
+    else:
+        # Convert to uint8 if needed
+        if transition_video.dtype != torch.uint8:
+            transition_video = (transition_video * 255).to(torch.uint8)
+
+    # Concatenate: prefix + transition + suffix
+    parts = []
+    if v1_prefix is not None:
+        parts.append(v1_prefix)
+    parts.append(transition_video.cpu())
+    if v2_suffix is not None:
+        parts.append(v2_suffix)
+
+    final_video = torch.cat(parts, dim=0)
+    print(f">>> Final joined video: {final_video.shape}")
+
+    # Free intermediate tensors immediately after concatenation
+    del parts, v1_prefix, v2_suffix, transition_video
+    cleanup_memory()
+
+    # =========================================================================
+    # Step 12: Combine final audio
+    # =========================================================================
+    # Same logic for both use_input_audio and video audio modes:
+    # prefix (from video1) + decoded_transition + suffix (from video2)
+    final_audio = None
+    if has_audio:
+        print(">>> Combining final audio...")
+        audio_parts = []
+
+        # Prefix audio from video1
+        if v1_prefix_end > 0 and audio1_waveform is not None:
+            prefix_end = int(round(v1_prefix_end / fps1 * audio_sample_rate))
+            prefix_audio = audio1_waveform[..., :prefix_end]
+            if prefix_audio.dim() == 2:
+                prefix_audio = prefix_audio.unsqueeze(0)
+            audio_parts.append(prefix_audio.cpu())
+            print(f">>> Prefix audio from video1: {prefix_audio.shape}")
+
+        # Transition audio (decoded from latent)
+        if decoded_transition_audio is not None:
+            transition_audio_part = decoded_transition_audio.cpu()
+            if transition_audio_part.dim() == 2:
+                transition_audio_part = transition_audio_part.unsqueeze(0)
+
+            # Blend with original input audio if available
+            if use_input_audio and original_combined_audio is not None:
+                orig_audio = original_combined_audio.cpu()
+                if orig_audio.dim() == 2:
+                    orig_audio = orig_audio.unsqueeze(0)
+
+                # Match lengths (VAE may change length slightly)
+                target_len = transition_audio_part.shape[-1]
+                if orig_audio.shape[-1] != target_len:
+                    orig_audio = torch.nn.functional.interpolate(
+                        orig_audio.float(), size=target_len, mode='linear'
+                    ).to(orig_audio.dtype)
+
+                # Blend: strength=1 means 100% original, strength=0 means 100% generated
+                transition_audio_part = audio_strength * orig_audio + (1.0 - audio_strength) * transition_audio_part
+                print(f">>> Blended audio (strength={audio_strength}): {transition_audio_part.shape}")
+
+            audio_parts.append(transition_audio_part)
+            print(f">>> Transition audio: {transition_audio_part.shape}")
+
+        # Suffix audio from video2
+        if v2_suffix_start < total_frames2 and audio2_waveform is not None:
+            suffix_start = int(round(v2_suffix_start / fps2 * audio_sample_rate))
+            suffix_audio = audio2_waveform[..., suffix_start:]
+            if suffix_audio.dim() == 2:
+                suffix_audio = suffix_audio.unsqueeze(0)
+            audio_parts.append(suffix_audio.cpu())
+            print(f">>> Suffix audio from video2: {suffix_audio.shape}")
+
+        if audio_parts:
+            final_audio = torch.cat(audio_parts, dim=-1)
+            if final_audio.dim() == 3 and final_audio.shape[0] == 1:
+                final_audio = final_audio.squeeze(0)
+            print(f">>> Final audio: {final_audio.shape}")
+
+    # Return uint8 tensor - encode_video expects uint8 [0-255]
+    return final_video, final_audio
+
+
+# =============================================================================
 # Preview Generation
 # =============================================================================
 
@@ -5988,6 +7845,18 @@ def main():
     """Main entry point for LTX-2 video generation."""
     args = parse_args()
 
+    # V2A mode validation
+    if args.v2a_mode:
+        if not args.input_video:
+            print("Error: --v2a-mode requires --input-video")
+            sys.exit(1)
+        if args.disable_audio:
+            print(">>> Warning: --disable-audio is ignored in V2A mode")
+            args.disable_audio = False
+        if args.refine_only:
+            print("Error: --v2a-mode cannot be combined with --refine-only")
+            sys.exit(1)
+
     # Configure logging
     log_level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(level=log_level, format="%(message)s")
@@ -6044,6 +7913,10 @@ def main():
         if args.extend_video:
             print(f"  Input Video: {args.extend_video}")
             print(f"  Prepend Original: {args.prepend_original}")
+    # V2A mode info
+    if args.v2a_mode:
+        print(f"V2A Mode: Video-to-Audio (freeze video, generate audio)")
+        print(f"  Input Video: {args.input_video}")
     # AV Extension mode info
     if args.av_extend_from:
         print(f"AV Extension Mode: Time-Based Audio-Video Continuation")
@@ -6168,6 +8041,37 @@ def main():
             end_time=args.av_extend_end_time,
             extend_steps=args.av_extend_steps,
             terminal=args.av_extend_terminal,
+            slope_len=args.av_slope_len,
+            skip_stage2=args.av_no_stage2,
+            latent_norm_fn=latent_norm_fn,
+        )
+
+        # Convert to iterator for encode_video
+        def tensor_to_iterator(tensor):
+            yield tensor
+
+        video = tensor_to_iterator(video_tensor)
+        total_frames = video_tensor.shape[0]
+        video_chunks_number = get_video_chunks_number(total_frames, tiling_config)
+
+    elif args.v2v_join_video1 and args.v2v_join_video2:
+        # V2V Join mode: join two videos with generated transition
+        print("=" * 60)
+        print(">>> Using V2V Join mode (video-to-video transition)")
+        print("=" * 60)
+
+        video_tensor, audio = generate_v2v_join(
+            generator=generator,
+            args=args,
+            video1_path=args.v2v_join_video1,
+            video2_path=args.v2v_join_video2,
+            frames_check1=args.v2v_join_frames_check1,
+            frames_check2=args.v2v_join_frames_check2,
+            preserve1_sec=args.v2v_join_preserve1,
+            preserve2_sec=args.v2v_join_preserve2,
+            transition_sec=args.v2v_join_transition_time,
+            extend_steps=args.v2v_join_steps,
+            terminal=args.v2v_join_terminal,
             slope_len=args.av_slope_len,
             skip_stage2=args.av_no_stage2,
             latent_norm_fn=latent_norm_fn,
@@ -6306,20 +8210,55 @@ def main():
             depth_stage2=args.depth_stage2,
             # Latent normalization (fixes overbaking/audio clipping)
             latent_norm_fn=latent_norm_fn,
+            # V2A mode (freeze video, generate audio)
+            v2a_mode=args.v2a_mode,
+            v2a_strength=args.v2a_strength,
         )
 
     # Encode and save video
     print(f">>> Encoding video to {args.output_path}...")
     encode_start = time.time()
 
-    encode_video(
-        video=video,
-        fps=args.frame_rate,
-        audio=audio,
-        audio_sample_rate=AUDIO_SAMPLE_RATE if audio is not None else None,
-        output_path=args.output_path,
-        video_chunks_number=video_chunks_number,
-    )
+    if args.v2a_mode and args.input_video:
+        import subprocess
+        import tempfile
+        import os
+        import numpy as np
+        from scipy.io import wavfile
+
+        print(">>> V2A Mode: Combining original video with generated audio...")
+
+        temp_audio = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+        temp_audio_path = temp_audio.name
+        temp_audio.close()
+
+        audio_np = audio.cpu().numpy().T
+        audio_np = np.clip(audio_np, -1.0, 1.0)
+        audio_int16 = (audio_np * 32767).astype(np.int16)
+        wavfile.write(temp_audio_path, AUDIO_SAMPLE_RATE, audio_int16)
+
+        subprocess.run([
+            'ffmpeg', '-y',
+            '-i', args.input_video,
+            '-i', temp_audio_path,
+            '-c:v', 'copy',
+            '-c:a', 'aac',
+            '-map', '0:v:0',
+            '-map', '1:a:0',
+            '-shortest',
+            args.output_path
+        ], check=True)
+
+        os.unlink(temp_audio_path)
+    else:
+        encode_video(
+            video=video,
+            fps=args.frame_rate,
+            audio=audio,
+            audio_sample_rate=AUDIO_SAMPLE_RATE if audio is not None else None,
+            output_path=args.output_path,
+            video_chunks_number=video_chunks_number,
+        )
 
     print(f">>> Video saved in {time.time() - encode_start:.1f}s")
 
@@ -6391,6 +8330,9 @@ def main():
         "estimate_depth": args.estimate_depth,
         "depth_strength": args.depth_strength if (args.depth_video or args.depth_image or args.estimate_depth) else None,
         "depth_stage2": args.depth_stage2 if (args.depth_video or args.depth_image or args.estimate_depth) else None,
+        # V2A Mode metadata
+        "v2a_mode": args.v2a_mode,
+        "v2a_strength": args.v2a_strength if args.v2a_mode else None,
         # Video continuation metadata
         "freeze_frames": args.freeze_frames if args.freeze_frames > 0 else None,
         "freeze_transition": args.freeze_transition if args.freeze_frames > 0 else None,
