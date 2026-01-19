@@ -2723,7 +2723,7 @@ class LTXVideoGeneratorWithOffloading:
         audio_conditionings = []
 
         if self.refine_only and input_video:
-            print(">>> Refine-only mode: Loading input video and creating keyframe conditionings...")
+            print(">>> Refine-only mode: Loading and encoding input video...")
             refine_start = time.time()
 
             video_encoder = self.stage_1_model_ledger.video_encoder()
@@ -2738,50 +2738,18 @@ class LTXVideoGeneratorWithOffloading:
                 device=self.device,
             )
 
-            # Use keyframe conditioning approach (like Wan2GP) instead of encoding whole video
-            # This avoids chunked encoding glitches from the causal VAE encoder
-            # Extract every Nth frame (controlled by refine_latent_stride) with strength=1.0
-            latent_stride = refine_latent_stride
             actual_frames = video_tensor.shape[2]
+            print(f">>> Encoding {actual_frames} frames to latent space...")
 
-            # Get latent indices already covered by --image args (don't duplicate conditioning)
-            image_latent_indices = set()
-            if images:
-                for _, frame_idx, _ in images:
-                    image_latent_indices.add(frame_idx // latent_stride)
+            # Encode full video to use as initial latent for denoising
+            # This allows refine_strength to actually control how much of the input is preserved
+            upscaled_video_latent = encode_video_chunked(
+                video_tensor.to(device=self.device, dtype=dtype),
+                video_encoder,
+                chunk_frames=v2v_chunk_frames,
+            )
 
-            print(f">>> Creating keyframe conditionings for {actual_frames} frames (every {latent_stride} frames)...")
-            if image_latent_indices:
-                print(f">>> Skipping latent indices {sorted(image_latent_indices)} (covered by --image)")
-
-            from ltx_core.conditioning import VideoConditionByLatentIndex
-            for frame_idx in range(0, actual_frames, latent_stride):
-                latent_idx = frame_idx // latent_stride
-
-                # Skip frames already covered by --image conditionings
-                if latent_idx in image_latent_indices:
-                    continue
-
-                # Extract single frame: video_tensor is [1, C, F, H, W]
-                frame = video_tensor[:, :, frame_idx:frame_idx+1, :, :]  # [1, C, 1, H, W]
-
-                # Encode frame to latent
-                with torch.no_grad():
-                    encoded_frame = video_encoder(frame)
-
-                # Create conditioning with strength=1.0 to preserve frame exactly
-                refine_keyframe_conditionings.append(
-                    VideoConditionByLatentIndex(
-                        latent=encoded_frame,
-                        strength=1.0,
-                        latent_idx=latent_idx,
-                    )
-                )
-
-            print(f">>> Created {len(refine_keyframe_conditionings)} keyframe conditionings")
-
-            # No initial video latent - using keyframe conditionings instead
-            upscaled_video_latent = None
+            print(f">>> Video encoded to latent shape {upscaled_video_latent.shape}")
 
             # Extract and encode audio from input video (like stage 1 would)
             audio_latent = None
@@ -2969,7 +2937,14 @@ class LTXVideoGeneratorWithOffloading:
             sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(
                 dtype=torch.float32, device=self.device
             )
-            print(f">>> Using {num_inference_steps} inference steps")
+
+            # Scale sigmas for V2V mode to preserve input content based on refine_strength
+            # Lower strength = less noise = more preservation of input video
+            if v2v_initial_latent is not None:
+                sigmas = sigmas * refine_strength
+                print(f">>> V2V: Using {num_inference_steps} steps with strength {refine_strength} (sigmas scaled)")
+            else:
+                print(f">>> Using {num_inference_steps} inference steps")
 
             # Move text embeddings to GPU for stage 1 denoising
             v_context_p = v_context_p.to(self.device)
@@ -3086,9 +3061,10 @@ class LTXVideoGeneratorWithOffloading:
                     stage_1_conditionings = stage_1_conditionings + anchor_conditionings
                     print(f">>> Added {len(anchor_conditionings)} anchor points at frames {[t[1] for t in anchor_tuples]}")
 
-            # V2V: Add video conditioning from input video (like ic_lora pipeline)
-            # Uses tiled encoding to handle long videos without OOM
+            # V2V: Encode input video as initial latent for denoising
+            # This allows refine_strength to control how much of the input is preserved
             v2v_audio_latent = None
+            v2v_initial_latent = None
             v2v_sequential_latent = None
             v2v_sequential_audio_state = None
             if input_video and not self.refine_only and not v2a_mode:
@@ -3235,47 +3211,20 @@ class LTXVideoGeneratorWithOffloading:
                     print(f">>> V2V Sequential: {chunk_idx} chunks processed in {time.time() - v2v_start:.1f}s")
 
                 else:
-                    tile_size = 17
-                    tile_overlap = 8
-                    tile_stride = tile_size - tile_overlap
+                    # Two-stage V2V: Encode full video as initial latent for stage 1
+                    # This allows refine_strength to actually control preservation of input
+                    print(f">>> V2V: Encoding {actual_frames} frames to latent space...")
 
-                    num_chunks = 0
-                    frame_idx = 0
-                    while frame_idx < actual_frames:
-                        chunk_end = min(frame_idx + tile_size, actual_frames)
-                        chunk_frames = chunk_end - frame_idx
-
-                        valid_frames = ((chunk_frames - 1) // 8) * 8 + 1
-                        if valid_frames < 9:
-                            break
-                        chunk_end = frame_idx + valid_frames
-
-                        chunk = video_tensor[:, :, frame_idx:chunk_end, :, :].to(device=self.device, dtype=dtype)
-                        with torch.no_grad():
-                            encoded_chunk = video_encoder(chunk)
-                        del chunk
-                        torch.cuda.empty_cache()
-
-                        encoded_chunk_cpu = encoded_chunk.cpu()
-                        del encoded_chunk
-                        torch.cuda.empty_cache()
-
-                        stage_1_conditionings.append(
-                            VideoConditionByKeyframeIndex(
-                                keyframes=encoded_chunk_cpu,
-                                frame_idx=frame_idx,
-                                strength=refine_strength,
-                            )
-                        )
-                        num_chunks += 1
-
-                        frame_idx += tile_stride
-                        if frame_idx >= actual_frames - 8:
-                            break
+                    v2v_initial_latent = encode_video_chunked(
+                        video_tensor.to(device=self.device, dtype=dtype),
+                        video_encoder,
+                        chunk_frames=v2v_chunk_frames,
+                    )
 
                     del video_tensor
+                    torch.cuda.empty_cache()
 
-                    print(f">>> V2V: Added {num_chunks} video conditioning chunks (strength={refine_strength}) in {time.time() - v2v_start:.1f}s")
+                    print(f">>> V2V: Video encoded to latent shape {v2v_initial_latent.shape} in {time.time() - v2v_start:.1f}s")
 
                 # Extract and encode audio from input video to preserve it
                 # Skip if V2A mode is active (V2A will handle audio extraction)
@@ -3570,6 +3519,7 @@ class LTXVideoGeneratorWithOffloading:
                     components=self.pipeline_components,
                     dtype=dtype,
                     device=self.device,
+                    initial_video_latent=v2v_initial_latent,
                     initial_audio_latent=v2a_preserved_audio_latent,
                     audio_conditionings=audio_conditionings if audio_conditionings else None,
                     audio_noise_scale=audio_noise_scale,
