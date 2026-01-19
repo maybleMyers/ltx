@@ -2813,6 +2813,10 @@ class LTXVideoGeneratorWithOffloading:
         # Phase 2: Stage 1 - Low Resolution Generation (skip for refine-only)
         # =====================================================================
         skip_stage_1 = self.refine_only and input_video
+
+        # Initialize V2V initial latent (will be set if input_video is provided for non-refine-only)
+        v2v_initial_latent = None
+
         if not skip_stage_1:
             print(">>> Stage 1: Loading video encoder and transformer...")
             stage1_start = time.time()
@@ -2938,13 +2942,7 @@ class LTXVideoGeneratorWithOffloading:
                 dtype=torch.float32, device=self.device
             )
 
-            # Scale sigmas for V2V mode to preserve input content based on refine_strength
-            # Lower strength = less noise = more preservation of input video
-            if v2v_initial_latent is not None:
-                sigmas = sigmas * refine_strength
-                print(f">>> V2V: Using {num_inference_steps} steps with strength {refine_strength} (sigmas scaled)")
-            else:
-                print(f">>> Using {num_inference_steps} inference steps")
+            print(f">>> Using {num_inference_steps} inference steps")
 
             # Move text embeddings to GPU for stage 1 denoising
             v_context_p = v_context_p.to(self.device)
@@ -3509,11 +3507,18 @@ class LTXVideoGeneratorWithOffloading:
 
                 audio_noise_scale = v2a_strength if v2a_preserved_audio_latent is not None else 1.0
 
+                # Scale sigmas for V2V mode to preserve input content based on refine_strength
+                # Lower strength = less noise = more preservation of input video
+                stage_1_sigmas = sigmas
+                if v2v_initial_latent is not None:
+                    stage_1_sigmas = sigmas * refine_strength
+                    print(f">>> V2V: Scaling sigmas by {refine_strength} to preserve input video")
+
                 video_state, audio_state = denoise_audio_video(
                     output_shape=stage_1_output_shape,
                     conditionings=stage_1_conditionings,
                     noiser=noiser,
-                    sigmas=sigmas,
+                    sigmas=stage_1_sigmas,
                     stepper=stepper,
                     denoising_loop_fn=first_stage_denoising_loop,
                     components=self.pipeline_components,
