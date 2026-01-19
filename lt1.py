@@ -2216,12 +2216,7 @@ def create_interface():
 Unlike SVI Pro (which uses motion latents), this method uses noise masking to preserve the original content exactly while generating seamless continuations.
 Audio is synchronized with the video extension.
                             """)
-                            with gr.Row():
-                                av_extend_video = gr.File(
-                                    label="Input Video to Extend",
-                                    file_types=["video"],
-                                    type="filepath"
-                                )
+                            av_extend_video = gr.Video(label="Input Video to Extend", sources=["upload"])
                             with gr.Row():
                                 av_extend_start_time = gr.Number(
                                     label="Start Time (seconds)",

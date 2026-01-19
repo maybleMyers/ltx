@@ -3097,7 +3097,7 @@ class LTXVideoGeneratorWithOffloading:
             v2v_sequential_latent = None
             v2v_sequential_audio_state = None
             if input_video and not self.refine_only and not v2a_mode:
-                from ltx_core.conditioning import VideoConditionByKeyframeIndex, VideoConditionByLatentIndex
+                from ltx_core.conditioning import VideoConditionByKeyframeIndex, VideoConditionByGuideLatent
                 print(f">>> V2V: Loading and encoding input video...")
                 v2v_start = time.time()
 
@@ -3148,14 +3148,41 @@ class LTXVideoGeneratorWithOffloading:
                         chunk_conditionings = list(stage_1_conditionings)
 
                         if chunk_idx > 0:
-                            overlap_from_prev = accumulated_latent[:, :, -overlap_latent:, :, :].to(self.device)
+                            # CropGuides pattern: append guide latents as surplus tokens
+                            # These influence attention but are cropped by clear_conditioning() after denoising
+                            guide_latent = accumulated_latent[:, :, -overlap_latent:, :, :].to(self.device)
                             chunk_conditionings.append(
-                                VideoConditionByLatentIndex(
-                                    latent=overlap_from_prev,
-                                    strength=0.95,
-                                    latent_idx=0,
+                                VideoConditionByGuideLatent(
+                                    latent=guide_latent,
+                                    frame_idx=0,  # Position at start of chunk for continuity
+                                    strength=0.98,  # High preservation (2% denoising freedom)
                                 )
                             )
+
+                        # Middle frame guide for longer chunks (improves temporal coherence)
+                        if chunk_latent_frames > 8:  # More than 64 pixel frames
+                            mid_pixel = valid_frames // 2
+                            # Encode 9 frames around the middle (produces 1 latent frame)
+                            mid_start = max(0, mid_pixel - 4)
+                            mid_end = min(valid_frames, mid_start + 9)
+                            mid_start = max(0, mid_end - 9)  # Adjust if near end
+
+                            if mid_end - mid_start >= 9:
+                                mid_tile = video_tensor[:, :, frame_start + mid_start:frame_start + mid_end, :, :].to(device=self.device, dtype=dtype)
+                                with torch.no_grad():
+                                    mid_encoded = video_encoder(mid_tile)
+                                del mid_tile
+                                torch.cuda.empty_cache()
+
+                                chunk_conditionings.append(
+                                    VideoConditionByGuideLatent(
+                                        latent=mid_encoded.cpu(),
+                                        frame_idx=mid_start,  # Position at middle of chunk
+                                        strength=0.95,  # Slightly lower than overlap guide
+                                    )
+                                )
+                                del mid_encoded
+                                torch.cuda.empty_cache()
 
                         enc_frame_idx = 0
                         while enc_frame_idx < valid_frames:
@@ -3224,9 +3251,12 @@ class LTXVideoGeneratorWithOffloading:
                         if accumulated_latent is None:
                             accumulated_latent = chunk_latent
                         else:
-                            accumulated_latent = self._linear_blend_latents(
-                                accumulated_latent, chunk_latent, overlap_latent
-                            )
+                            # CropGuides: clean concatenation - overlap handled by guide attention
+                            # Skip first overlap_latent frames of this chunk (already covered by previous)
+                            accumulated_latent = torch.cat([
+                                accumulated_latent,
+                                chunk_latent[:, :, overlap_latent:, :, :]
+                            ], dim=2)
 
                         print(f">>> V2V Sequential: Chunk {chunk_idx+1} done (frames {frame_start}-{frame_end})")
 
