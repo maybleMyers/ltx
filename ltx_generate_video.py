@@ -3510,9 +3510,11 @@ class LTXVideoGeneratorWithOffloading:
                 # Scale sigmas for V2V mode to preserve input content based on refine_strength
                 # Lower strength = less noise = more preservation of input video
                 stage_1_sigmas = sigmas
+                video_noise_scale = sigmas[0]  # Default: full noise
                 if v2v_initial_latent is not None:
                     stage_1_sigmas = sigmas * refine_strength
-                    print(f">>> V2V: Scaling sigmas by {refine_strength} to preserve input video")
+                    video_noise_scale = stage_1_sigmas[0]  # Scale initial noise to match sigmas
+                    print(f">>> V2V: Scaling sigmas by {refine_strength} to preserve input video (noise_scale={video_noise_scale:.4f})")
 
                 video_state, audio_state = denoise_audio_video(
                     output_shape=stage_1_output_shape,
@@ -3524,6 +3526,7 @@ class LTXVideoGeneratorWithOffloading:
                     components=self.pipeline_components,
                     dtype=dtype,
                     device=self.device,
+                    noise_scale=video_noise_scale,
                     initial_video_latent=v2v_initial_latent,
                     initial_audio_latent=v2a_preserved_audio_latent,
                     audio_conditionings=audio_conditionings if audio_conditionings else None,
