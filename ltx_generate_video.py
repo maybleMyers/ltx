@@ -2331,6 +2331,8 @@ def encode_video_chunked(
     video_encoder,
     chunk_frames: int = 65,  # 8*8 + 1
     overlap_frames: int = 8,  # kept for API compatibility, but we use context_frames internally
+    device: torch.device | str | None = None,
+    dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """
     Encode video in temporal chunks to reduce memory usage.
@@ -2342,19 +2344,33 @@ def encode_video_chunked(
     - This avoids blending artifacts from mismatched latents at chunk boundaries
 
     Args:
-        video_tensor: Shape (1, C, F, H, W) normalized video
+        video_tensor: Shape (1, C, F, H, W) normalized video (can be on CPU)
         video_encoder: VideoEncoder model
         chunk_frames: Frames per chunk (must be 8*k+1)
         overlap_frames: Legacy parameter, context_frames is used internally
+        device: Device to use for encoding (if None, uses video_tensor's device)
+        dtype: Dtype to use for encoding (if None, uses video_tensor's dtype)
 
     Returns:
-        Encoded latent tensor (1, latent_channels, F', H', W')
+        Encoded latent tensor (1, latent_channels, F', H', W') on the specified device
     """
+    # Determine device and dtype
+    if device is None:
+        device = video_tensor.device
+    if dtype is None:
+        dtype = video_tensor.dtype
+
     _, c, total_frames, h, w = video_tensor.shape
 
     # If video fits in one chunk, encode directly
     if total_frames <= chunk_frames:
-        return video_encoder(video_tensor)
+        chunk = video_tensor.to(device=device, dtype=dtype)
+        with torch.no_grad():
+            result = video_encoder(chunk)
+        del chunk
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return result
 
     # Validate
     assert (chunk_frames - 1) % 8 == 0, "chunk_frames must be 8*k+1"
@@ -2399,22 +2415,34 @@ def encode_video_chunked(
             pad_frames = 0
 
         print(f">>> Encoding chunk {i+1}/{len(chunks_info)} (frames {start}-{end})...")
+        # Extract chunk from CPU tensor
         chunk = video_tensor[:, :, start:end, :, :]
 
-        # Pad if necessary
+        # Pad if necessary (on CPU)
         if pad_frames > 0:
             last_frame = chunk[:, :, -1:, :, :]
             padding = last_frame.expand(-1, -1, pad_frames, -1, -1)
             chunk = torch.cat([chunk, padding], dim=2)
 
+        # Move chunk to GPU for encoding
+        chunk = chunk.to(device=device, dtype=dtype)
+
         # Encode
         with torch.no_grad():
             latent = video_encoder(chunk)
+
+        # Free GPU memory immediately
+        del chunk
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # Remove padded latent tokens if we padded
         if pad_frames > 0:
             valid_tokens = (actual_frames - 1) // 8 + 1
             latent = latent[:, :, :valid_tokens, :, :]
+
+        # Move latent to CPU to save GPU memory
+        latent = latent.cpu()
 
         # For first chunk: use all latent tokens
         # For subsequent chunks: discard context latents (warm-up region)
@@ -2426,8 +2454,7 @@ def encode_video_chunked(
                 latent_segments.append(latent[:, :, context_latents:, :, :])
             # If chunk is very short, it might be entirely context - skip it
 
-        # Free memory
-        del chunk
+        del latent
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -2448,7 +2475,8 @@ def encode_video_chunked(
         padding = last_latent.expand(-1, -1, pad_latents, -1, -1)
         result = torch.cat([result, padding], dim=2)
 
-    return result
+    # Move final result to target device
+    return result.to(device=device)
 
 
 # =============================================================================
@@ -2743,10 +2771,13 @@ class LTXVideoGeneratorWithOffloading:
 
             # Encode full video to use as initial latent for denoising
             # This allows refine_strength to actually control how much of the input is preserved
+            # Note: video_tensor is kept on CPU, chunks are moved to GPU one at a time
             upscaled_video_latent = encode_video_chunked(
-                video_tensor.to(device=self.device, dtype=dtype),
+                video_tensor,
                 video_encoder,
                 chunk_frames=v2v_chunk_frames,
+                device=self.device,
+                dtype=dtype,
             )
 
             print(f">>> Video encoded to latent shape {upscaled_video_latent.shape}")
@@ -3211,12 +3242,15 @@ class LTXVideoGeneratorWithOffloading:
                 else:
                     # Two-stage V2V: Encode full video as initial latent for stage 1
                     # This allows refine_strength to actually control preservation of input
+                    # Note: video_tensor is kept on CPU, chunks are moved to GPU one at a time
                     print(f">>> V2V: Encoding {actual_frames} frames to latent space...")
 
                     v2v_initial_latent = encode_video_chunked(
-                        video_tensor.to(device=self.device, dtype=dtype),
+                        video_tensor,
                         video_encoder,
                         chunk_frames=v2v_chunk_frames,
+                        device=self.device,
+                        dtype=dtype,
                     )
 
                     del video_tensor
