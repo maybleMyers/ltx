@@ -1701,6 +1701,12 @@ Examples:
         default=24,
         help="Overlap frames between chunks (divisible by 8). Default: 24",
     )
+    v2v_group.add_argument(
+        "--refine-latent-stride",
+        type=int,
+        default=8,
+        help="Condition every Nth frame in refine-only mode. Lower values (1-4) produce smoother video but use more VRAM. Default: 8",
+    )
 
     # ==========================================================================
     # V2A Mode (Video-to-Audio)
@@ -2607,6 +2613,7 @@ class LTXVideoGeneratorWithOffloading:
         # Sequential V2V chunk processing
         v2v_chunk_frames: int = 121,
         v2v_overlap_frames: int = 24,
+        refine_latent_stride: int = 8,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor | None, str | None]:
         """
         Generate video with optional audio.
@@ -2733,8 +2740,8 @@ class LTXVideoGeneratorWithOffloading:
 
             # Use keyframe conditioning approach (like Wan2GP) instead of encoding whole video
             # This avoids chunked encoding glitches from the causal VAE encoder
-            # Extract every 8th frame and create conditionings with strength=1.0
-            latent_stride = 8
+            # Extract every Nth frame (controlled by refine_latent_stride) with strength=1.0
+            latent_stride = refine_latent_stride
             actual_frames = video_tensor.shape[2]
 
             # Get latent indices already covered by --image args (don't duplicate conditioning)
@@ -8398,6 +8405,7 @@ def main():
             v2a_strength=args.v2a_strength,
             v2v_chunk_frames=args.v2v_chunk_frames,
             v2v_overlap_frames=args.v2v_overlap_frames,
+            refine_latent_stride=args.refine_latent_stride,
         )
 
     # Encode and save video

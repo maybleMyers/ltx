@@ -966,6 +966,7 @@ def generate_ltx_video(
     refine_steps: int,
     v2v_chunk_frames: int,
     v2v_overlap_frames: int,
+    refine_latent_stride: int,
     # Audio & prompt
     disable_audio: bool,
     audio_input: str,
@@ -1134,17 +1135,18 @@ def generate_ltx_video(
             "--stage2-steps", str(int(stage2_steps)),
             "--seed", str(current_seed),
             "--output-path", output_filename,
-            # STG parameters (always pass, even when 0)
-            "--stg-scale", str(float(stg_scale)),
-            "--stg-mode", str(stg_mode),
         ]
 
-        # STG blocks (parse comma-separated string to list)
-        if stg_blocks and stg_blocks.strip():
-            for block in stg_blocks.split(","):
-                block = block.strip()
-                if block:
-                    command.extend(["--stg-blocks", block])
+        # STG parameters (only include when stg_scale > 0)
+        if float(stg_scale) > 0:
+            command.extend(["--stg-scale", str(float(stg_scale))])
+            command.extend(["--stg-mode", str(stg_mode)])
+            # STG blocks (parse comma-separated string to list)
+            if stg_blocks and stg_blocks.strip():
+                for block in stg_blocks.split(","):
+                    block = block.strip()
+                    if block:
+                        command.extend(["--stg-blocks", block])
 
         # Pipeline selection
         if is_one_stage:
@@ -1176,6 +1178,7 @@ def generate_ltx_video(
             command.extend(["--refine-steps", str(int(refine_steps))])
             command.extend(["--v2v-chunk-frames", str(int(v2v_chunk_frames))])
             command.extend(["--v2v-overlap-frames", str(int(v2v_overlap_frames))])
+            command.extend(["--refine-latent-stride", str(int(refine_latent_stride))])
 
         # Image conditioning (I2V)
         if mode == "i2v" and input_image:
@@ -2100,6 +2103,12 @@ def create_interface():
                                     minimum=8, maximum=64, value=24, step=8,
                                     label="V2V Overlap Frames",
                                     info="Overlap frames between chunks (divisible by 8)"
+                                )
+                            with gr.Row():
+                                refine_latent_stride = gr.Slider(
+                                    minimum=1, maximum=8, value=8, step=1,
+                                    label="Refine Latent Stride",
+                                    info="Condition every Nth frame in refine-only mode. Lower values (1-4) produce smoother video but use more VRAM."
                                 )
 
                         # Depth Control (IC-LoRA)
@@ -3163,7 +3172,7 @@ Audio is synchronized with the video extension.
                 input_image, image_frame_idx, image_strength,
                 end_image, end_image_strength,
                 anchor_image, anchor_interval, anchor_strength, anchor_decay,
-                input_video, refine_strength, refine_steps, v2v_chunk_frames, v2v_overlap_frames,
+                input_video, refine_strength, refine_steps, v2v_chunk_frames, v2v_overlap_frames, refine_latent_stride,
                 disable_audio, audio_input, audio_strength, enhance_prompt,
                 offload, enable_fp8,
                 enable_dit_block_swap, dit_blocks_in_memory,
@@ -3218,7 +3227,7 @@ Audio is synchronized with the video extension.
         def send_to_generation_handler(metadata, first_frame):
             """Send loaded metadata to generation tab parameters and switch to Generation tab."""
             if not metadata:
-                return [gr.update()] * 41 + ["No metadata loaded - upload a video first"]
+                return [gr.update()] * 42 + ["No metadata loaded - upload a video first"]
 
             # Handle legacy metadata that used single enable_block_swap
             legacy_block_swap = metadata.get("enable_block_swap", True)
@@ -3274,6 +3283,7 @@ Audio is synchronized with the video extension.
                 gr.update(value=metadata.get("refine_steps", 10)),  # refine_steps
                 gr.update(value=metadata.get("v2v_chunk_frames", 121)),  # v2v_chunk_frames
                 gr.update(value=metadata.get("v2v_overlap_frames", 24)),  # v2v_overlap_frames
+                gr.update(value=metadata.get("refine_latent_stride", 8)),  # refine_latent_stride
                 # Audio and prompt
                 gr.update(value=metadata.get("disable_audio", False)),  # disable_audio
                 gr.update(value=metadata.get("audio_strength", 1.0)),  # audio_strength
@@ -3309,7 +3319,7 @@ Audio is synchronized with the video extension.
                 # Anchor conditioning
                 anchor_interval, anchor_strength, anchor_decay,
                 # Refine settings
-                refine_strength, refine_steps, v2v_chunk_frames, v2v_overlap_frames,
+                refine_strength, refine_steps, v2v_chunk_frames, v2v_overlap_frames, refine_latent_stride,
                 # Audio and prompt
                 disable_audio, audio_strength, enhance_prompt,
                 # Memory optimization
@@ -3473,7 +3483,7 @@ Audio is synchronized with the video extension.
             # Anchor conditioning
             anchor_interval, anchor_strength, anchor_decay,
             # Refine settings
-            refine_strength, refine_steps, v2v_chunk_frames, v2v_overlap_frames,
+            refine_strength, refine_steps, v2v_chunk_frames, v2v_overlap_frames, refine_latent_stride,
             # Audio and prompt
             disable_audio, audio_strength, enhance_prompt,
             # Memory optimization
@@ -3517,7 +3527,7 @@ Audio is synchronized with the video extension.
             # Anchor conditioning
             "anchor_interval", "anchor_strength", "anchor_decay",
             # Refine settings
-            "refine_strength", "refine_steps", "v2v_chunk_frames", "v2v_overlap_frames",
+            "refine_strength", "refine_steps", "v2v_chunk_frames", "v2v_overlap_frames", "refine_latent_stride",
             # Audio and prompt
             "disable_audio", "audio_strength", "enhance_prompt",
             # Memory optimization
