@@ -534,25 +534,36 @@ class _GIMMInputPadder:
 # Model variant configurations
 GIMM_MODELS = {
     "GIMM-VFI-R (RAFT)": {
+        "type": "gimm",
         "config": "GIMM-VFI/configs/gimmvfi/gimmvfi_r_arb.yaml",
         "checkpoint": "GIMM-VFI/pretrained_ckpt/gimmvfi_r_arb.pt",
     },
     "GIMM-VFI-R-P (RAFT+Perceptual)": {
+        "type": "gimm",
         "config": "GIMM-VFI/configs/gimmvfi/gimmvfi_r_arb.yaml",
         "checkpoint": "GIMM-VFI/pretrained_ckpt/gimmvfi_r_arb_lpips.pt",
     },
     "GIMM-VFI-F (FlowFormer)": {
+        "type": "gimm",
         "config": "GIMM-VFI/configs/gimmvfi/gimmvfi_f_arb.yaml",
         "checkpoint": "GIMM-VFI/pretrained_ckpt/gimmvfi_f_arb.pt",
     },
     "GIMM-VFI-F-P (FlowFormer+Perceptual)": {
+        "type": "gimm",
         "config": "GIMM-VFI/configs/gimmvfi/gimmvfi_f_arb.yaml",
         "checkpoint": "GIMM-VFI/pretrained_ckpt/gimmvfi_f_arb_lpips.pt",
+    },
+    "BiM-VFI (Bidirectional Motion)": {
+        "type": "bim",
+        "checkpoint": "GIMM-VFI/pretrained_ckpt/bim_vfi.pth",
     },
 }
 
 # Global cache for GIMM-VFI model
 _gimm_model_cache = {"model": None, "variant": None}
+
+# Global cache for BiM-VFI model
+_bim_model_cache = {"model": None, "variant": None}
 
 
 def _load_gimm_model(model_variant: str, checkpoint_path: str = "", config_path: str = ""):
@@ -622,6 +633,63 @@ def _load_gimm_model(model_variant: str, checkpoint_path: str = "", config_path:
     # Cache the model
     _gimm_model_cache["model"] = model
     _gimm_model_cache["variant"] = cache_key
+
+    return model
+
+
+def _load_bim_model(checkpoint_path: str = ""):
+    """Load BiM-VFI model with caching."""
+    import torch
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    gimm_dir = os.path.join(script_dir, "GIMM-VFI")
+
+    # Add GIMM-VFI to path so bim_vfi can be imported as a package
+    if gimm_dir not in sys.path:
+        sys.path.insert(0, gimm_dir)
+
+    from bim_vfi import BiMVFI
+
+    # Use default checkpoint if not specified
+    default_ckpt = "GIMM-VFI/pretrained_ckpt/bim_vfi.pth"
+    ckpt_file = checkpoint_path if checkpoint_path else default_ckpt
+
+    # Check if already loaded
+    cache_key = f"bim:{ckpt_file}"
+    if _bim_model_cache["model"] is not None and _bim_model_cache["variant"] == cache_key:
+        return _bim_model_cache["model"]
+
+    # Clear old model from GPU
+    if _bim_model_cache["model"] is not None:
+        del _bim_model_cache["model"]
+        _bim_model_cache["model"] = None
+        torch.cuda.empty_cache()
+
+    # Create model
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = BiMVFI(pyr_level=3, feat_channels=32)
+    model = model.to(device)
+
+    # Load checkpoint (use absolute path)
+    abs_ckpt_file = os.path.join(script_dir, ckpt_file) if not os.path.isabs(ckpt_file) else ckpt_file
+    if os.path.exists(abs_ckpt_file):
+        ckpt = torch.load(abs_ckpt_file, map_location="cpu", weights_only=False)
+        # Support "model", "state_dict" keys or direct state dict
+        if "model" in ckpt:
+            state_dict = ckpt["model"]
+        elif "state_dict" in ckpt:
+            state_dict = ckpt["state_dict"]
+        else:
+            state_dict = ckpt
+        model.load_state_dict(state_dict, strict=True)
+    else:
+        raise FileNotFoundError(f"BiM-VFI checkpoint not found: {abs_ckpt_file}")
+
+    model.eval()
+
+    # Cache the model
+    _bim_model_cache["model"] = model
+    _bim_model_cache["variant"] = cache_key
 
     return model
 
@@ -763,6 +831,7 @@ def interpolate_video_gimm(
     import torch
     import numpy as np
     import cv2
+    import gc
 
     if not input_video:
         yield None, "Error: No input video provided", 0.0
@@ -886,6 +955,16 @@ def interpolate_video_gimm(
 
         _frames_to_video(output_frames_dir, output_path, output_fps, audio_source=input_video)
 
+        # Offload model and clear VRAM before final yield
+        if _gimm_model_cache["model"] is not None:
+            _gimm_model_cache["model"].cpu()
+            del _gimm_model_cache["model"]
+            _gimm_model_cache["model"] = None
+            _gimm_model_cache["variant"] = None
+        gc.collect()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
         yield output_path, f"Done! Output: {output_fps:.1f} FPS ({output_frame_idx} frames)", 1.0
 
     except Exception as e:
@@ -898,21 +977,227 @@ def interpolate_video_gimm(
             shutil.rmtree(temp_dir)
         except:
             pass
-        # Unload GIMM-VFI model to free VRAM
+        # Ensure model is offloaded even on error
         try:
-            import torch
-            import gc
             if _gimm_model_cache["model"] is not None:
-                # Move to CPU first to release CUDA memory
                 _gimm_model_cache["model"].cpu()
                 del _gimm_model_cache["model"]
                 _gimm_model_cache["model"] = None
                 _gimm_model_cache["variant"] = None
-            # Force garbage collection and clear CUDA cache
             gc.collect()
             torch.cuda.empty_cache()
         except:
             pass
+
+
+def interpolate_video_bim(
+    input_video: str,
+    checkpoint_path: str,
+    interp_factor: int,
+    pyr_level: int,
+    output_fps_override: float,
+    seed: int,
+) -> Generator[Tuple[Optional[str], str, float], None, None]:
+    """
+    Interpolate video frames using BiM-VFI.
+
+    Yields: (output_video_path, status_text, progress_fraction)
+    """
+    import torch
+    import numpy as np
+    import cv2
+    import gc
+
+    if not input_video:
+        yield None, "Error: No input video provided", 0.0
+        return
+
+    _gimm_set_seed(seed)
+
+    # Create temp directories
+    temp_dir = tempfile.mkdtemp(prefix="bim_interp_")
+    input_frames_dir = os.path.join(temp_dir, "input_frames")
+    output_frames_dir = os.path.join(temp_dir, "output_frames")
+    os.makedirs(input_frames_dir, exist_ok=True)
+    os.makedirs(output_frames_dir, exist_ok=True)
+
+    try:
+        # Extract frames
+        yield None, "Extracting video frames...", 0.05
+        frame_paths, original_fps = _extract_video_frames(input_video, input_frames_dir)
+
+        if len(frame_paths) < 2:
+            yield None, "Error: Video must have at least 2 frames", 0.0
+            return
+
+        yield None, f"Extracted {len(frame_paths)} frames at {original_fps:.2f} FPS", 0.1
+
+        # Load model
+        yield None, "Loading BiM-VFI model...", 0.15
+        model = _load_bim_model(checkpoint_path)
+        device = next(model.parameters()).device
+
+        yield None, "Model loaded, starting interpolation...", 0.2
+
+        # Auto-detect pyr_level based on resolution if not specified
+        from PIL import Image
+        first_img = Image.open(frame_paths[0])
+        width, height = first_img.size
+        max_dim = max(width, height)
+
+        if pyr_level <= 0:
+            # Auto-detect based on resolution
+            if max_dim >= 3840:  # 4K+
+                auto_pyr_level = 7
+            elif max_dim >= 1920:  # 1080p
+                auto_pyr_level = 6
+            else:  # < 1080p
+                auto_pyr_level = 5
+            yield None, f"Auto-detected pyr_level={auto_pyr_level} for {width}x{height}", 0.22
+        else:
+            auto_pyr_level = pyr_level
+
+        # Process frame pairs
+        N = interp_factor  # Number of output frames per input pair (including endpoints)
+        total_pairs = len(frame_paths) - 1
+        output_frame_idx = 0
+
+        def load_image(img_path):
+            img = Image.open(img_path)
+            raw_img = np.array(img.convert("RGB"))
+            img_tensor = torch.from_numpy(raw_img.copy()).permute(2, 0, 1) / 255.0
+            return img_tensor.to(torch.float).unsqueeze(0)
+
+        for pair_idx in range(total_pairs):
+            progress = 0.2 + (pair_idx / total_pairs) * 0.7
+            yield None, f"Interpolating pair {pair_idx + 1}/{total_pairs}...", progress
+
+            # Load frame pair
+            I0 = load_image(frame_paths[pair_idx]).to(device)
+            I1 = load_image(frame_paths[pair_idx + 1]).to(device)
+
+            # Save first frame (only for first pair)
+            if pair_idx == 0:
+                frame_np = (I0[0].cpu().numpy().transpose(1, 2, 0) * 255.0).astype(np.uint8)
+                frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
+                cv2.imwrite(os.path.join(output_frames_dir, f"{output_frame_idx:05d}.png"), frame_bgr)
+                output_frame_idx += 1
+
+            # Generate intermediate frames
+            with torch.no_grad():
+                for i in range(1, N):
+                    time_step = i / N
+                    results = model(img0=I0, img1=I1, time_step=time_step, pyr_level=auto_pyr_level)
+                    imgt_pred = results["imgt_pred"]
+
+                    # Save interpolated frame
+                    frame_np = (imgt_pred[0].cpu().numpy().transpose(1, 2, 0) * 255.0)
+                    frame_np = np.clip(frame_np, 0, 255).astype(np.uint8)
+                    frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
+                    cv2.imwrite(os.path.join(output_frames_dir, f"{output_frame_idx:05d}.png"), frame_bgr)
+                    output_frame_idx += 1
+
+            # Save second frame of pair
+            frame_np = (I1[0].cpu().numpy().transpose(1, 2, 0) * 255.0).astype(np.uint8)
+            frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(os.path.join(output_frames_dir, f"{output_frame_idx:05d}.png"), frame_bgr)
+            output_frame_idx += 1
+
+            # Clear CUDA cache periodically
+            if pair_idx % 10 == 0:
+                torch.cuda.empty_cache()
+
+        # Reassemble video
+        yield None, "Encoding output video...", 0.92
+
+        # Calculate output FPS
+        output_fps = output_fps_override if output_fps_override > 0 else original_fps * N
+
+        # Create output path
+        output_dir = "outputs"
+        os.makedirs(output_dir, exist_ok=True)
+        output_filename = f"interpolated_bim_{int(time.time())}.mp4"
+        output_path = os.path.join(output_dir, output_filename)
+
+        _frames_to_video(output_frames_dir, output_path, output_fps, audio_source=input_video)
+
+        # Offload model and clear VRAM before final yield
+        if _bim_model_cache["model"] is not None:
+            _bim_model_cache["model"].cpu()
+            del _bim_model_cache["model"]
+            _bim_model_cache["model"] = None
+            _bim_model_cache["variant"] = None
+        gc.collect()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+        yield output_path, f"Done! Output: {output_fps:.1f} FPS ({output_frame_idx} frames)", 1.0
+
+    except Exception as e:
+        yield None, f"Error: {str(e)}", 0.0
+        import traceback
+        traceback.print_exc()
+    finally:
+        # Cleanup temp directory
+        try:
+            shutil.rmtree(temp_dir)
+        except:
+            pass
+        # Ensure model is offloaded even on error
+        try:
+            if _bim_model_cache["model"] is not None:
+                _bim_model_cache["model"].cpu()
+                del _bim_model_cache["model"]
+                _bim_model_cache["model"] = None
+                _bim_model_cache["variant"] = None
+            gc.collect()
+            torch.cuda.empty_cache()
+        except:
+            pass
+
+
+def interpolate_video(
+    input_video: str,
+    model_variant: str,
+    checkpoint_path: str,
+    config_path: str,
+    interp_factor: int,
+    ds_scale: float,
+    output_fps_override: float,
+    raft_iters: int,
+    pyr_level: int,
+    seed: int,
+) -> Generator[Tuple[Optional[str], str, float], None, None]:
+    """
+    Unified dispatcher for video frame interpolation.
+    Routes to GIMM-VFI or BiM-VFI based on model type.
+    """
+    model_info = GIMM_MODELS.get(model_variant, {})
+    model_type = model_info.get("type", "gimm")
+
+    if model_type == "bim":
+        # Use BiM-VFI
+        yield from interpolate_video_bim(
+            input_video=input_video,
+            checkpoint_path=checkpoint_path,
+            interp_factor=interp_factor,
+            pyr_level=pyr_level,
+            output_fps_override=output_fps_override,
+            seed=seed,
+        )
+    else:
+        # Use GIMM-VFI
+        yield from interpolate_video_gimm(
+            input_video=input_video,
+            model_variant=model_variant,
+            checkpoint_path=checkpoint_path,
+            config_path=config_path,
+            interp_factor=interp_factor,
+            ds_scale=ds_scale,
+            output_fps_override=output_fps_override,
+            raft_iters=raft_iters,
+            seed=seed,
+        )
 
 
 # =============================================================================
@@ -2964,12 +3249,20 @@ Audio is synchronized with the video extension.
                         # Advanced Settings
                         with gr.Accordion("Advanced", open=False):
                             interp_raft_iters = gr.Slider(
-                                label="RAFT Iterations",
+                                label="RAFT Iterations (GIMM-VFI only)",
                                 minimum=12,
                                 maximum=32,
                                 value=20,
                                 step=1,
-                                info="More iterations = better quality, slower"
+                                info="More iterations = better quality, slower (GIMM-VFI only)"
+                            )
+                            interp_pyr_level = gr.Slider(
+                                label="Pyramid Level (BiM-VFI only)",
+                                minimum=0,
+                                maximum=8,
+                                value=0,
+                                step=1,
+                                info="0=auto (based on resolution), 5=<1080p, 6=1080p, 7=4K+"
                             )
                             interp_seed = gr.Number(
                                 label="Seed",
@@ -2996,11 +3289,11 @@ Audio is synchronized with the video extension.
 
                         gr.Markdown("""
                         **Notes:**
-                        - Download checkpoints from [HuggingFace](https://huggingface.co/GSean/GIMM-VFI)
-                        - Place `.pt` files in `GIMM-VFI/pretrained_ckpt/`
-                        - For 2K/4K video, reduce DS Scale to fit in VRAM
-                        - FlowFormer (F) variants need more VRAM but produce better quality
-                        - Recommended: `gimmvfi_r_arb_lpips.pt` (RAFT+Perceptual)
+                        - **GIMM-VFI**: Download from [HuggingFace](https://huggingface.co/GSean/GIMM-VFI). R=RAFT (faster), F=FlowFormer (better), P=Perceptual loss
+                        - **BiM-VFI**: Download from [GitHub](https://github.com/KAIST-VICLab/BiM-VFI). Bidirectional motion field interpolation
+                        - Place checkpoints in `GIMM-VFI/pretrained_ckpt/`
+                        - For 2K/4K video with GIMM-VFI, reduce DS Scale to fit in VRAM
+                        - BiM-VFI auto-detects pyramid level based on resolution (or set manually)
                         """)
 
             # =================================================================
@@ -3897,7 +4190,7 @@ Audio is synchronized with the video extension.
         # Frame Interpolation Event Handlers
         # =================================================================
         interp_generate_btn.click(
-            fn=interpolate_video_gimm,
+            fn=interpolate_video,
             inputs=[
                 interp_input_video,
                 interp_model_variant,
@@ -3907,6 +4200,7 @@ Audio is synchronized with the video extension.
                 interp_ds_scale,
                 interp_output_fps,
                 interp_raft_iters,
+                interp_pyr_level,
                 interp_seed,
             ],
             outputs=[interp_output_video, interp_status, interp_progress]
