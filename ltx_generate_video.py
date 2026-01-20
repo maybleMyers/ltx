@@ -360,8 +360,15 @@ Suggested actions:
             # Apply strategy: reconfigure blocks, FFN, activation
             cleanup_memory()
 
-            # Reconfigure based on strategy
-            if strategy['blocks'] != retry_state.current_blocks and block_swap_manager:
+            # Reconfigure if ANY block swap setting changed
+            needs_reconfigure = (
+                strategy['blocks'] != retry_state.current_blocks or
+                strategy['activation_offload'] != retry_state.activation_offload_enabled or
+                strategy['temporal_chunk_size'] != retry_state.current_temporal_chunk_size
+            )
+
+            if needs_reconfigure and block_swap_manager:
+                print(f">>> Reconfiguring: blocks={strategy['blocks']}, activation_offload={strategy['activation_offload']}, temporal_chunk={strategy['temporal_chunk_size']}")
                 block_swap_manager, _ = reconfigure_block_swap(
                     transformer,
                     new_blocks_in_memory=strategy['blocks'],
@@ -370,6 +377,7 @@ Suggested actions:
                     temporal_chunk_size=strategy['temporal_chunk_size'],
                 )
 
+            # Handle FFN chunking
             if strategy['ffn_chunk_size'] is not None:
                 set_ffn_chunk_size(transformer, strategy['ffn_chunk_size'])
             elif retry_state.ffn_chunking_enabled:
@@ -377,6 +385,7 @@ Suggested actions:
 
             # Update state
             retry_state.current_blocks = strategy['blocks']
+            retry_state.current_temporal_chunk_size = strategy['temporal_chunk_size']
             retry_state.ffn_chunking_enabled = strategy['ffn_chunk_size'] is not None
             retry_state.activation_offload_enabled = strategy['activation_offload']
 
