@@ -22,8 +22,9 @@ import os
 import sys
 import time
 from collections.abc import Callable, Iterator
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Optional
 
 import torch
 from tqdm import tqdm
@@ -235,6 +236,158 @@ LATENT_RGB_FACTORS_LTXV = [
     [-1.4605e-02, -6.7032e-03, 3.9675e-03],
 ]
 LATENT_RGB_FACTORS_BIAS_LTXV = [-0.0571, -0.1657, -0.2512]
+
+
+# =============================================================================
+# OOM Retry Infrastructure
+# =============================================================================
+
+class OOMError(RuntimeError):
+    """Exception raised when all OOM retry strategies are exhausted."""
+    pass
+
+
+@dataclass
+class OOMRetryState:
+    """Tracks OOM retry state across attempts."""
+    stage: str  # "stage1" or "stage2"
+    attempt: int = 0
+    max_attempts: int = 21  # Gradual block reduction + final memory optimization
+
+    # Configuration tracking
+    original_blocks: int = 0
+    current_blocks: int = 0
+    min_blocks: int = 1
+
+    original_ffn_chunk_size: Optional[int] = None
+    ffn_chunking_enabled: bool = False
+
+    original_activation_offload: bool = False
+    activation_offload_enabled: bool = False
+
+    original_temporal_chunk_size: int = 0
+    current_temporal_chunk_size: int = 0
+    min_temporal_chunk_size: int = 50000
+
+    def can_retry(self) -> bool:
+        return self.attempt < self.max_attempts
+
+    def get_next_strategy(self) -> Optional[dict]:
+        """Returns next retry strategy or None if exhausted."""
+        self.attempt += 1
+
+        # Strategy 1: Gradual block reduction (reduce by 1 each attempt)
+        if self.current_blocks > self.min_blocks:
+            new_blocks = self.current_blocks - 1
+            return {
+                'blocks': new_blocks,
+                'ffn_chunk_size': None,
+                'activation_offload': False,
+                'temporal_chunk_size': 0,
+                'description': f"Reducing blocks from {self.current_blocks} to {new_blocks}"
+            }
+
+        # Strategy 2: At minimum blocks, enable activation offload + FFN chunking
+        if not self.activation_offload_enabled:
+            return {
+                'blocks': self.min_blocks,
+                'ffn_chunk_size': 512,
+                'activation_offload': True,
+                'temporal_chunk_size': 50000,
+                'description': f"At minimum blocks ({self.min_blocks}), enabling activation offload + FFN chunking (512/50k)"
+            }
+
+        # No more strategies
+        return None
+
+
+def oom_retry_wrapper(
+    retry_state: OOMRetryState,
+    denoising_fn: Callable,
+    transformer,
+    generator_instance,
+    block_swap_manager,
+    seed: int,
+    **denoising_kwargs
+):
+    """
+    Executes denoising with progressive OOM retry.
+
+    On OOM:
+    1. Get next strategy from retry_state
+    2. Reconfigure transformer (blocks/FFN/activation)
+    3. Cleanup memory
+    4. Reset generator seed
+    5. Retry denoising
+    """
+    while retry_state.can_retry():
+        try:
+            result = denoising_fn(**denoising_kwargs)
+            if retry_state.attempt > 0:
+                print(f">>> SUCCESS after {retry_state.attempt} retry attempts")
+            return result, block_swap_manager
+
+        except torch.OutOfMemoryError as e:
+            strategy = retry_state.get_next_strategy()
+            if strategy is None:
+                # Build comprehensive error message
+                strategies_tried = []
+                if retry_state.original_blocks > retry_state.min_blocks:
+                    strategies_tried.append(
+                        f"  - Gradual block reduction: {retry_state.original_blocks} → ... → {retry_state.min_blocks}"
+                    )
+                if retry_state.activation_offload_enabled:
+                    strategies_tried.append(
+                        f"  - Activation offload + FFN chunking: Enabled (FFN chunk=512, temporal chunk=50000)"
+                    )
+
+                error_msg = f"""OUT OF MEMORY in {retry_state.stage} after exhausting all retry strategies.
+Attempts made: {retry_state.attempt}
+Strategies tried:
+{chr(10).join(strategies_tried)}
+
+Suggested actions:
+  1. Reduce resolution: --width 640 --height 416
+  2. Reduce video length: --num-frames 64
+  3. Use --one-stage to skip stage 2
+  4. Process in smaller chunks (sliding window mode)
+  5. Consider GPU with 48GB+ VRAM"""
+
+                raise OOMError(error_msg) from e
+
+            print(f">>> OOM in {retry_state.stage}! Retry {retry_state.attempt}: {strategy['description']}")
+
+            # Apply strategy: reconfigure blocks, FFN, activation
+            cleanup_memory()
+
+            # Reconfigure based on strategy
+            if strategy['blocks'] != retry_state.current_blocks and block_swap_manager:
+                block_swap_manager, _ = reconfigure_block_swap(
+                    transformer,
+                    new_blocks_in_memory=strategy['blocks'],
+                    device=torch.device(generator_instance.device),
+                    enable_activation_offload=strategy['activation_offload'],
+                    temporal_chunk_size=strategy['temporal_chunk_size'],
+                )
+
+            if strategy['ffn_chunk_size'] is not None:
+                set_ffn_chunk_size(transformer, strategy['ffn_chunk_size'])
+            elif retry_state.ffn_chunking_enabled:
+                set_ffn_chunk_size(transformer, None)
+
+            # Update state
+            retry_state.current_blocks = strategy['blocks']
+            retry_state.ffn_chunking_enabled = strategy['ffn_chunk_size'] is not None
+            retry_state.activation_offload_enabled = strategy['activation_offload']
+
+            # Reset generator
+            generator_torch = torch.Generator(device=generator_instance.device).manual_seed(seed)
+            if 'noiser' in denoising_kwargs:
+                denoising_kwargs['noiser'] = GaussianNoiser(generator=generator_torch)
+
+            cleanup_memory()
+
+    raise RuntimeError("Retry loop exited unexpectedly")
 
 
 # =============================================================================
@@ -3231,19 +3384,41 @@ class LTXVideoGeneratorWithOffloading:
                             fps=frame_rate,
                         )
 
-                        chunk_video_state, chunk_audio_state = denoise_audio_video(
-                            output_shape=chunk_shape,
-                            conditionings=chunk_conditionings,
-                            noiser=noiser,
-                            sigmas=sigmas,
-                            stepper=stepper,
-                            denoising_loop_fn=first_stage_denoising_loop,
-                            components=self.pipeline_components,
-                            dtype=dtype,
-                            device=self.device,
-                            initial_audio_latent=None,
-                            audio_conditionings=None,
-                            audio_noise_scale=1.0,
+                        # Create retry state for V2V sequential chunk denoising
+                        chunk_retry_state = OOMRetryState(
+                            stage=f"stage1_v2v_seq_chunk{chunk_idx}",
+                            original_blocks=self.dit_blocks_in_memory if self.enable_dit_block_swap else 0,
+                            current_blocks=self.dit_blocks_in_memory if self.enable_dit_block_swap else 0,
+                            min_blocks=2,  # DiT minimum
+                            original_ffn_chunk_size=self.ffn_chunk_size,
+                            original_activation_offload=self.enable_activation_offload,
+                            original_temporal_chunk_size=self.temporal_chunk_size,
+                        )
+
+                        chunk_denoising_kwargs = {
+                            'output_shape': chunk_shape,
+                            'conditionings': chunk_conditionings,
+                            'noiser': noiser,
+                            'sigmas': sigmas,
+                            'stepper': stepper,
+                            'denoising_loop_fn': first_stage_denoising_loop,
+                            'components': self.pipeline_components,
+                            'dtype': dtype,
+                            'device': self.device,
+                            'initial_audio_latent': None,
+                            'audio_conditionings': None,
+                            'audio_noise_scale': 1.0,
+                        }
+
+                        # Execute with OOM retry
+                        (chunk_video_state, chunk_audio_state), block_swap_manager = oom_retry_wrapper(
+                            retry_state=chunk_retry_state,
+                            denoising_fn=denoise_audio_video,
+                            transformer=transformer,
+                            generator_instance=self,
+                            block_swap_manager=block_swap_manager,
+                            seed=seed,
+                            **chunk_denoising_kwargs
                         )
 
                         chunk_latent = chunk_video_state.latent.cpu()
@@ -3552,19 +3727,42 @@ class LTXVideoGeneratorWithOffloading:
                     audio_state = v2v_sequential_audio_state
                 else:
                     audio_noise_scale = v2a_strength if v2a_preserved_audio_latent is not None else 1.0
-                    _, audio_state = denoise_audio_video(
-                        output_shape=stage_1_output_shape,
-                        conditionings=[],
-                        noiser=noiser,
-                        sigmas=sigmas,
-                        stepper=stepper,
-                        denoising_loop_fn=first_stage_denoising_loop,
-                        components=self.pipeline_components,
-                        dtype=dtype,
-                        device=self.device,
-                        initial_audio_latent=v2a_preserved_audio_latent,
-                        audio_conditionings=audio_conditionings if audio_conditionings else None,
-                        audio_noise_scale=audio_noise_scale,
+
+                    # Create retry state for V2V sequential audio-only denoising
+                    audio_retry_state = OOMRetryState(
+                        stage="stage1_audio",
+                        original_blocks=self.dit_blocks_in_memory if self.enable_dit_block_swap else 0,
+                        current_blocks=self.dit_blocks_in_memory if self.enable_dit_block_swap else 0,
+                        min_blocks=2,  # DiT minimum
+                        original_ffn_chunk_size=self.ffn_chunk_size,
+                        original_activation_offload=self.enable_activation_offload,
+                        original_temporal_chunk_size=self.temporal_chunk_size,
+                    )
+
+                    audio_denoising_kwargs = {
+                        'output_shape': stage_1_output_shape,
+                        'conditionings': [],
+                        'noiser': noiser,
+                        'sigmas': sigmas,
+                        'stepper': stepper,
+                        'denoising_loop_fn': first_stage_denoising_loop,
+                        'components': self.pipeline_components,
+                        'dtype': dtype,
+                        'device': self.device,
+                        'initial_audio_latent': v2a_preserved_audio_latent,
+                        'audio_conditionings': audio_conditionings if audio_conditionings else None,
+                        'audio_noise_scale': audio_noise_scale,
+                    }
+
+                    # Execute with OOM retry
+                    (_, audio_state), block_swap_manager = oom_retry_wrapper(
+                        retry_state=audio_retry_state,
+                        denoising_fn=denoise_audio_video,
+                        transformer=transformer,
+                        generator_instance=self,
+                        block_swap_manager=block_swap_manager,
+                        seed=seed,
+                        **audio_denoising_kwargs
                     )
             else:
                 print(f">>> {stage_label}: Generating at {stage_1_output_shape.width}x{stage_1_output_shape.height}...")
@@ -3580,21 +3778,43 @@ class LTXVideoGeneratorWithOffloading:
                     video_noise_scale = stage_1_sigmas[0]  # Scale initial noise to match sigmas
                     print(f">>> V2V: Scaling sigmas by {refine_strength} to preserve input video (noise_scale={video_noise_scale:.4f})")
 
-                video_state, audio_state = denoise_audio_video(
-                    output_shape=stage_1_output_shape,
-                    conditionings=stage_1_conditionings,
-                    noiser=noiser,
-                    sigmas=stage_1_sigmas,
-                    stepper=stepper,
-                    denoising_loop_fn=first_stage_denoising_loop,
-                    components=self.pipeline_components,
-                    dtype=dtype,
-                    device=self.device,
-                    noise_scale=video_noise_scale,
-                    initial_video_latent=v2v_initial_latent,
-                    initial_audio_latent=v2a_preserved_audio_latent,
-                    audio_conditionings=audio_conditionings if audio_conditionings else None,
-                    audio_noise_scale=audio_noise_scale,
+                # Create retry state for Stage 1
+                stage1_retry_state = OOMRetryState(
+                    stage="stage1",
+                    original_blocks=self.dit_blocks_in_memory if self.enable_dit_block_swap else 0,
+                    current_blocks=self.dit_blocks_in_memory if self.enable_dit_block_swap else 0,
+                    min_blocks=2,  # DiT minimum
+                    original_ffn_chunk_size=self.ffn_chunk_size,
+                    original_activation_offload=self.enable_activation_offload,
+                    original_temporal_chunk_size=self.temporal_chunk_size,
+                )
+
+                denoising_kwargs = {
+                    'output_shape': stage_1_output_shape,
+                    'conditionings': stage_1_conditionings,
+                    'noiser': noiser,
+                    'sigmas': stage_1_sigmas,
+                    'stepper': stepper,
+                    'denoising_loop_fn': first_stage_denoising_loop,
+                    'components': self.pipeline_components,
+                    'dtype': dtype,
+                    'device': self.device,
+                    'noise_scale': video_noise_scale,
+                    'initial_video_latent': v2v_initial_latent,
+                    'initial_audio_latent': v2a_preserved_audio_latent,
+                    'audio_conditionings': audio_conditionings if audio_conditionings else None,
+                    'audio_noise_scale': audio_noise_scale,
+                }
+
+                # Execute with OOM retry
+                (video_state, audio_state), block_swap_manager = oom_retry_wrapper(
+                    retry_state=stage1_retry_state,
+                    denoising_fn=denoise_audio_video,
+                    transformer=transformer,
+                    generator_instance=self,
+                    block_swap_manager=block_swap_manager,
+                    seed=seed,
+                    **denoising_kwargs
                 )
 
             print(f">>> {stage_label} completed in {time.time() - stage1_start:.1f}s", flush=True)
@@ -4146,75 +4366,43 @@ class LTXVideoGeneratorWithOffloading:
         else:
             stage_2_initial_audio = audio_state.latent
 
-        # OOM retry loop - reduces blocks in GPU until denoising succeeds
-        current_blocks = self.refiner_blocks_in_memory
-        min_blocks = 1  # Minimum blocks to try before giving up
-        max_retries = current_blocks - min_blocks + 1  # Maximum retry attempts
+        # Create retry state for Stage 2
+        stage2_retry_state = OOMRetryState(
+            stage="stage2",
+            original_blocks=self.refiner_blocks_in_memory if self.enable_refiner_block_swap else 0,
+            current_blocks=self.refiner_blocks_in_memory if self.enable_refiner_block_swap else 0,
+            min_blocks=1,  # Refiner minimum
+            original_ffn_chunk_size=self.ffn_chunk_size,
+            original_activation_offload=self.enable_activation_offload,
+            original_temporal_chunk_size=self.temporal_chunk_size,
+        )
 
-        for retry_attempt in range(max_retries):
-            try:
-                # Reset generator for reproducibility on retries
-                if retry_attempt > 0:
-                    generator = torch.Generator(device=self.device).manual_seed(seed)
-                    noiser = GaussianNoiser(generator=generator)
+        denoising_kwargs = {
+            'output_shape': stage_2_output_shape,
+            'conditionings': stage_2_conditionings,
+            'noiser': noiser,
+            'sigmas': distilled_sigmas,
+            'stepper': stepper,
+            'denoising_loop_fn': second_stage_denoising_loop,
+            'components': self.pipeline_components,
+            'dtype': dtype,
+            'device': self.device,
+            'noise_scale': distilled_sigmas[0],
+            'initial_video_latent': upscaled_video_latent,
+            'initial_audio_latent': stage_2_initial_audio,
+            'audio_conditionings': audio_conditionings if audio_conditionings else None,
+        }
 
-                video_state, audio_state = denoise_audio_video(
-                    output_shape=stage_2_output_shape,
-                    conditionings=stage_2_conditionings,
-                    noiser=noiser,
-                    sigmas=distilled_sigmas,
-                    stepper=stepper,
-                    denoising_loop_fn=second_stage_denoising_loop,
-                    components=self.pipeline_components,
-                    dtype=dtype,
-                    device=self.device,
-                    noise_scale=distilled_sigmas[0],
-                    initial_video_latent=upscaled_video_latent,
-                    initial_audio_latent=stage_2_initial_audio,
-                    audio_conditionings=audio_conditionings if audio_conditionings else None,
-                )
-                # Success - break out of retry loop
-                break
-
-            except torch.OutOfMemoryError as e:
-                # Check if we can retry with fewer blocks
-                if not block_swap_manager:
-                    print(f">>> OOM Error: Block swapping not enabled, cannot reduce memory usage")
-                    raise
-
-                current_blocks -= 1
-                if current_blocks < min_blocks:
-                    print(f">>> OOM Error: Already at minimum blocks ({min_blocks}), cannot reduce further")
-                    raise
-
-                print(f">>> OOM Error caught! Retrying with {current_blocks} blocks in GPU...")
-
-                # Clear CUDA error state and memory
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                    torch.cuda.empty_cache()
-                gc.collect()
-
-                # Reconfigure block swap with fewer blocks
-                block_swap_manager, current_blocks = reconfigure_block_swap(
-                    transformer,
-                    new_blocks_in_memory=current_blocks,
-                    device=torch.device(self.device),
-                    enable_activation_offload=self.enable_activation_offload,
-                    temporal_chunk_size=self.temporal_chunk_size,
-                )
-
-                if block_swap_manager is None:
-                    print(f">>> Failed to reconfigure block swap, cannot retry")
-                    raise
-
-                # Clear memory again after reconfiguration
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                    torch.cuda.empty_cache()
-                gc.collect()
-
-                print(f">>> Retry attempt {retry_attempt + 1}/{max_retries}...")
+        # Execute with OOM retry
+        (video_state, audio_state), block_swap_manager = oom_retry_wrapper(
+            retry_state=stage2_retry_state,
+            denoising_fn=denoise_audio_video,
+            transformer=transformer,
+            generator_instance=self,
+            block_swap_manager=block_swap_manager,
+            seed=seed,
+            **denoising_kwargs
+        )
 
         print(f">>> Stage 2 completed in {time.time() - stage2_start:.1f}s")
 
@@ -5459,14 +5647,38 @@ def generate_av_extension(
         )
         audio_state = noiser(audio_state, noise_scale=1.0)
 
-    # Run denoising loop with properly masked states
-    final_video_state, final_audio_state = euler_denoising_loop(
-        sigmas=sigmas,
-        video_state=video_state,
-        audio_state=audio_state,
-        stepper=stepper,
-        denoise_fn=denoise_fn,
-        latent_norm_fn=latent_norm_fn,
+    # Create retry state for AV-Extension Stage 1
+    av_stage1_retry_state = OOMRetryState(
+        stage="av_extension_stage1",
+        original_blocks=generator.dit_blocks_in_memory if generator.enable_dit_block_swap else 0,
+        current_blocks=generator.dit_blocks_in_memory if generator.enable_dit_block_swap else 0,
+        min_blocks=2,  # DiT minimum
+        original_ffn_chunk_size=generator.ffn_chunk_size,
+        original_activation_offload=generator.enable_activation_offload,
+        original_temporal_chunk_size=generator.temporal_chunk_size,
+    )
+
+    def av_denoising_call(**kwargs):
+        return euler_denoising_loop(**kwargs)
+
+    av_denoising_kwargs = {
+        'sigmas': sigmas,
+        'video_state': video_state,
+        'audio_state': audio_state,
+        'stepper': stepper,
+        'denoise_fn': denoise_fn,
+        'latent_norm_fn': latent_norm_fn,
+    }
+
+    # Run denoising loop with properly masked states and OOM retry
+    (final_video_state, final_audio_state), block_swap_manager = oom_retry_wrapper(
+        retry_state=av_stage1_retry_state,
+        denoising_fn=av_denoising_call,
+        transformer=transformer,
+        generator_instance=generator,
+        block_swap_manager=block_swap_manager,
+        seed=args.seed,
+        **av_denoising_kwargs
     )
 
     # =========================================================================
@@ -5848,14 +6060,38 @@ def generate_av_extension(
         )
         stage2_audio_state = noiser(stage2_audio_state, noise_scale=stage2_sigmas[0].item())
 
-        # Run stage 2 denoising loop with masked states
-        final_stage2_video, final_stage2_audio = euler_denoising_loop(
-            sigmas=stage2_sigmas,
-            video_state=stage2_video_state,
-            audio_state=stage2_audio_state,
-            stepper=stepper,
-            denoise_fn=stage2_denoise_fn,
-            latent_norm_fn=latent_norm_fn,
+        # Create retry state for AV-Extension Stage 2
+        av_stage2_retry_state = OOMRetryState(
+            stage="av_extension_stage2",
+            original_blocks=generator.refiner_blocks_in_memory if generator.enable_refiner_block_swap else 0,
+            current_blocks=generator.refiner_blocks_in_memory if generator.enable_refiner_block_swap else 0,
+            min_blocks=1,  # Refiner minimum
+            original_ffn_chunk_size=generator.ffn_chunk_size,
+            original_activation_offload=generator.enable_activation_offload,
+            original_temporal_chunk_size=generator.temporal_chunk_size,
+        )
+
+        def av_stage2_denoising_call(**kwargs):
+            return euler_denoising_loop(**kwargs)
+
+        av_stage2_denoising_kwargs = {
+            'sigmas': stage2_sigmas,
+            'video_state': stage2_video_state,
+            'audio_state': stage2_audio_state,
+            'stepper': stepper,
+            'denoise_fn': stage2_denoise_fn,
+            'latent_norm_fn': latent_norm_fn,
+        }
+
+        # Run stage 2 denoising loop with masked states and OOM retry
+        (final_stage2_video, final_stage2_audio), stage2_block_swap_manager = oom_retry_wrapper(
+            retry_state=av_stage2_retry_state,
+            denoising_fn=av_stage2_denoising_call,
+            transformer=stage2_transformer,
+            generator_instance=generator,
+            block_swap_manager=stage2_block_swap_manager,
+            seed=args.seed,
+            **av_stage2_denoising_kwargs
         )
 
         # Unpatchify results
@@ -6775,14 +7011,38 @@ def generate_v2v_join(
         audio_state = dataclass_replace(audio_state, denoise_mask=torch.zeros_like(audio_state.denoise_mask))
         audio_state = noiser(audio_state, noise_scale=1.0)
 
-    # Run denoising loop
-    final_video_state, final_audio_state = euler_denoising_loop(
-        sigmas=sigmas,
-        video_state=video_state,
-        audio_state=audio_state,
-        stepper=stepper,
-        denoise_fn=denoise_fn,
-        latent_norm_fn=latent_norm_fn,
+    # Create retry state for V2V Join Stage 1
+    v2v_join_stage1_retry_state = OOMRetryState(
+        stage="v2v_join_stage1",
+        original_blocks=generator.dit_blocks_in_memory if generator.enable_dit_block_swap else 0,
+        current_blocks=generator.dit_blocks_in_memory if generator.enable_dit_block_swap else 0,
+        min_blocks=2,  # DiT minimum
+        original_ffn_chunk_size=generator.ffn_chunk_size,
+        original_activation_offload=generator.enable_activation_offload,
+        original_temporal_chunk_size=generator.temporal_chunk_size,
+    )
+
+    def v2v_join_denoising_call(**kwargs):
+        return euler_denoising_loop(**kwargs)
+
+    v2v_join_denoising_kwargs = {
+        'sigmas': sigmas,
+        'video_state': video_state,
+        'audio_state': audio_state,
+        'stepper': stepper,
+        'denoise_fn': denoise_fn,
+        'latent_norm_fn': latent_norm_fn,
+    }
+
+    # Run denoising loop with OOM retry
+    (final_video_state, final_audio_state), block_swap_manager = oom_retry_wrapper(
+        retry_state=v2v_join_stage1_retry_state,
+        denoising_fn=v2v_join_denoising_call,
+        transformer=transformer,
+        generator_instance=generator,
+        block_swap_manager=block_swap_manager,
+        seed=args.seed,
+        **v2v_join_denoising_kwargs
     )
 
     # Extract ONLY the generate tokens from final_video_state (matching AV extension pattern)
@@ -7177,14 +7437,38 @@ def generate_v2v_join(
             stage2_audio_state = stage2_audio_tools.create_initial_state(device, dtype, None)
             stage2_audio_state = stage2_noiser(stage2_audio_state, noise_scale=1.0)
 
-        # Run stage 2 denoising
-        final_stage2_video_state, final_stage2_audio = euler_denoising_loop(
-            sigmas=stage2_sigmas,
-            video_state=stage2_video_state,
-            audio_state=stage2_audio_state,
-            stepper=stepper,
-            denoise_fn=stage2_denoise_fn,
-            latent_norm_fn=latent_norm_fn,
+        # Create retry state for V2V Join Stage 2
+        v2v_join_stage2_retry_state = OOMRetryState(
+            stage="v2v_join_stage2",
+            original_blocks=generator.refiner_blocks_in_memory if generator.enable_refiner_block_swap else 0,
+            current_blocks=generator.refiner_blocks_in_memory if generator.enable_refiner_block_swap else 0,
+            min_blocks=1,  # Refiner minimum
+            original_ffn_chunk_size=generator.ffn_chunk_size,
+            original_activation_offload=generator.enable_activation_offload,
+            original_temporal_chunk_size=generator.temporal_chunk_size,
+        )
+
+        def v2v_join_stage2_denoising_call(**kwargs):
+            return euler_denoising_loop(**kwargs)
+
+        v2v_join_stage2_denoising_kwargs = {
+            'sigmas': stage2_sigmas,
+            'video_state': stage2_video_state,
+            'audio_state': stage2_audio_state,
+            'stepper': stepper,
+            'denoise_fn': stage2_denoise_fn,
+            'latent_norm_fn': latent_norm_fn,
+        }
+
+        # Run stage 2 denoising with OOM retry
+        (final_stage2_video_state, final_stage2_audio), stage2_block_swap_manager = oom_retry_wrapper(
+            retry_state=v2v_join_stage2_retry_state,
+            denoising_fn=v2v_join_stage2_denoising_call,
+            transformer=stage2_transformer,
+            generator_instance=generator,
+            block_swap_manager=stage2_block_swap_manager,
+            seed=args.seed,
+            **v2v_join_stage2_denoising_kwargs
         )
 
         final_stage2_video_state = stage2_video_tools.clear_conditioning(final_stage2_video_state)
