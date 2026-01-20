@@ -1170,34 +1170,112 @@ def interpolate_video(
 ) -> Generator[Tuple[Optional[str], str, float], None, None]:
     """
     Unified dispatcher for video frame interpolation.
-    Routes to GIMM-VFI or BiM-VFI based on model type.
+    Runs interpolation in a subprocess for complete VRAM cleanup.
     """
+    if not input_video:
+        yield None, "Error: No input video provided", 0.0
+        return
+
     model_info = GIMM_MODELS.get(model_variant, {})
     model_type = model_info.get("type", "gimm")
 
-    if model_type == "bim":
-        # Use BiM-VFI
-        yield from interpolate_video_bim(
-            input_video=input_video,
-            checkpoint_path=checkpoint_path,
-            interp_factor=interp_factor,
-            pyr_level=pyr_level,
-            output_fps_override=output_fps_override,
-            seed=seed,
+    # Create output path
+    output_dir = "outputs"
+    os.makedirs(output_dir, exist_ok=True)
+    output_filename = f"interpolated_{model_type}_{int(time.time())}.mp4"
+    output_path = os.path.join(output_dir, output_filename)
+
+    # Build subprocess command
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    interp_script = os.path.join(script_dir, "interpolate_video.py")
+
+    command = [
+        sys.executable, interp_script,
+        "--input", input_video,
+        "--output", output_path,
+        "--model-type", model_type,
+        "--variant", model_variant,
+        "--factor", str(int(interp_factor)),
+        "--pyr-level", str(int(pyr_level)),
+        "--ds-scale", str(float(ds_scale)),
+        "--output-fps", str(float(output_fps_override)),
+        "--seed", str(int(seed)),
+    ]
+
+    if checkpoint_path:
+        command.extend(["--checkpoint", checkpoint_path])
+    if config_path:
+        command.extend(["--config", config_path])
+
+    print("\n" + "=" * 80)
+    print("LAUNCHING INTERPOLATION SUBPROCESS:")
+    print(" ".join(command))
+    print("=" * 80 + "\n")
+
+    yield None, "Starting interpolation subprocess...", 0.05
+
+    try:
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env=env
         )
-    else:
-        # Use GIMM-VFI
-        yield from interpolate_video_gimm(
-            input_video=input_video,
-            model_variant=model_variant,
-            checkpoint_path=checkpoint_path,
-            config_path=config_path,
-            interp_factor=interp_factor,
-            ds_scale=ds_scale,
-            output_fps_override=output_fps_override,
-            raft_iters=raft_iters,
-            seed=seed,
-        )
+
+        output_file = None
+        last_status = "Processing..."
+
+        while True:
+            line = process.stdout.readline()
+            if line:
+                line = line.strip()
+                if line:
+                    print(line)
+                    if line.startswith("PROGRESS:"):
+                        last_status = line[9:].strip()
+                        # Try to extract percentage
+                        progress = 0.1
+                        if "%" in last_status:
+                            try:
+                                pct = int(last_status.split("(")[1].split("%")[0])
+                                progress = 0.1 + (pct / 100) * 0.8
+                            except:
+                                pass
+                        yield None, last_status, progress
+                    elif line.startswith("OUTPUT:"):
+                        output_file = line[7:].strip()
+                    elif line.startswith("ERROR:"):
+                        yield None, line[6:].strip(), 0.0
+                        return
+
+            if process.poll() is not None:
+                # Read remaining output
+                for line in process.stdout:
+                    line = line.strip()
+                    if line:
+                        print(line)
+                        if line.startswith("OUTPUT:"):
+                            output_file = line[7:].strip()
+                        elif line.startswith("ERROR:"):
+                            yield None, line[6:].strip(), 0.0
+                            return
+                break
+
+        return_code = process.returncode
+
+        if return_code == 0 and output_file and os.path.exists(output_file):
+            yield output_file, f"Done! Output saved to {output_file}", 1.0
+        else:
+            yield None, f"Interpolation failed (exit code {return_code})", 0.0
+
+    except Exception as e:
+        yield None, f"Error: {str(e)}", 0.0
+        import traceback
+        traceback.print_exc()
 
 
 # =============================================================================

@@ -5337,7 +5337,23 @@ def generate_av_extension(
     print(">>> Running masked denoising...")
 
     # 7A: Load text encoder FIRST and encode prompts (before transformer!)
-    text_encoder = generator.stage_1_model_ledger.text_encoder()
+    text_encoder_block_swap = None
+    if generator.enable_text_encoder_block_swap:
+        # Load text encoder to CPU first for block swapping
+        original_device = generator.stage_1_model_ledger.device
+        generator.stage_1_model_ledger.device = torch.device("cpu")
+        text_encoder = generator.stage_1_model_ledger.text_encoder()
+        generator.stage_1_model_ledger.device = original_device
+
+        # Enable block swap for text encoder
+        print(f">>> Enabling text encoder block swap ({generator.text_encoder_blocks_in_memory} layers in GPU)...", flush=True)
+        text_encoder_block_swap = enable_text_encoder_block_swap(
+            text_encoder,
+            blocks_in_memory=generator.text_encoder_blocks_in_memory,
+            device=device,
+        )
+    else:
+        text_encoder = generator.stage_1_model_ledger.text_encoder()
     print(">>> Encoding prompts...")
     if args.cfg_guidance_scale > 1.0:
         context_p, context_n = encode_text(text_encoder, prompts=[args.prompt, args.negative_prompt])
