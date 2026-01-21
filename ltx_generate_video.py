@@ -5126,9 +5126,16 @@ def generate_av_extension(
     stage1_height = (stage1_height // 32) * 32
 
     # Load frames from input video
+    # Calculate frames to load (up to start_time + buffer), ensuring 8n+1 format
+    frames_to_load = min(total_frames, int(start_time * input_fps) + 16)
+    # Round up to nearest 8n+1
+    n_frames = max(1, (frames_to_load - 1 + 7) // 8)
+    frames_to_load = 8 * n_frames + 1
+    frames_to_load = min(frames_to_load, total_frames)
+
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     input_frames = []
-    for _ in range(min(total_frames, int(start_time * input_fps) + 16)):  # Load up to start_time + some buffer
+    for _ in range(frames_to_load):
         ret, frame = cap.read()
         if not ret:
             break
@@ -5137,6 +5144,13 @@ def generate_av_extension(
         frame = cv2.resize(frame, (stage1_width, stage1_height), interpolation=cv2.INTER_LANCZOS4)
         input_frames.append(frame)
     cap.release()
+
+    # Ensure loaded frames is 8n+1 (pad with last frame if needed)
+    if len(input_frames) > 1:
+        n_loaded = (len(input_frames) - 1 + 7) // 8
+        target_loaded = 8 * n_loaded + 1
+        while len(input_frames) < target_loaded:
+            input_frames.append(input_frames[-1])
 
     print(f">>> Loaded {len(input_frames)} frames, resized to {stage1_width}x{stage1_height}")
 
@@ -5195,15 +5209,23 @@ def generate_av_extension(
             end_frame = min(start_frame + chunk_pixel_frames, total_pixel_frames)
             actual_frames = end_frame - start_frame
 
-            # Ensure we have at least 9 frames (minimum for VAE)
-            if actual_frames < 9:
-                # Pad with last frame
-                pad_frames = 9 - actual_frames
-                chunk = video_input[:, :, start_frame:end_frame, :, :]
-                last_frame = chunk[:, :, -1:, :, :].expand(-1, -1, pad_frames, -1, -1)
-                chunk = torch.cat([chunk, last_frame], dim=2)
-            else:
-                chunk = video_input[:, :, start_frame:end_frame, :, :]
+            # Ensure chunk has valid 8n+1 frame count for VAE
+            # Valid counts: 1, 9, 17, 25, 33, 41, 49, 57, 65, ...
+            chunk = video_input[:, :, start_frame:end_frame, :, :]
+
+            if actual_frames > 1:
+                # Calculate nearest valid 8n+1 frame count (round up)
+                n = (actual_frames - 1 + 7) // 8  # Round up to next valid count
+                target_frames = 8 * n + 1
+
+                if actual_frames < target_frames:
+                    # Pad with last frame to reach target
+                    pad_frames = target_frames - actual_frames
+                    last_frame = chunk[:, :, -1:, :, :].expand(-1, -1, pad_frames, -1, -1)
+                    chunk = torch.cat([chunk, last_frame], dim=2)
+                elif actual_frames > target_frames:
+                    # This shouldn't happen with round up, but trim if needed
+                    chunk = chunk[:, :, :target_frames, :, :]
 
             # Encode chunk
             chunk_latent = video_encoder(chunk.to(device=device, dtype=encoder_dtype))
