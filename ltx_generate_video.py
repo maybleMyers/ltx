@@ -5034,6 +5034,9 @@ def generate_av_extension(
     device = generator.device
     dtype = generator.dtype
 
+    # Save original video path before any trimming (for quality preservation)
+    original_input_video_path = input_video_path
+
     print("=" * 60)
     print("AV Extension Mode (Time-Based Audio-Video Masking)")
     print("=" * 60)
@@ -6190,6 +6193,50 @@ def generate_av_extension(
     del video_decoder, decoded_video_chunks
     cleanup_memory()
 
+    # =========================================================================
+    # Step 10.5: Replace preserved frames with original pixels (bypass VAE quality loss)
+    # =========================================================================
+    preserve_pixel_frames = int(start_time * output_fps)
+    if preserve_pixel_frames > 0:
+        print(f">>> Replacing {preserve_pixel_frames} preserved frames with original pixels...")
+
+        # Get output resolution from decoded video
+        out_h, out_w = decoded_video.shape[1], decoded_video.shape[2]
+
+        # Load original video frames at output resolution and fps
+        import numpy as np
+        cap_orig = cv2.VideoCapture(original_input_video_path)
+        if cap_orig.isOpened():
+            orig_fps = cap_orig.get(cv2.CAP_PROP_FPS)
+            orig_total = int(cap_orig.get(cv2.CAP_PROP_FRAME_COUNT))
+
+            # Read and resample frames to match output fps
+            original_frames = []
+            for out_frame_idx in range(preserve_pixel_frames):
+                # Map output frame index to input frame index based on fps ratio
+                in_frame_idx = int(out_frame_idx * orig_fps / output_fps)
+                in_frame_idx = min(in_frame_idx, orig_total - 1)
+
+                cap_orig.set(cv2.CAP_PROP_POS_FRAMES, in_frame_idx)
+                ret, frame = cap_orig.read()
+                if ret:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_LANCZOS4)
+                    original_frames.append(frame)
+                else:
+                    break
+            cap_orig.release()
+
+            if len(original_frames) > 0:
+                # Convert to tensor [F, H, W, C] normalized to [0, 1]
+                original_pixels = torch.from_numpy(np.stack(original_frames)).float() / 255.0
+                # Replace preserved frames
+                num_replace = min(len(original_frames), preserve_pixel_frames, decoded_video.shape[0])
+                decoded_video[:num_replace] = original_pixels[:num_replace]
+                print(f">>> Replaced {num_replace} frames with original quality pixels")
+        else:
+            print(f">>> Warning: Could not open original video for frame preservation")
+
     # Decode audio if present
     decoded_audio = None
     if denoised_audio_latent is not None:
@@ -6203,6 +6250,36 @@ def generate_av_extension(
         )
         del audio_decoder, vocoder
         cleanup_memory()
+
+    # =========================================================================
+    # Step 10.7: Replace preserved audio with original audio (bypass VAE quality loss)
+    # =========================================================================
+    if decoded_audio is not None and audio_waveform is not None and start_time > 0:
+        # Use original sample rate or default to 24000
+        sr = audio_sample_rate if audio_sample_rate is not None else 24000
+        preserve_audio_samples = int(start_time * sr)
+
+        if preserve_audio_samples > 0:
+            print(f">>> Replacing {preserve_audio_samples} preserved audio samples with original...")
+
+            # Get the number of samples to replace (min of original, decoded, and preserve target)
+            orig_samples = audio_waveform.shape[-1] if audio_waveform.dim() > 0 else 0
+            decoded_samples = decoded_audio.shape[-1] if decoded_audio.dim() > 0 else 0
+            num_replace = min(preserve_audio_samples, orig_samples, decoded_samples)
+
+            if num_replace > 0:
+                # Handle both 1D and 2D audio tensors
+                if decoded_audio.dim() == 1 and audio_waveform.dim() == 1:
+                    decoded_audio[:num_replace] = audio_waveform[:num_replace]
+                elif decoded_audio.dim() == 2 and audio_waveform.dim() == 2:
+                    decoded_audio[:, :num_replace] = audio_waveform[:, :num_replace]
+                elif decoded_audio.dim() == 1 and audio_waveform.dim() == 2:
+                    # Original is stereo, decoded is mono - use first channel
+                    decoded_audio[:num_replace] = audio_waveform[0, :num_replace]
+                elif decoded_audio.dim() == 2 and audio_waveform.dim() == 1:
+                    # Original is mono, decoded is stereo - broadcast
+                    decoded_audio[:, :num_replace] = audio_waveform[:num_replace].unsqueeze(0)
+                print(f">>> Replaced {num_replace} audio samples with original quality")
 
     print(f">>> Output video shape: {decoded_video.shape}")
     if decoded_audio is not None:
