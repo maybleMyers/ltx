@@ -673,15 +673,9 @@ class VideoConditionByMotionLatent:
         motion_latent = self.motion_latent.to(device=device, dtype=dtype)
         num_motion_frames = motion_latent.shape[2]
 
-        # Position motion frames at the END of the temporal sequence
-        # This provides "where we're going" context for motion continuity
         for i in range(num_motion_frames):
-            # Extract single latent frame: [1, C, 1, H, W]
             frame_latent = motion_latent[:, :, i:i+1, :, :]
-
-            # Frame index at end: num_frames - num_motion_frames + i
-            # Convert to pixel frame index for VideoConditionByKeyframeIndex
-            frame_idx = num_frames - num_motion_frames + i + self.frame_offset
+            frame_idx = i + self.frame_offset
 
             conditionings.append(
                 VideoConditionByKeyframeIndex(
@@ -3107,21 +3101,52 @@ class LTXVideoGeneratorWithOffloading:
                 if hasattr(transformer.velocity_model, "av_ca_v2a_gate_adaln_single"):
                     transformer.velocity_model.av_ca_v2a_gate_adaln_single.to(self.device)
 
-                # Use activation offload for extreme memory savings (moves activations to CPU between blocks)
-                if self.enable_activation_offload:
-                    block_swap_manager = enable_block_swap_with_activation_offload(
-                        transformer,
-                        blocks_in_memory=self.dit_blocks_in_memory,
-                        device=self.device,
-                        verbose=True,
-                        temporal_chunk_size=self.temporal_chunk_size,
-                    )
-                else:
-                    block_swap_manager = enable_block_swap(
-                        transformer,
-                        blocks_in_memory=self.dit_blocks_in_memory,
-                        device=self.device,
-                    )
+                # Try to enable block swap with OOM retry (reduce blocks if needed)
+                current_blocks = self.dit_blocks_in_memory
+                min_blocks = 1
+                block_swap_manager = None
+                use_activation_offload = self.enable_activation_offload
+
+                while current_blocks >= min_blocks:
+                    try:
+                        if use_activation_offload:
+                            block_swap_manager = enable_block_swap_with_activation_offload(
+                                transformer,
+                                blocks_in_memory=current_blocks,
+                                device=self.device,
+                                verbose=True,
+                                temporal_chunk_size=self.temporal_chunk_size,
+                            )
+                        else:
+                            block_swap_manager = enable_block_swap(
+                                transformer,
+                                blocks_in_memory=current_blocks,
+                                device=self.device,
+                            )
+                        # Update instance variable for later retry logic
+                        self.dit_blocks_in_memory = current_blocks
+                        break
+                    except torch.OutOfMemoryError:
+                        current_blocks -= 1
+                        if current_blocks < min_blocks:
+                            if not use_activation_offload:
+                                # Fall back to activation offload as last resort
+                                print(f">>> OOM at minimum blocks, enabling activation offload...")
+                                use_activation_offload = True
+                                current_blocks = self.dit_blocks_in_memory  # reset blocks
+                                if torch.cuda.is_available():
+                                    torch.cuda.synchronize()
+                                    torch.cuda.empty_cache()
+                                gc.collect()
+                                continue
+                            else:
+                                print(f">>> OOM Error during block swap setup: Already at minimum blocks ({min_blocks}) with activation offload")
+                                raise
+                        print(f">>> OOM during enable_block_swap! Retrying with {current_blocks} blocks...")
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                            torch.cuda.empty_cache()
+                        gc.collect()
             else:
                 transformer = self.stage_1_model_ledger.transformer()
 
@@ -3374,7 +3399,7 @@ class LTXVideoGeneratorWithOffloading:
                             chunk_conditionings.append(
                                 VideoConditionByKeyframeIndex(
                                     keyframes=encoded_tile.cpu(),
-                                    frame_idx=cond_frame_idx,
+                                    frame_idx=0,
                                     strength=refine_strength,
                                 )
                             )

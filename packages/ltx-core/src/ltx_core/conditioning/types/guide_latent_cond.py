@@ -36,7 +36,7 @@ class VideoConditionByGuideLatent(ConditioningItem):
         positions = get_pixel_coords(
             latent_coords=latent_coords,
             scale_factors=latent_tools.scale_factors,
-            causal_fix=False,  # No causal fix for guides
+            causal_fix=latent_tools.causal_fix if self.frame_idx == 0 else False,
         )
 
         positions[:, 0, ...] += self.frame_idx
