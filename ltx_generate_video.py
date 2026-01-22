@@ -6232,22 +6232,33 @@ def generate_av_extension(
             orig_fps = cap_orig.get(cv2.CAP_PROP_FPS)
             orig_total = int(cap_orig.get(cv2.CAP_PROP_FRAME_COUNT))
 
-            # Read and resample frames to match output fps
+            # Calculate max input frame needed
+            max_in_frame = int((preserve_pixel_frames - 1) * orig_fps / output_fps)
+            max_in_frame = min(max_in_frame, orig_total - 1)
+
+            # Read frames sequentially (much faster than seeking)
+            print(f">>>   Loading {max_in_frame + 1} source frames...")
+            input_frames = []
+            for i in range(max_in_frame + 1):
+                ret, frame = cap_orig.read()
+                if not ret:
+                    break
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+                input_frames.append(frame)
+                if (i + 1) % 100 == 0:
+                    print(f">>>   Loaded {i + 1}/{max_in_frame + 1} frames...")
+            cap_orig.release()
+
+            # Map to output fps (select/duplicate frames as needed)
             original_frames = []
             for out_frame_idx in range(preserve_pixel_frames):
-                # Map output frame index to input frame index based on fps ratio
                 in_frame_idx = int(out_frame_idx * orig_fps / output_fps)
-                in_frame_idx = min(in_frame_idx, orig_total - 1)
+                in_frame_idx = min(in_frame_idx, len(input_frames) - 1)
+                if in_frame_idx < len(input_frames):
+                    original_frames.append(input_frames[in_frame_idx])
 
-                cap_orig.set(cv2.CAP_PROP_POS_FRAMES, in_frame_idx)
-                ret, frame = cap_orig.read()
-                if ret:
-                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_LANCZOS4)
-                    original_frames.append(frame)
-                else:
-                    break
-            cap_orig.release()
+            del input_frames  # Free memory
 
             if len(original_frames) > 0:
                 # Convert to tensor [F, H, W, C] as uint8 [0-255] to match decoded video format
