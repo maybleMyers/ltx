@@ -5854,6 +5854,10 @@ def generate_av_extension(
         cap_full.set(cv2.CAP_PROP_POS_FRAMES, 0)
         full_res_frames = []
         frames_to_load = min(int(cap_full.get(cv2.CAP_PROP_FRAME_COUNT)), int(start_time * input_fps) + 16)
+        # Round to nearest 8n+1 format for VAE compatibility
+        n_frames_full = max(1, (frames_to_load - 1 + 7) // 8)
+        frames_to_load = 8 * n_frames_full + 1
+        frames_to_load = min(frames_to_load, int(cap_full.get(cv2.CAP_PROP_FRAME_COUNT)))
         for _ in range(frames_to_load):
             ret, frame = cap_full.read()
             if not ret:
