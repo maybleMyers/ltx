@@ -75,7 +75,9 @@ from ltx_pipelines.utils.helpers import (
     euler_denoising_loop,
     guider_denoising_func,
     simple_denoising_func,
+    noise_video_state,
 )
+from dataclasses import replace as dataclass_replace
 from ltx_pipelines.utils.media_io import decode_audio_from_file, encode_video
 from ltx_pipelines.utils.types import PipelineComponents
 
@@ -289,6 +291,10 @@ def extend_video(
     # Step 5: Encode audio to latent (if present)
     # =========================================================================
     preserved_audio_latent = None
+    extended_audio_latent = None
+    audio_mask = None
+    audio_latents_per_second = None
+    original_audio_latent_frames = 0
     if audio_waveform is not None:
         print(">>> Encoding audio to latent space...")
         audio_encoder = generator.stage_1_model_ledger.audio_encoder()
@@ -317,24 +323,39 @@ def extend_video(
 
         print(f">>> Audio latent: {preserved_audio_latent.shape}")
 
-        # Pad audio latent to match extended output duration
-        # Audio latent temporal dimension needs to match output duration
-        # Audio encoder produces ~25 frames/second (AUDIO_SAMPLE_RATE / hop_length / temporal_compression)
-        # Typical: 24000 / 160 / 4 = 37.5, but actual rate from encoder may vary
-        # Use the audio encoder's actual parameters for accurate calculation
+        # Calculate audio latent timing
+        # Audio encoder produces latents at: sample_rate / hop_length / temporal_compression
         audio_latents_per_second = audio_encoder.sample_rate / audio_encoder.mel_hop_length / 4
+        original_audio_latent_frames = preserved_audio_latent.shape[2]
         output_audio_frames = int(output_duration * audio_latents_per_second)
 
-        if preserved_audio_latent.shape[2] < output_audio_frames:
-            pad_frames = output_audio_frames - preserved_audio_latent.shape[2]
-            pad = torch.zeros(
+        # Create extended audio latent: [original_audio | zeros_for_extension]
+        # The zeros will be replaced with noise, and the model will generate continuation
+        if original_audio_latent_frames < output_audio_frames:
+            extended_audio_latent = torch.zeros(
                 (preserved_audio_latent.shape[0], preserved_audio_latent.shape[1],
-                 pad_frames, preserved_audio_latent.shape[3]),
+                 output_audio_frames, preserved_audio_latent.shape[3]),
                 device=preserved_audio_latent.device,
                 dtype=preserved_audio_latent.dtype,
             )
-            preserved_audio_latent = torch.cat([preserved_audio_latent, pad], dim=2)
-            print(f">>> Padded audio latent to {preserved_audio_latent.shape} ({pad_frames} frames added for extension)")
+            # Copy original audio into the beginning
+            extended_audio_latent[:, :, :original_audio_latent_frames, :] = preserved_audio_latent
+            print(f">>> Extended audio latent: {extended_audio_latent.shape} "
+                  f"(original: {original_audio_latent_frames}, generate: {output_audio_frames - original_audio_latent_frames})")
+        else:
+            extended_audio_latent = preserved_audio_latent
+            print(f">>> Audio latent already covers output duration")
+
+        # Create audio mask: 0 = preserve (original audio), 1 = generate (extension)
+        # Shape: [B, 1, T, 1] to match audio latent [B, C, T, mel_bins]
+        audio_mask = torch.zeros(
+            (extended_audio_latent.shape[0], 1, output_audio_frames, 1),
+            device=extended_audio_latent.device,
+            dtype=torch.float32,
+        )
+        # Set mask=1 for frames that need to be generated (after original audio)
+        audio_mask[:, :, original_audio_latent_frames:, :] = 1.0
+        print(f">>> Audio mask: preserve 0-{original_audio_latent_frames}, generate {original_audio_latent_frames}-{output_audio_frames}")
 
         del audio_encoder, audio_processor
         cleanup_memory()
@@ -398,16 +419,6 @@ def extend_video(
         )
 
     print(f">>> Added {len(stage_1_conditionings)} frame conditionings (strength={preserve_strength})")
-
-    # Audio handling for extension:
-    # DO NOT use AudioConditionByLatent - it sets denoise_mask=0 for ALL tokens,
-    # which prevents generation of new audio for the extended portion.
-    # Instead, let the model generate audio freely for the entire duration,
-    # then replace the preserved portion with original audio after decoding.
-    # This matches how the normal pipeline handles audio in extension mode.
-    audio_conditionings = []
-    if preserved_audio_latent is not None:
-        print(f">>> Audio: Model will generate full audio, preserved portion replaced after decode")
 
     # =========================================================================
     # Step 8: Load transformer and run Stage 1 denoising
@@ -530,30 +541,60 @@ def extend_video(
     else:
         denoise_fn = simple_denoising_func(v_context_p, a_context_p, transformer)
 
-    def stage1_denoising_loop(
-        sigmas: torch.Tensor,
-        video_state: LatentState,
-        audio_state: LatentState,
-        stepper: DiffusionStepProtocol,
-        preview_tools=None,
-        mask_context=None,
-    ) -> tuple[LatentState, LatentState]:
-        return euler_denoising_loop(
-            sigmas=sigmas,
-            video_state=video_state,
-            audio_state=audio_state,
-            stepper=stepper,
-            denoise_fn=denoise_fn,
-        )
-
-    # Run Stage 1 denoising using denoise_audio_video (Wan2GP pattern)
-    # This function:
-    # 1. Creates initial state with output shape
-    # 2. Applies conditionings (sets latent, clean_latent, denoise_mask)
-    # 3. Runs noiser (adds noise only where mask > 0)
-    # 4. Runs denoising loop (post_process_latent blends with clean_latent)
+    # =========================================================================
+    # Create video and audio states with proper masks for extension
+    # =========================================================================
     print(f">>> Stage 1 denoising ({len(sigmas) - 1} steps)...")
 
+    # Create video state using noise_video_state (handles video conditionings)
+    video_state, video_tools = noise_video_state(
+        output_shape=stage_1_output_shape,
+        noiser=noiser,
+        conditionings=stage_1_conditionings,
+        components=generator.pipeline_components,
+        dtype=dtype,
+        device=device,
+        noise_scale=1.0,
+        initial_latent=None,
+    )
+
+    # Create audio state manually with proper mask for extension
+    # This is the key difference from AudioConditionByLatent:
+    # - Mask=0 for preserved frames (keep original audio, no noise)
+    # - Mask=1 for extended frames (add noise, generate new audio)
+    # The model sees original audio as context and generates continuation
+    if extended_audio_latent is not None:
+        audio_latent_shape = AudioLatentShape.from_torch_shape(extended_audio_latent.shape)
+        audio_tools = AudioLatentTools(
+            patchifier=generator.pipeline_components.audio_patchifier,
+            target_shape=audio_latent_shape,
+        )
+        # Create initial state with the extended audio latent (original + zeros)
+        audio_state = audio_tools.create_initial_state(device, dtype, extended_audio_latent)
+        # Patchify and apply the audio mask
+        patchified_audio_mask = audio_tools.patchifier.patchify(audio_mask.to(device=device))
+        audio_state = dataclass_replace(
+            audio_state,
+            denoise_mask=patchified_audio_mask.to(dtype=torch.float32),
+        )
+        # Add noise only where mask=1 (extended frames)
+        audio_state = noiser(audio_state, noise_scale=1.0)
+        print(f">>> Audio state: mask preserves {original_audio_latent_frames} frames, generates rest")
+    else:
+        # No audio - create empty audio state
+        audio_latent_shape = AudioLatentShape.from_video_pixel_shape(shape=stage_1_output_shape)
+        audio_tools = AudioLatentTools(
+            patchifier=generator.pipeline_components.audio_patchifier,
+            target_shape=audio_latent_shape,
+        )
+        audio_state = audio_tools.create_initial_state(device, dtype, None)
+        audio_state = dataclass_replace(
+            audio_state,
+            denoise_mask=torch.zeros_like(audio_state.denoise_mask),
+        )
+        audio_state = noiser(audio_state, noise_scale=1.0)
+
+    # Run denoising loop directly
     stage1_retry_state = OOMRetryState(
         stage="stage1_extension",
         original_blocks=generator.dit_blocks_in_memory if generator.enable_dit_block_swap else 0,
@@ -565,19 +606,14 @@ def extend_video(
     )
 
     def stage1_denoise_call(**kwargs):
-        return denoise_audio_video(**kwargs)
+        return euler_denoising_loop(**kwargs)
 
     stage1_kwargs = {
-        'output_shape': stage_1_output_shape,
-        'conditionings': stage_1_conditionings,
-        'audio_conditionings': audio_conditionings if audio_conditionings else None,
-        'noiser': noiser,
         'sigmas': sigmas,
+        'video_state': video_state,
+        'audio_state': audio_state,
         'stepper': stepper,
-        'denoising_loop_fn': stage1_denoising_loop,
-        'components': generator.pipeline_components,
-        'dtype': dtype,
-        'device': device,
+        'denoise_fn': denoise_fn,
     }
 
     (video_state, audio_state), block_swap_manager = oom_retry_wrapper(
@@ -592,6 +628,12 @@ def extend_video(
 
     if video_state is None:
         raise RuntimeError("Stage 1 denoising failed")
+
+    # Clear conditioning and unpatchify
+    video_state = video_tools.clear_conditioning(video_state)
+    video_state = video_tools.unpatchify(video_state)
+    audio_state = audio_tools.clear_conditioning(audio_state)
+    audio_state = audio_tools.unpatchify(audio_state)
 
     # Cleanup stage 1 transformer
     if block_swap_manager is not None:
