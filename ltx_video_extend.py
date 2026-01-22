@@ -399,15 +399,15 @@ def extend_video(
 
     print(f">>> Added {len(stage_1_conditionings)} frame conditionings (strength={preserve_strength})")
 
-    # Audio conditioning (if present)
+    # Audio handling for extension:
+    # DO NOT use AudioConditionByLatent - it sets denoise_mask=0 for ALL tokens,
+    # which prevents generation of new audio for the extended portion.
+    # Instead, let the model generate audio freely for the entire duration,
+    # then replace the preserved portion with original audio after decoding.
+    # This matches how the normal pipeline handles audio in extension mode.
     audio_conditionings = []
     if preserved_audio_latent is not None:
-        audio_conditionings.append(
-            AudioConditionByLatent(
-                latent=preserved_audio_latent,
-                strength=preserve_strength,
-            )
-        )
+        print(f">>> Audio: Model will generate full audio, preserved portion replaced after decode")
 
     # =========================================================================
     # Step 8: Load transformer and run Stage 1 denoising
@@ -901,6 +901,36 @@ def extend_video(
         decoded_audio = vae_decode_audio(denoised_audio_latent, audio_decoder, vocoder)
         del audio_decoder, vocoder
         cleanup_memory()
+
+        # Replace preserved audio with original audio (bypass VAE quality loss)
+        # This is critical - the audio VAE causes quality degradation, so we
+        # replace the preserved portion with the original audio waveform
+        if audio_waveform is not None:
+            sr = audio_sample_rate if audio_sample_rate is not None else AUDIO_SAMPLE_RATE
+            preserve_audio_samples = int(input_duration * sr)
+
+            if preserve_audio_samples > 0:
+                print(f">>> Replacing {preserve_audio_samples} preserved audio samples with original...")
+
+                # Get the number of samples to replace
+                orig_audio = audio_waveform.squeeze(0) if audio_waveform.dim() == 3 else audio_waveform
+                orig_samples = orig_audio.shape[-1] if orig_audio.dim() > 0 else 0
+                decoded_samples = decoded_audio.shape[-1] if decoded_audio.dim() > 0 else 0
+                num_replace = min(preserve_audio_samples, orig_samples, decoded_samples)
+
+                if num_replace > 0:
+                    # Handle different tensor dimensions
+                    if decoded_audio.dim() == 1 and orig_audio.dim() == 1:
+                        decoded_audio[:num_replace] = orig_audio[:num_replace]
+                    elif decoded_audio.dim() == 2 and orig_audio.dim() == 2:
+                        decoded_audio[:, :num_replace] = orig_audio[:, :num_replace]
+                    elif decoded_audio.dim() == 1 and orig_audio.dim() == 2:
+                        # Original is stereo, decoded is mono - use first channel
+                        decoded_audio[:num_replace] = orig_audio[0, :num_replace]
+                    elif decoded_audio.dim() == 2 and orig_audio.dim() == 1:
+                        # Original is mono, decoded is stereo - broadcast
+                        decoded_audio[:, :num_replace] = orig_audio[:num_replace].unsqueeze(0)
+                    print(f">>> Replaced {num_replace} audio samples with original quality")
 
     print(f">>> Done! Output: {decoded_video.shape}")
 
