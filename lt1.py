@@ -1802,6 +1802,205 @@ def stop_generation():
 
 
 # =============================================================================
+# Video Extension (Wan2GP-style)
+# =============================================================================
+
+def generate_extension_video(
+    # Extension-specific parameters
+    ext_input_video: str,
+    ext_prompt: str,
+    ext_negative_prompt: str,
+    ext_extend_seconds: float,
+    ext_seed: int,
+    ext_steps: int,
+    ext_cfg: float,
+    ext_preserve_strength: float,
+    ext_skip_stage2: bool,
+    # Model paths
+    ext_checkpoint_path: str,
+    ext_distilled_checkpoint: bool,
+    ext_gemma_root: str,
+    ext_spatial_upsampler_path: str,
+    ext_vae_path: str,
+    ext_distilled_lora_path: str,
+    ext_distilled_lora_strength: float,
+    # Memory optimization
+    ext_offload: bool,
+    ext_enable_fp8: bool,
+    ext_enable_dit_block_swap: bool,
+    ext_dit_blocks_in_memory: int,
+    ext_enable_text_encoder_block_swap: bool,
+    ext_text_encoder_blocks_in_memory: int,
+    ext_enable_refiner_block_swap: bool,
+    ext_refiner_blocks_in_memory: int,
+    ext_enable_activation_offload: bool,
+    # LoRA
+    ext_lora_folder: str,
+    ext_user_lora_1: str,
+    ext_user_lora_strength_1: float,
+    ext_user_lora_stage_1: str,
+    ext_user_lora_2: str,
+    ext_user_lora_strength_2: float,
+    ext_user_lora_stage_2: str,
+    ext_user_lora_3: str,
+    ext_user_lora_strength_3: float,
+    ext_user_lora_stage_3: str,
+    ext_user_lora_4: str,
+    ext_user_lora_strength_4: float,
+    ext_user_lora_stage_4: str,
+    # Output
+    ext_save_path: str,
+) -> Generator[Tuple[list, str, str], None, None]:
+    """Generate video extension using Wan2GP-style conditioning approach."""
+    global current_process, current_output_filename, stop_event
+
+    stop_event.clear()
+
+    # Validate input video
+    if not ext_input_video:
+        yield [], "Error: No input video provided", ""
+        return
+
+    if not os.path.exists(ext_input_video):
+        yield [], f"Error: Input video not found: {ext_input_video}", ""
+        return
+
+    # Validate prompt
+    if not ext_prompt or not ext_prompt.strip():
+        yield [], "Error: Prompt is required", ""
+        return
+
+    # Generate random seed if -1
+    if ext_seed == -1:
+        ext_seed = random.randint(0, 2147483647)
+
+    # Create output directory
+    os.makedirs(ext_save_path, exist_ok=True)
+
+    # Generate output filename
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    safe_prompt = re.sub(r'[^\w\s-]', '', ext_prompt[:30]).strip().replace(' ', '_')
+    output_filename = f"ext_{timestamp}_{safe_prompt}_{ext_seed}.mp4"
+    output_path = os.path.join(ext_save_path, output_filename)
+    current_output_filename = output_path
+
+    # Build command for ltx_video_extend.py
+    command = [
+        sys.executable, "ltx_video_extend.py",
+        "--input", ext_input_video,
+        "--output", output_path,
+        "--prompt", ext_prompt,
+        "--extend-seconds", str(ext_extend_seconds),
+        "--seed", str(ext_seed),
+        "--steps", str(ext_steps),
+        "--cfg", str(ext_cfg),
+        "--preserve-strength", str(ext_preserve_strength),
+    ]
+
+    # Add negative prompt if provided
+    if ext_negative_prompt and ext_negative_prompt.strip():
+        command.extend(["--negative-prompt", ext_negative_prompt])
+
+    # Model paths
+    if ext_checkpoint_path:
+        command.extend(["--checkpoint", ext_checkpoint_path])
+    if ext_gemma_root:
+        command.extend(["--gemma-root", ext_gemma_root])
+    if ext_spatial_upsampler_path:
+        command.extend(["--spatial-upsampler", ext_spatial_upsampler_path])
+
+    # Distilled LoRA (only if not using distilled checkpoint)
+    if not ext_distilled_checkpoint and ext_distilled_lora_path and ext_distilled_lora_path.strip() and os.path.exists(ext_distilled_lora_path):
+        command.extend(["--distilled-lora", ext_distilled_lora_path])
+
+    # Skip stage 2
+    if ext_skip_stage2:
+        command.append("--skip-stage2")
+
+    # Memory optimization
+    if ext_enable_dit_block_swap:
+        command.append("--dit-block-swap")
+        command.extend(["--dit-blocks", str(ext_dit_blocks_in_memory)])
+
+    if ext_enable_text_encoder_block_swap:
+        command.append("--text-encoder-block-swap")
+        command.extend(["--text-encoder-blocks", str(ext_text_encoder_blocks_in_memory)])
+
+    if ext_enable_refiner_block_swap:
+        command.append("--refiner-block-swap")
+        command.extend(["--refiner-blocks", str(ext_refiner_blocks_in_memory)])
+
+    if ext_enable_activation_offload:
+        command.append("--activation-offload")
+
+    # User LoRAs
+    lora_configs = [
+        (ext_user_lora_1, ext_user_lora_strength_1, ext_user_lora_stage_1),
+        (ext_user_lora_2, ext_user_lora_strength_2, ext_user_lora_stage_2),
+        (ext_user_lora_3, ext_user_lora_strength_3, ext_user_lora_stage_3),
+        (ext_user_lora_4, ext_user_lora_strength_4, ext_user_lora_stage_4),
+    ]
+    for user_lora, user_lora_strength, user_lora_stage in lora_configs:
+        if user_lora and user_lora != "None" and ext_lora_folder:
+            lora_path = os.path.join(ext_lora_folder, user_lora)
+            if os.path.exists(lora_path):
+                if user_lora_stage == "Stage 1 (Base)":
+                    command.extend(["--lora", lora_path, str(user_lora_strength)])
+                elif user_lora_stage == "Stage 2 (Refine)":
+                    command.extend(["--stage2-lora", lora_path, str(user_lora_strength)])
+                else:  # Both
+                    command.extend(["--lora", lora_path, str(user_lora_strength)])
+                    command.extend(["--stage2-lora", lora_path, str(user_lora_strength)])
+
+    yield [], "Starting video extension...", f"Command: {' '.join(command[:10])}..."
+
+    try:
+        # Start the subprocess
+        current_process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            universal_newlines=True
+        )
+
+        last_progress = "Starting..."
+        output_lines = []
+
+        # Stream output
+        for line in iter(current_process.stdout.readline, ''):
+            if stop_event.is_set():
+                current_process.terminate()
+                yield [], "Generation stopped by user", last_progress
+                return
+
+            line = line.rstrip()
+            if line:
+                output_lines.append(line)
+                # Parse progress
+                progress = parse_ltx_progress_line(line)
+                if progress:
+                    last_progress = progress
+                    yield [], f"Extending video: {progress}", last_progress
+
+        # Wait for process to finish
+        current_process.wait()
+
+        if current_process.returncode == 0 and os.path.exists(output_path):
+            yield [output_path], f"Extension complete! Saved to: {output_path}", "Done!"
+        else:
+            error_output = "\n".join(output_lines[-20:])
+            yield [], f"Extension failed (code {current_process.returncode})\n{error_output}", "Error"
+
+    except Exception as e:
+        yield [], f"Extension error: {str(e)}", "Error"
+    finally:
+        current_process = None
+        current_output_filename = None
+
+
+# =============================================================================
 # SVI-LTX Frame Checking Functions
 # =============================================================================
 
@@ -2319,10 +2518,6 @@ def create_interface():
         """,
         title="LTX-2 Video Generator"
     ) as demo:
-
-        gr.Markdown("# LTX-2 Video Generator")
-        gr.Markdown("Two-stage pipeline with joint audio-video generation")
-
         with gr.Tabs() as tabs:
             # =================================================================
             # Generation Tab
@@ -3375,6 +3570,224 @@ Audio is synchronized with the video extension.
                         """)
 
             # =================================================================
+            # Extension Tab (Wan2GP-style)
+            # =================================================================
+            with gr.Tab("Extension", id="ext_tab"):
+                with gr.Row():
+                    # Left column - Input and settings
+                    with gr.Column(scale=1):
+                        # Extension-specific inputs
+                        with gr.Accordion("Input Video", open=True):
+                            ext_input_video = gr.Video(label="Video to Extend", sources=["upload"])
+                            ext_prompt = gr.Textbox(
+                                label="Prompt",
+                                placeholder="Describe the continuation...",
+                                lines=3
+                            )
+                            ext_negative_prompt = gr.Textbox(
+                                label="Negative Prompt",
+                                placeholder="Things to avoid...",
+                                lines=2
+                            )
+
+                        with gr.Accordion("Extension Settings", open=True):
+                            with gr.Row():
+                                ext_extend_seconds = gr.Slider(
+                                    minimum=1.0, maximum=30.0, value=5.0, step=0.5,
+                                    label="Extend Duration (seconds)"
+                                )
+                                ext_seed = gr.Number(label="Seed", value=-1, precision=0)
+                                ext_random_seed_btn = gr.Button("🎲", size="sm")
+                            with gr.Row():
+                                ext_steps = gr.Slider(
+                                    minimum=4, maximum=60, value=30, step=1,
+                                    label="Inference Steps"
+                                )
+                                ext_cfg = gr.Slider(
+                                    minimum=1.0, maximum=10.0, value=3.0, step=0.1,
+                                    label="CFG Scale"
+                                )
+                            with gr.Row():
+                                ext_preserve_strength = gr.Slider(
+                                    minimum=0.5, maximum=1.0, value=1.0, step=0.05,
+                                    label="Preserve Strength",
+                                    info="1.0 = fully frozen original frames"
+                                )
+                                ext_skip_stage2 = gr.Checkbox(
+                                    label="Skip Stage 2",
+                                    value=False,
+                                    info="Faster but lower quality"
+                                )
+
+                    # Right column - Output, LoRAs and Model Settings
+                    with gr.Column(scale=1):
+                        # Output gallery and controls
+                        ext_output_gallery = gr.Gallery(
+                            label="Extended Videos",
+                            columns=1, rows=1,
+                            object_fit="contain",
+                            height="auto",
+                            allow_preview=True,
+                            preview=True
+                        )
+                        with gr.Row():
+                            ext_generate_btn = gr.Button("Extend Video", variant="primary", size="lg")
+                            ext_stop_btn = gr.Button("Stop", variant="stop", size="lg")
+                        ext_status_text = gr.Textbox(label="Status", value="Ready", interactive=False)
+                        ext_progress_text = gr.Textbox(label="Progress", value="", interactive=False)
+
+                        # User LoRAs (copied from main tab)
+                        with gr.Accordion("User LoRAs (Optional)", open=True):
+                            ext_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
+                            ext_lora_refresh_btn = gr.Button("🔄 Refresh", size="sm")
+                            # LoRA 1
+                            with gr.Row():
+                                ext_user_lora_1 = gr.Dropdown(
+                                    label="LoRA 1",
+                                    choices=get_ltx_lora_options("lora"),
+                                    value="None",
+                                    scale=3
+                                )
+                                ext_user_lora_strength_1 = gr.Slider(
+                                    minimum=0.0, maximum=2.0, value=1.0, step=0.1,
+                                    label="Strength", scale=1
+                                )
+                                ext_user_lora_stage_1 = gr.Dropdown(
+                                    label="Stage",
+                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Both"],
+                                    value="Stage 2 (Refine)",
+                                    scale=1
+                                )
+                            # LoRA 2
+                            with gr.Row():
+                                ext_user_lora_2 = gr.Dropdown(
+                                    label="LoRA 2",
+                                    choices=get_ltx_lora_options("lora"),
+                                    value="None",
+                                    scale=3
+                                )
+                                ext_user_lora_strength_2 = gr.Slider(
+                                    minimum=0.0, maximum=2.0, value=1.0, step=0.1,
+                                    label="Strength", scale=1
+                                )
+                                ext_user_lora_stage_2 = gr.Dropdown(
+                                    label="Stage",
+                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Both"],
+                                    value="Stage 2 (Refine)",
+                                    scale=1
+                                )
+                            # LoRA 3
+                            with gr.Row():
+                                ext_user_lora_3 = gr.Dropdown(
+                                    label="LoRA 3",
+                                    choices=get_ltx_lora_options("lora"),
+                                    value="None",
+                                    scale=3
+                                )
+                                ext_user_lora_strength_3 = gr.Slider(
+                                    minimum=0.0, maximum=2.0, value=1.0, step=0.1,
+                                    label="Strength", scale=1
+                                )
+                                ext_user_lora_stage_3 = gr.Dropdown(
+                                    label="Stage",
+                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Both"],
+                                    value="Stage 2 (Refine)",
+                                    scale=1
+                                )
+                            # LoRA 4
+                            with gr.Row():
+                                ext_user_lora_4 = gr.Dropdown(
+                                    label="LoRA 4",
+                                    choices=get_ltx_lora_options("lora"),
+                                    value="None",
+                                    scale=3
+                                )
+                                ext_user_lora_strength_4 = gr.Slider(
+                                    minimum=0.0, maximum=2.0, value=1.0, step=0.1,
+                                    label="Strength", scale=1
+                                )
+                                ext_user_lora_stage_4 = gr.Dropdown(
+                                    label="Stage",
+                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Both"],
+                                    value="Stage 2 (Refine)",
+                                    scale=1
+                                )
+
+                        # Model settings (copied from main tab)
+                        with gr.Accordion("Model Settings", open=True):
+                            with gr.Row():
+                                ext_offload = gr.Checkbox(label="CPU Offloading", value=False, info="Offload models to CPU when not in use")
+                                ext_enable_fp8 = gr.Checkbox(label="FP8 Mode", value=False, info="Reduce memory with FP8 transformer")
+                            gr.Markdown("### Block Swapping")
+                            with gr.Row():
+                                ext_enable_dit_block_swap = gr.Checkbox(label="DiT Block Swap", value=True, info="Main transformer (stage 1)")
+                                ext_dit_blocks_in_memory = gr.Slider(minimum=1, maximum=47, value=22, step=1, label="DiT Blocks in GPU", visible=True)
+                            with gr.Row():
+                                ext_enable_text_encoder_block_swap = gr.Checkbox(label="Text Encoder Block Swap", value=True, info="Gemma text encoder")
+                                ext_text_encoder_blocks_in_memory = gr.Slider(minimum=1, maximum=47, value=6, step=1, label="Text Encoder Blocks in GPU", visible=True, info="Gemma-3-12B has 48 layers")
+                            with gr.Row():
+                                ext_enable_refiner_block_swap = gr.Checkbox(label="Refiner Block Swap", value=True, info="Stage 2 refiner transformer")
+                                ext_refiner_blocks_in_memory = gr.Slider(minimum=1, maximum=47, value=22, step=1, label="Refiner Blocks in GPU", visible=True)
+                            with gr.Row():
+                                ext_enable_activation_offload = gr.Checkbox(label="Activation Offload", value=False, info="Offload activations to CPU (slower but lower VRAM)")
+                            with gr.Row():
+                                ext_checkpoint_path = gr.Textbox(
+                                    label="LTX Checkpoint Path",
+                                    value="./weights/ltx-2-19b-dev.safetensors",
+                                    info="Path to LTX-2 model checkpoint",
+                                    scale=4
+                                )
+                                ext_distilled_checkpoint = gr.Checkbox(
+                                    label="Distilled",
+                                    value=False,
+                                    info="Checkpoint is distilled (skips distilled LoRA)",
+                                    scale=1
+                                )
+                            ext_gemma_root = gr.Textbox(
+                                label="Gemma Root Path",
+                                value="./gemma-3-12b-it-qat-q4_0-unquantized",
+                                info="Path to Gemma text encoder"
+                            )
+                            ext_spatial_upsampler_path = gr.Textbox(
+                                label="Spatial Upsampler Path",
+                                value="./weights/ltx-2-spatial-upscaler-x2-1.0.safetensors",
+                                info="Path to 2x spatial upsampler"
+                            )
+                            ext_vae_path = gr.Textbox(
+                                label="VAE Path (Optional)",
+                                value="",
+                                info="Path to dev checkpoint for vae use (leave empty to use VAE from main checkpoint)",
+                                placeholder="e.g., ./weights/ltx-2-19b-dev.safetensors"
+                            )
+                            with gr.Row():
+                                ext_distilled_lora_path = gr.Textbox(
+                                    label="Distilled LoRA Path",
+                                    value="./weights/ltx-2-19b-distilled-lora-384.safetensors",
+                                    info="For stage 2 refinement",
+                                    scale=3
+                                )
+                                ext_distilled_lora_strength = gr.Slider(
+                                    minimum=0.0, maximum=2.0, value=1.0, step=0.1,
+                                    label="Strength", scale=1
+                                )
+                            ext_save_path = gr.Textbox(label="Output Folder", value="outputs")
+
+                # Tips at the bottom (outside columns)
+                gr.Markdown("""
+                ---
+                **How it works:**
+                - Uses VideoConditionByLatentIndex to preserve original frames exactly
+                - Generates seamless continuation with synchronized audio
+                - Stage 1: Low-res extension at half resolution
+                - Stage 2: Hi-res refinement with 2x upsampling
+
+                **Tips:**
+                - Use a descriptive prompt for the continuation
+                - Preserve Strength 1.0 keeps original frames frozen
+                - Skip Stage 2 for faster (but lower quality) results
+                """)
+
+            # =================================================================
             # Help Tab
             # =================================================================
             with gr.Tab("Help"):
@@ -4282,6 +4695,80 @@ Audio is synchronized with the video extension.
                 interp_seed,
             ],
             outputs=[interp_output_video, interp_status, interp_progress]
+        )
+
+        # =================================================================
+        # Extension Tab Event Handlers
+        # =================================================================
+
+        # Random seed button
+        ext_random_seed_btn.click(
+            fn=lambda: -1,
+            outputs=[ext_seed]
+        )
+
+        # LoRA refresh (updates all 4 dropdowns)
+        def ext_refresh_all_lora_dropdowns(folder):
+            choices = get_ltx_lora_options(folder)
+            return [gr.update(choices=choices) for _ in range(4)]
+
+        ext_lora_refresh_btn.click(
+            fn=ext_refresh_all_lora_dropdowns,
+            inputs=[ext_lora_folder],
+            outputs=[ext_user_lora_1, ext_user_lora_2, ext_user_lora_3, ext_user_lora_4]
+        )
+
+        # Block swap visibility toggles
+        ext_enable_dit_block_swap.change(
+            fn=lambda x: gr.update(visible=x),
+            inputs=[ext_enable_dit_block_swap],
+            outputs=[ext_dit_blocks_in_memory]
+        )
+        ext_enable_text_encoder_block_swap.change(
+            fn=lambda x: gr.update(visible=x),
+            inputs=[ext_enable_text_encoder_block_swap],
+            outputs=[ext_text_encoder_blocks_in_memory]
+        )
+        ext_enable_refiner_block_swap.change(
+            fn=lambda x: gr.update(visible=x),
+            inputs=[ext_enable_refiner_block_swap],
+            outputs=[ext_refiner_blocks_in_memory]
+        )
+
+        # Stop button
+        ext_stop_btn.click(
+            fn=stop_generation,
+            outputs=[ext_status_text]
+        )
+
+        # Generate extension button
+        ext_generate_btn.click(
+            fn=generate_extension_video,
+            inputs=[
+                # Extension-specific parameters
+                ext_input_video, ext_prompt, ext_negative_prompt,
+                ext_extend_seconds, ext_seed, ext_steps, ext_cfg,
+                ext_preserve_strength, ext_skip_stage2,
+                # Model paths
+                ext_checkpoint_path, ext_distilled_checkpoint,
+                ext_gemma_root, ext_spatial_upsampler_path, ext_vae_path,
+                ext_distilled_lora_path, ext_distilled_lora_strength,
+                # Memory optimization
+                ext_offload, ext_enable_fp8,
+                ext_enable_dit_block_swap, ext_dit_blocks_in_memory,
+                ext_enable_text_encoder_block_swap, ext_text_encoder_blocks_in_memory,
+                ext_enable_refiner_block_swap, ext_refiner_blocks_in_memory,
+                ext_enable_activation_offload,
+                # LoRA
+                ext_lora_folder,
+                ext_user_lora_1, ext_user_lora_strength_1, ext_user_lora_stage_1,
+                ext_user_lora_2, ext_user_lora_strength_2, ext_user_lora_stage_2,
+                ext_user_lora_3, ext_user_lora_strength_3, ext_user_lora_stage_3,
+                ext_user_lora_4, ext_user_lora_strength_4, ext_user_lora_stage_4,
+                # Output
+                ext_save_path,
+            ],
+            outputs=[ext_output_gallery, ext_status_text, ext_progress_text]
         )
 
         return demo
