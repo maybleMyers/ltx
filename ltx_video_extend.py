@@ -89,6 +89,35 @@ def resolve_path(path: str) -> str:
     return os.path.abspath(os.path.expanduser(path))
 
 
+def add_metadata_to_video(video_path: str, parameters: dict) -> None:
+    """Add generation parameters to video metadata using ffmpeg."""
+    import json
+    import subprocess
+
+    params_json = json.dumps(parameters, indent=2)
+    temp_path = video_path.replace(".mp4", "_temp.mp4")
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-metadata", f"comment={params_json}",
+        "-codec", "copy",
+        temp_path
+    ]
+
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        os.replace(temp_path, video_path)
+    except subprocess.CalledProcessError as e:
+        print(f"Warning: Failed to add metadata: {e.stderr.decode() if e.stderr else e}")
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+    except Exception as e:
+        print(f"Warning: Failed to add metadata: {e}")
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
 class LoraAction(argparse.Action):
     """Parse LoRA arguments: PATH [STRENGTH]"""
     def __call__(self, parser, namespace, values, option_string=None):
@@ -1096,6 +1125,36 @@ def main():
         output_path=args.output,
         video_chunks_number=1,
     )
+
+    # Build and save metadata
+    metadata = {
+        "model_type": "LTX-2",
+        "pipeline": "video-extension",
+        "checkpoint_path": args.checkpoint,
+        "prompt": args.prompt,
+        "negative_prompt": args.negative_prompt if args.negative_prompt else None,
+        "input_video": args.input,
+        "extend_seconds": args.extend_seconds,
+        "preserve_strength": args.preserve_strength,
+        "cfg_guidance_scale": args.cfg,
+        "num_inference_steps": args.steps,
+        "seed": args.seed,
+        "skip_stage2": args.skip_stage2 or args.one_stage,
+        "one_stage": args.one_stage,
+        "output_fps": fps,
+        "enable_dit_block_swap": args.dit_block_swap,
+        "dit_blocks_in_memory": args.dit_blocks if args.dit_block_swap else None,
+        "enable_text_encoder_block_swap": args.text_encoder_block_swap,
+        "text_encoder_blocks_in_memory": args.text_encoder_blocks if args.text_encoder_block_swap else None,
+        "enable_refiner_block_swap": args.refiner_block_swap,
+        "refiner_blocks_in_memory": args.refiner_blocks if args.refiner_block_swap else None,
+        "enable_activation_offload": args.activation_offload,
+        "loras": [(lora.path, lora.strength) for lora in args.loras] if args.loras else None,
+        "stage2_loras": [(lora.path, lora.strength) for lora in args.stage2_loras] if args.stage2_loras else None,
+    }
+
+    print(">>> Adding metadata to video...")
+    add_metadata_to_video(args.output, metadata)
 
     print(f">>> Done! Saved to {args.output}")
 
