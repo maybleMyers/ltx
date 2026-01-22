@@ -148,6 +148,7 @@ def extend_video(
     cfg_guidance_scale: float = 3.0,
     preserve_strength: float = 1.0,
     skip_stage2: bool = False,
+    preserve_seconds: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """
     Extend a video using Wan2GP-style VideoConditionByLatentIndex conditioning.
@@ -169,6 +170,7 @@ def extend_video(
         cfg_guidance_scale: CFG scale
         preserve_strength: Strength for preserved frames (1.0 = fully frozen)
         skip_stage2: Skip stage 2 refinement
+        preserve_seconds: Max seconds of input video to preserve (None = all, uses last N seconds)
 
     Returns:
         Tuple of (video_tensor [F, H, W, C], audio_tensor or None)
@@ -197,17 +199,30 @@ def extend_video(
     print(f">>> Resolution: {video_width}x{video_height}")
     print(f">>> Duration: {input_duration:.2f}s")
 
+    # Limit preservation to last N seconds if specified
+    preserve_start_frame = 0
+    effective_input_duration = input_duration
+    effective_input_frames = total_input_frames
+
+    if preserve_seconds is not None and preserve_seconds > 0:
+        max_preserve_frames = int(preserve_seconds * input_fps)
+        if max_preserve_frames < total_input_frames:
+            preserve_start_frame = total_input_frames - max_preserve_frames
+            effective_input_frames = max_preserve_frames
+            effective_input_duration = preserve_seconds
+            print(f">>> Limiting preservation to last {preserve_seconds:.1f}s ({effective_input_frames} frames, starting at frame {preserve_start_frame})")
+
     # Calculate output parameters
     output_fps = input_fps
-    output_duration = input_duration + extend_seconds
+    output_duration = effective_input_duration + extend_seconds
     output_frames = int(output_duration * output_fps)
 
     # Ensure output frames is 8n+1 format for VAE
     output_frames = ((output_frames - 1) // 8) * 8 + 1
 
     # Also ensure input frames to preserve is 8n+1
-    preserve_pixel_frames = ((total_input_frames - 1) // 8) * 8 + 1
-    preserve_pixel_frames = min(preserve_pixel_frames, total_input_frames)
+    preserve_pixel_frames = ((effective_input_frames - 1) // 8) * 8 + 1
+    preserve_pixel_frames = min(preserve_pixel_frames, effective_input_frames)
 
     print(f">>> Output: {output_frames} frames ({output_frames / output_fps:.2f}s)")
     print(f">>> Preserving: {preserve_pixel_frames} frames")
@@ -236,7 +251,7 @@ def extend_video(
     # Step 2: Load video frames
     # =========================================================================
     print(">>> Loading video frames...")
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, preserve_start_frame)
     input_frames = []
     for _ in range(preserve_pixel_frames):
         ret, frame = cap.read()
@@ -263,6 +278,18 @@ def extend_video(
     try:
         waveform, sample_rate = decode_audio_from_file(input_video_path, device)
         if waveform is not None:
+            # If we're limiting preservation, trim the audio to match
+            if preserve_start_frame > 0:
+                start_sample = int((preserve_start_frame / input_fps) * sample_rate)
+                if waveform.dim() == 3:
+                    # Shape: [frames, channels, samples_per_frame]
+                    waveform = waveform.reshape(waveform.shape[1], -1)  # Flatten to [channels, total_samples]
+                if waveform.dim() == 2:
+                    waveform = waveform[:, start_sample:]
+                elif waveform.dim() == 1:
+                    waveform = waveform[start_sample:]
+                print(f">>> Trimmed audio to start at {preserve_start_frame / input_fps:.2f}s")
+            print(f">>> [Audio Debug] shape={waveform.shape}, min={waveform.min():.4f}, max={waveform.max():.4f}, mean={waveform.mean():.4f}")
             audio_waveform = waveform
             audio_sample_rate = sample_rate
             print(f">>> Audio: {waveform.shape}, {sample_rate}Hz")
@@ -279,8 +306,8 @@ def extend_video(
     # Get VAE temporal scale factor
     time_scale_factor = 8  # LTX-2 uses 8x temporal compression
 
-    # Encode in chunks if needed
-    chunk_pixel_frames = 65  # 8*8+1
+    # Encode in chunks if needed - use smaller chunks for high resolution to avoid OOM
+    chunk_pixel_frames = 17  # 2*8+1 - smaller chunks reduce peak VRAM during encoding
     total_pixel_frames = frames_tensor.shape[2]
 
     latent_chunks = []
@@ -703,6 +730,7 @@ def extend_video(
         stage2_height = stage1_height * 2
 
         cap = cv2.VideoCapture(input_video_path)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, preserve_start_frame)
         full_res_frames = []
         for _ in range(preserve_pixel_frames):
             ret, frame = cap.read()
@@ -947,6 +975,7 @@ def extend_video(
     out_h, out_w = decoded_video.shape[1], decoded_video.shape[2]
 
     cap = cv2.VideoCapture(input_video_path)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, preserve_start_frame)
     original_frames = []
     for i in range(preserve_pixel_frames):
         ret, frame = cap.read()
@@ -978,7 +1007,7 @@ def extend_video(
         # replace the preserved portion with the original audio waveform
         if audio_waveform is not None:
             sr = audio_sample_rate if audio_sample_rate is not None else AUDIO_SAMPLE_RATE
-            preserve_audio_samples = int(input_duration * sr)
+            preserve_audio_samples = int(effective_input_duration * sr)
 
             if preserve_audio_samples > 0:
                 print(f">>> Replacing {preserve_audio_samples} preserved audio samples with original...")
@@ -1003,6 +1032,58 @@ def extend_video(
                         decoded_audio[:, :num_replace] = orig_audio[:num_replace].unsqueeze(0)
                     print(f">>> Replaced {num_replace} audio samples with original quality")
 
+    # =========================================================================
+    # Step 11: Prepend prefix frames if we limited preservation
+    # =========================================================================
+    # If we used preserve_seconds to limit context, prepend the unchanged prefix
+    if preserve_start_frame > 0:
+        print(f">>> Prepending {preserve_start_frame} unchanged prefix frames...")
+        cap = cv2.VideoCapture(input_video_path)
+        prefix_frames = []
+        for i in range(preserve_start_frame):
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # Resize to match output dimensions
+            frame = cv2.resize(frame, (decoded_video.shape[2], decoded_video.shape[1]), interpolation=cv2.INTER_LANCZOS4)
+            prefix_frames.append(frame)
+        cap.release()
+
+        if prefix_frames:
+            prefix_tensor = torch.from_numpy(np.stack(prefix_frames))
+            decoded_video = torch.cat([prefix_tensor, decoded_video], dim=0)
+            print(f">>> Added {len(prefix_frames)} prefix frames, total: {decoded_video.shape[0]} frames")
+
+        # Also prepend prefix audio if present
+        if decoded_audio is not None and audio_sample_rate is not None:
+            prefix_audio_samples = int((preserve_start_frame / input_fps) * audio_sample_rate)
+            if prefix_audio_samples > 0:
+                print(f">>> Prepending {prefix_audio_samples} prefix audio samples...")
+                # Load original audio for prefix
+                try:
+                    orig_waveform, orig_sr = decode_audio_from_file(input_video_path, device)
+                    if orig_waveform is not None:
+                        if orig_waveform.dim() == 3:
+                            orig_waveform = orig_waveform.reshape(orig_waveform.shape[1], -1)
+                        # Get prefix portion
+                        if orig_waveform.dim() == 2:
+                            prefix_audio = orig_waveform[:, :prefix_audio_samples]
+                        else:
+                            prefix_audio = orig_waveform[:prefix_audio_samples]
+                        # Prepend to decoded audio
+                        if decoded_audio.dim() == 2 and prefix_audio.dim() == 2:
+                            decoded_audio = torch.cat([prefix_audio, decoded_audio], dim=1)
+                        elif decoded_audio.dim() == 1 and prefix_audio.dim() == 1:
+                            decoded_audio = torch.cat([prefix_audio, decoded_audio], dim=0)
+                        elif decoded_audio.dim() == 1 and prefix_audio.dim() == 2:
+                            decoded_audio = torch.cat([prefix_audio[0], decoded_audio], dim=0)
+                        elif decoded_audio.dim() == 2 and prefix_audio.dim() == 1:
+                            decoded_audio = torch.cat([prefix_audio.unsqueeze(0), decoded_audio], dim=1)
+                        print(f">>> Audio now has {decoded_audio.shape[-1]} samples")
+                except Exception as e:
+                    print(f">>> Warning: Could not prepend prefix audio: {e}")
+
     print(f">>> Done! Output: {decoded_video.shape}")
 
     return decoded_video, decoded_audio
@@ -1019,6 +1100,7 @@ def main():
 
     # Generation settings
     parser.add_argument("--extend-seconds", type=float, default=5.0, help="Seconds to extend")
+    parser.add_argument("--preserve-seconds", type=float, default=None, help="Max seconds of input video to preserve (uses last N seconds, None=all)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--steps", type=int, default=30, help="Denoising steps")
     parser.add_argument("--cfg", type=float, default=3.0, help="CFG guidance scale")
@@ -1107,6 +1189,7 @@ def main():
         cfg_guidance_scale=args.cfg,
         preserve_strength=args.preserve_strength,
         skip_stage2=args.skip_stage2 or args.one_stage,
+        preserve_seconds=args.preserve_seconds,
     )
 
     # Save output
@@ -1135,6 +1218,7 @@ def main():
         "negative_prompt": args.negative_prompt if args.negative_prompt else None,
         "input_video": args.input,
         "extend_seconds": args.extend_seconds,
+        "preserve_seconds": args.preserve_seconds,
         "preserve_strength": args.preserve_strength,
         "cfg_guidance_scale": args.cfg,
         "num_inference_steps": args.steps,

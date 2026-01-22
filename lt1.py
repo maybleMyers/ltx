@@ -1811,6 +1811,7 @@ def generate_extension_video(
     ext_prompt: str,
     ext_negative_prompt: str,
     ext_extend_seconds: float,
+    ext_preserve_seconds: float,
     ext_seed: int,
     ext_steps: int,
     ext_cfg: float,
@@ -1912,6 +1913,10 @@ def generate_extension_video(
             "--cfg", str(ext_cfg),
             "--preserve-strength", str(ext_preserve_strength),
         ]
+
+        # Add preserve-seconds if specified (limit input video context)
+        if ext_preserve_seconds and float(ext_preserve_seconds) > 0:
+            command.extend(["--preserve-seconds", str(float(ext_preserve_seconds))])
 
         # Add negative prompt if provided
         if ext_negative_prompt and ext_negative_prompt.strip():
@@ -3641,6 +3646,12 @@ Audio is synchronized with the video extension.
                                     minimum=1.0, maximum=30.0, value=5.0, step=0.5,
                                     label="Extend Duration (seconds)"
                                 )
+                                ext_preserve_seconds = gr.Slider(
+                                    minimum=0.0, maximum=30.0, value=0.0, step=0.5,
+                                    label="Max Preserve (seconds)",
+                                    info="0 = keep all, >0 = only use last N seconds as context"
+                                )
+                            with gr.Row():
                                 ext_seed = gr.Number(label="Seed", value=-1, precision=0)
                                 ext_random_seed_btn = gr.Button("🎲", size="sm")
                             with gr.Row():
@@ -3821,6 +3832,10 @@ Audio is synchronized with the video extension.
                                     label="Strength", scale=1
                                 )
                             ext_save_path = gr.Textbox(label="Output Folder", value="outputs")
+                            with gr.Row():
+                                ext_save_defaults_btn = gr.Button("💾 Save Defaults")
+                                ext_load_defaults_btn = gr.Button("📂 Load Defaults")
+                            ext_defaults_status = gr.Textbox(label="Defaults Status", value="", interactive=False, visible=True)
 
                 # Tips at the bottom (outside columns)
                 gr.Markdown("""
@@ -3835,6 +3850,9 @@ Audio is synchronized with the video extension.
                 - Use a descriptive prompt for the continuation
                 - Preserve Strength 1.0 keeps original frames frozen
                 - Skip Stage 2 for faster (but lower quality) results
+                - **Max Preserve**: Set to limit VRAM usage by only using the last N seconds as context
+                  - 0 = use entire video as context (may OOM on long videos)
+                  - \>0 = only encode last N seconds, full video still included in output
                 """)
 
             # =================================================================
@@ -4626,6 +4644,126 @@ Audio is synchronized with the video extension.
         )
 
         # =================================================================
+        # Extension Tab Save/Load Defaults
+        # =================================================================
+        EXT_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "ext_defaults.json")
+
+        ext_ui_default_components_ORDERED_LIST = [
+            # Extension settings
+            ext_extend_seconds, ext_preserve_seconds, ext_steps, ext_cfg,
+            ext_preserve_strength, ext_skip_stage2, ext_batch_size,
+            # Model paths
+            ext_checkpoint_path, ext_distilled_checkpoint,
+            ext_gemma_root, ext_spatial_upsampler_path, ext_vae_path,
+            ext_distilled_lora_path, ext_distilled_lora_strength,
+            # Memory optimization
+            ext_offload, ext_enable_fp8,
+            ext_enable_dit_block_swap, ext_dit_blocks_in_memory,
+            ext_enable_text_encoder_block_swap, ext_text_encoder_blocks_in_memory,
+            ext_enable_refiner_block_swap, ext_refiner_blocks_in_memory,
+            ext_enable_activation_offload,
+            # LoRA
+            ext_lora_folder,
+            ext_user_lora_1, ext_user_lora_strength_1, ext_user_lora_stage_1,
+            ext_user_lora_2, ext_user_lora_strength_2, ext_user_lora_stage_2,
+            ext_user_lora_3, ext_user_lora_strength_3, ext_user_lora_stage_3,
+            ext_user_lora_4, ext_user_lora_strength_4, ext_user_lora_stage_4,
+            # Output
+            ext_save_path,
+        ]
+
+        ext_ui_default_keys = [
+            "ext_extend_seconds", "ext_preserve_seconds", "ext_steps", "ext_cfg",
+            "ext_preserve_strength", "ext_skip_stage2", "ext_batch_size",
+            "ext_checkpoint_path", "ext_distilled_checkpoint",
+            "ext_gemma_root", "ext_spatial_upsampler_path", "ext_vae_path",
+            "ext_distilled_lora_path", "ext_distilled_lora_strength",
+            "ext_offload", "ext_enable_fp8",
+            "ext_enable_dit_block_swap", "ext_dit_blocks_in_memory",
+            "ext_enable_text_encoder_block_swap", "ext_text_encoder_blocks_in_memory",
+            "ext_enable_refiner_block_swap", "ext_refiner_blocks_in_memory",
+            "ext_enable_activation_offload",
+            "ext_lora_folder",
+            "ext_user_lora_1", "ext_user_lora_strength_1", "ext_user_lora_stage_1",
+            "ext_user_lora_2", "ext_user_lora_strength_2", "ext_user_lora_stage_2",
+            "ext_user_lora_3", "ext_user_lora_strength_3", "ext_user_lora_stage_3",
+            "ext_user_lora_4", "ext_user_lora_strength_4", "ext_user_lora_stage_4",
+            "ext_save_path",
+        ]
+
+        def save_ext_defaults(*values):
+            os.makedirs(UI_CONFIGS_DIR, exist_ok=True)
+            settings_to_save = {}
+            for i, key in enumerate(ext_ui_default_keys):
+                settings_to_save[key] = values[i]
+            try:
+                with open(EXT_DEFAULTS_FILE, 'w') as f:
+                    json.dump(settings_to_save, f, indent=2)
+                return "Extension defaults saved successfully."
+            except Exception as e:
+                return f"Error saving Extension defaults: {e}"
+
+        def load_ext_defaults(request: gr.Request = None):
+            lora_folder_val = "lora"
+            lora_choices = get_ltx_lora_options(lora_folder_val)
+
+            if not os.path.exists(EXT_DEFAULTS_FILE):
+                if request:
+                    return [gr.update()] * len(ext_ui_default_keys) + ["No defaults file found."]
+                else:
+                    return [gr.update()] * len(ext_ui_default_keys) + [""]
+
+            try:
+                with open(EXT_DEFAULTS_FILE, 'r') as f:
+                    loaded_settings = json.load(f)
+            except Exception as e:
+                return [gr.update()] * len(ext_ui_default_keys) + [f"Error loading defaults: {e}"]
+
+            # Update lora folder from settings
+            lora_folder_val = loaded_settings.get("ext_lora_folder", "lora")
+            lora_choices = get_ltx_lora_options(lora_folder_val)
+
+            updates = []
+            for i, key in enumerate(ext_ui_default_keys):
+                component = ext_ui_default_components_ORDERED_LIST[i]
+                default_value_from_component = None
+                if hasattr(component, 'value'):
+                    default_value_from_component = component.value
+
+                value_to_set = loaded_settings.get(key, default_value_from_component)
+
+                # Special handling for LoRA dropdowns
+                if key in ("ext_user_lora_1", "ext_user_lora_2", "ext_user_lora_3", "ext_user_lora_4"):
+                    if value_to_set not in lora_choices:
+                        value_to_set = "None"
+                    updates.append(gr.update(choices=lora_choices, value=value_to_set))
+                else:
+                    updates.append(gr.update(value=value_to_set))
+
+            return updates + ["Extension defaults loaded successfully."]
+
+        ext_save_defaults_btn.click(
+            fn=save_ext_defaults,
+            inputs=ext_ui_default_components_ORDERED_LIST,
+            outputs=[ext_defaults_status]
+        )
+        ext_load_defaults_btn.click(
+            fn=load_ext_defaults,
+            inputs=None,
+            outputs=ext_ui_default_components_ORDERED_LIST + [ext_defaults_status]
+        )
+
+        def initial_load_ext_defaults():
+            results_and_status = load_ext_defaults(None)
+            return results_and_status[:-1]
+
+        demo.load(
+            fn=initial_load_ext_defaults,
+            inputs=None,
+            outputs=ext_ui_default_components_ORDERED_LIST
+        )
+
+        # =================================================================
         # Depth Map Tab Event Handlers
         # =================================================================
 
@@ -4825,7 +4963,7 @@ Audio is synchronized with the video extension.
             inputs=[
                 # Extension-specific parameters
                 ext_input_video, ext_prompt, ext_negative_prompt,
-                ext_extend_seconds, ext_seed, ext_steps, ext_cfg,
+                ext_extend_seconds, ext_preserve_seconds, ext_seed, ext_steps, ext_cfg,
                 ext_preserve_strength, ext_skip_stage2,
                 # Model paths
                 ext_checkpoint_path, ext_distilled_checkpoint,
