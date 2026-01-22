@@ -6250,8 +6250,9 @@ def generate_av_extension(
             cap_orig.release()
 
             if len(original_frames) > 0:
-                # Convert to tensor [F, H, W, C] normalized to [0, 1]
-                original_pixels = torch.from_numpy(np.stack(original_frames)).float() / 255.0
+                # Convert to tensor [F, H, W, C] as uint8 [0-255] to match decoded video format
+                original_pixels = torch.from_numpy(np.stack(original_frames))  # uint8 from cv2
+
                 # Replace preserved frames
                 num_replace = min(len(original_frames), preserve_pixel_frames, decoded_video.shape[0])
                 decoded_video[:num_replace] = original_pixels[:num_replace]
@@ -6290,17 +6291,20 @@ def generate_av_extension(
             num_replace = min(preserve_audio_samples, orig_samples, decoded_samples)
 
             if num_replace > 0:
+                # Squeeze batch dimension if present (audio_waveform may be [1, C, S])
+                orig_audio = audio_waveform.squeeze(0) if audio_waveform.dim() == 3 else audio_waveform
+
                 # Handle both 1D and 2D audio tensors
-                if decoded_audio.dim() == 1 and audio_waveform.dim() == 1:
-                    decoded_audio[:num_replace] = audio_waveform[:num_replace]
-                elif decoded_audio.dim() == 2 and audio_waveform.dim() == 2:
-                    decoded_audio[:, :num_replace] = audio_waveform[:, :num_replace]
-                elif decoded_audio.dim() == 1 and audio_waveform.dim() == 2:
+                if decoded_audio.dim() == 1 and orig_audio.dim() == 1:
+                    decoded_audio[:num_replace] = orig_audio[:num_replace]
+                elif decoded_audio.dim() == 2 and orig_audio.dim() == 2:
+                    decoded_audio[:, :num_replace] = orig_audio[:, :num_replace]
+                elif decoded_audio.dim() == 1 and orig_audio.dim() == 2:
                     # Original is stereo, decoded is mono - use first channel
-                    decoded_audio[:num_replace] = audio_waveform[0, :num_replace]
-                elif decoded_audio.dim() == 2 and audio_waveform.dim() == 1:
+                    decoded_audio[:num_replace] = orig_audio[0, :num_replace]
+                elif decoded_audio.dim() == 2 and orig_audio.dim() == 1:
                     # Original is mono, decoded is stereo - broadcast
-                    decoded_audio[:, :num_replace] = audio_waveform[:num_replace].unsqueeze(0)
+                    decoded_audio[:, :num_replace] = orig_audio[:num_replace].unsqueeze(0)
                 print(f">>> Replaced {num_replace} audio samples with original quality")
 
     print(f">>> Output video shape: {decoded_video.shape}")
