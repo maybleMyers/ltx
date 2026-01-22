@@ -182,17 +182,22 @@ def extend_video(
     print(f">>> Preserving: {preserve_pixel_frames} frames")
     print(f">>> Generating: {output_frames - preserve_pixel_frames} new frames")
 
-    # Determine resolution
-    if generator.one_stage:
-        stage1_width = video_width
-        stage1_height = video_height
-    else:
-        stage1_width = video_width // 2
-        stage1_height = video_height // 2
+    # For video extension, use the input video's resolution directly
+    # (don't force half resolution like generation mode does)
+    # This preserves the original video quality
+    stage1_width = video_width
+    stage1_height = video_height
 
     # Ensure divisible by 32
     stage1_width = (stage1_width // 32) * 32
     stage1_height = (stage1_height // 32) * 32
+
+    # For extension at input resolution, skip stage 2 upsampling since we're already at target resolution
+    # Stage 2 would only be useful if we were upscaling (which we're not for extension)
+    force_skip_stage2 = True
+    if not skip_stage2 and force_skip_stage2:
+        print(f">>> Auto-skipping stage 2 for extension (already at input resolution)")
+        skip_stage2 = True
 
     print(f">>> Stage 1 resolution: {stage1_width}x{stage1_height}")
 
@@ -311,6 +316,25 @@ def extend_video(
             preserved_audio_latent = preserved_audio_latent.to(dtype=dtype)
 
         print(f">>> Audio latent: {preserved_audio_latent.shape}")
+
+        # Pad audio latent to match extended output duration
+        # Audio latent temporal dimension needs to match output duration
+        # Audio encoder produces ~25 frames/second (AUDIO_SAMPLE_RATE / hop_length / temporal_compression)
+        # Typical: 24000 / 160 / 4 = 37.5, but actual rate from encoder may vary
+        # Use the audio encoder's actual parameters for accurate calculation
+        audio_latents_per_second = audio_encoder.sample_rate / audio_encoder.mel_hop_length / 4
+        output_audio_frames = int(output_duration * audio_latents_per_second)
+
+        if preserved_audio_latent.shape[2] < output_audio_frames:
+            pad_frames = output_audio_frames - preserved_audio_latent.shape[2]
+            pad = torch.zeros(
+                (preserved_audio_latent.shape[0], preserved_audio_latent.shape[1],
+                 pad_frames, preserved_audio_latent.shape[3]),
+                device=preserved_audio_latent.device,
+                dtype=preserved_audio_latent.dtype,
+            )
+            preserved_audio_latent = torch.cat([preserved_audio_latent, pad], dim=2)
+            print(f">>> Padded audio latent to {preserved_audio_latent.shape} ({pad_frames} frames added for extension)")
 
         del audio_encoder, audio_processor
         cleanup_memory()

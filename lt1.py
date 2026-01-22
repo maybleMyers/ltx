@@ -1850,6 +1850,8 @@ def generate_extension_video(
     ext_user_lora_stage_4: str,
     # Output
     ext_save_path: str,
+    # Batching
+    ext_batch_size: int = 1,
 ) -> Generator[Tuple[list, str, str], None, None]:
     """Generate video extension using Wan2GP-style conditioning approach."""
     global current_process, current_output_filename, stop_event
@@ -1870,134 +1872,176 @@ def generate_extension_video(
         yield [], "Error: Prompt is required", ""
         return
 
-    # Generate random seed if -1
-    if ext_seed == -1:
-        ext_seed = random.randint(0, 2147483647)
+    # Generate random base seed if -1
+    base_seed = ext_seed
+    if base_seed == -1:
+        base_seed = random.randint(0, 2147483647)
 
     # Create output directory
     os.makedirs(ext_save_path, exist_ok=True)
 
-    # Generate output filename
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    safe_prompt = re.sub(r'[^\w\s-]', '', ext_prompt[:30]).strip().replace(' ', '_')
-    output_filename = f"ext_{timestamp}_{safe_prompt}_{ext_seed}.mp4"
-    output_path = os.path.join(ext_save_path, output_filename)
-    current_output_filename = output_path
+    batch_count = max(1, int(ext_batch_size))
+    all_outputs = []
 
-    # Build command for ltx_video_extend.py
-    command = [
-        sys.executable, "ltx_video_extend.py",
-        "--input", ext_input_video,
-        "--output", output_path,
-        "--prompt", ext_prompt,
-        "--extend-seconds", str(ext_extend_seconds),
-        "--seed", str(ext_seed),
-        "--steps", str(ext_steps),
-        "--cfg", str(ext_cfg),
-        "--preserve-strength", str(ext_preserve_strength),
-    ]
+    for batch_idx in range(batch_count):
+        if stop_event.is_set():
+            yield all_outputs, "Generation stopped by user", ""
+            return
 
-    # Add negative prompt if provided
-    if ext_negative_prompt and ext_negative_prompt.strip():
-        command.extend(["--negative-prompt", ext_negative_prompt])
+        # Calculate seed for this batch
+        current_seed = base_seed + batch_idx
 
-    # Model paths
-    if ext_checkpoint_path:
-        command.extend(["--checkpoint", ext_checkpoint_path])
-    if ext_gemma_root:
-        command.extend(["--gemma-root", ext_gemma_root])
-    if ext_spatial_upsampler_path:
-        command.extend(["--spatial-upsampler", ext_spatial_upsampler_path])
+        # Generate output filename
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        safe_prompt = re.sub(r'[^\w\s-]', '', ext_prompt[:30]).strip().replace(' ', '_')
+        output_filename = f"ext_{timestamp}_{safe_prompt}_{current_seed}.mp4"
+        output_path = os.path.join(ext_save_path, output_filename)
+        current_output_filename = output_path
 
-    # Distilled LoRA (only if not using distilled checkpoint)
-    if not ext_distilled_checkpoint and ext_distilled_lora_path and ext_distilled_lora_path.strip() and os.path.exists(ext_distilled_lora_path):
-        command.extend(["--distilled-lora", ext_distilled_lora_path])
+        batch_status = f"Batch {batch_idx + 1}/{batch_count}" if batch_count > 1 else ""
 
-    # Skip stage 2
-    if ext_skip_stage2:
-        command.append("--skip-stage2")
+        # Build command for ltx_video_extend.py
+        command = [
+            sys.executable, "ltx_video_extend.py",
+            "--input", ext_input_video,
+            "--output", output_path,
+            "--prompt", ext_prompt,
+            "--extend-seconds", str(ext_extend_seconds),
+            "--seed", str(current_seed),
+            "--steps", str(ext_steps),
+            "--cfg", str(ext_cfg),
+            "--preserve-strength", str(ext_preserve_strength),
+        ]
 
-    # Memory optimization
-    if ext_enable_dit_block_swap:
-        command.append("--dit-block-swap")
-        command.extend(["--dit-blocks", str(ext_dit_blocks_in_memory)])
+        # Add negative prompt if provided
+        if ext_negative_prompt and ext_negative_prompt.strip():
+            command.extend(["--negative-prompt", ext_negative_prompt])
 
-    if ext_enable_text_encoder_block_swap:
-        command.append("--text-encoder-block-swap")
-        command.extend(["--text-encoder-blocks", str(ext_text_encoder_blocks_in_memory)])
+        # Model paths
+        if ext_checkpoint_path:
+            command.extend(["--checkpoint", ext_checkpoint_path])
+        if ext_gemma_root:
+            command.extend(["--gemma-root", ext_gemma_root])
+        if ext_spatial_upsampler_path:
+            command.extend(["--spatial-upsampler", ext_spatial_upsampler_path])
 
-    if ext_enable_refiner_block_swap:
-        command.append("--refiner-block-swap")
-        command.extend(["--refiner-blocks", str(ext_refiner_blocks_in_memory)])
+        # Distilled LoRA (only if not using distilled checkpoint)
+        if not ext_distilled_checkpoint and ext_distilled_lora_path and ext_distilled_lora_path.strip() and os.path.exists(ext_distilled_lora_path):
+            command.extend(["--distilled-lora", ext_distilled_lora_path])
 
-    if ext_enable_activation_offload:
-        command.append("--activation-offload")
+        # Skip stage 2
+        if ext_skip_stage2:
+            command.append("--skip-stage2")
 
-    # User LoRAs
-    lora_configs = [
-        (ext_user_lora_1, ext_user_lora_strength_1, ext_user_lora_stage_1),
-        (ext_user_lora_2, ext_user_lora_strength_2, ext_user_lora_stage_2),
-        (ext_user_lora_3, ext_user_lora_strength_3, ext_user_lora_stage_3),
-        (ext_user_lora_4, ext_user_lora_strength_4, ext_user_lora_stage_4),
-    ]
-    for user_lora, user_lora_strength, user_lora_stage in lora_configs:
-        if user_lora and user_lora != "None" and ext_lora_folder:
-            lora_path = os.path.join(ext_lora_folder, user_lora)
-            if os.path.exists(lora_path):
-                if user_lora_stage == "Stage 1 (Base)":
-                    command.extend(["--lora", lora_path, str(user_lora_strength)])
-                elif user_lora_stage == "Stage 2 (Refine)":
-                    command.extend(["--stage2-lora", lora_path, str(user_lora_strength)])
-                else:  # Both
-                    command.extend(["--lora", lora_path, str(user_lora_strength)])
-                    command.extend(["--stage2-lora", lora_path, str(user_lora_strength)])
+        # Memory optimization
+        if ext_enable_dit_block_swap:
+            command.append("--dit-block-swap")
+            command.extend(["--dit-blocks", str(ext_dit_blocks_in_memory)])
 
-    yield [], "Starting video extension...", f"Command: {' '.join(command[:10])}..."
+        if ext_enable_text_encoder_block_swap:
+            command.append("--text-encoder-block-swap")
+            command.extend(["--text-encoder-blocks", str(ext_text_encoder_blocks_in_memory)])
 
-    try:
-        # Start the subprocess
-        current_process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            universal_newlines=True
-        )
+        if ext_enable_refiner_block_swap:
+            command.append("--refiner-block-swap")
+            command.extend(["--refiner-blocks", str(ext_refiner_blocks_in_memory)])
 
-        last_progress = "Starting..."
-        output_lines = []
+        if ext_enable_activation_offload:
+            command.append("--activation-offload")
 
-        # Stream output
-        for line in iter(current_process.stdout.readline, ''):
-            if stop_event.is_set():
-                current_process.terminate()
-                yield [], "Generation stopped by user", last_progress
-                return
+        # User LoRAs
+        lora_configs = [
+            (ext_user_lora_1, ext_user_lora_strength_1, ext_user_lora_stage_1),
+            (ext_user_lora_2, ext_user_lora_strength_2, ext_user_lora_stage_2),
+            (ext_user_lora_3, ext_user_lora_strength_3, ext_user_lora_stage_3),
+            (ext_user_lora_4, ext_user_lora_strength_4, ext_user_lora_stage_4),
+        ]
+        for user_lora, user_lora_strength, user_lora_stage in lora_configs:
+            if user_lora and user_lora != "None" and ext_lora_folder:
+                lora_path = os.path.join(ext_lora_folder, user_lora)
+                if os.path.exists(lora_path):
+                    if user_lora_stage == "Stage 1 (Base)":
+                        command.extend(["--lora", lora_path, str(user_lora_strength)])
+                    elif user_lora_stage == "Stage 2 (Refine)":
+                        command.extend(["--stage2-lora", lora_path, str(user_lora_strength)])
+                    else:  # Both
+                        command.extend(["--lora", lora_path, str(user_lora_strength)])
+                        command.extend(["--stage2-lora", lora_path, str(user_lora_strength)])
 
-            line = line.rstrip()
-            if line:
-                output_lines.append(line)
-                # Parse progress
-                progress = parse_ltx_progress_line(line)
-                if progress:
-                    last_progress = progress
-                    yield [], f"Extending video: {progress}", last_progress
+        # Print command for debugging
+        print("\n" + "=" * 80)
+        print(f"LAUNCHING EXTENSION COMMAND (Batch {batch_idx + 1}/{batch_count}):")
+        print(" ".join(command))
+        print("=" * 80 + "\n")
 
-        # Wait for process to finish
-        current_process.wait()
+        yield all_outputs, f"{batch_status} Starting video extension...", f"Command: {' '.join(command[:10])}..."
 
-        if current_process.returncode == 0 and os.path.exists(output_path):
-            yield [output_path], f"Extension complete! Saved to: {output_path}", "Done!"
-        else:
-            error_output = "\n".join(output_lines[-20:])
-            yield [], f"Extension failed (code {current_process.returncode})\n{error_output}", "Error"
+        try:
+            # Use PYTHONUNBUFFERED to ensure subprocess output isn't block-buffered
+            env = os.environ.copy()
+            env["PYTHONUNBUFFERED"] = "1"
 
-    except Exception as e:
-        yield [], f"Extension error: {str(e)}", "Error"
-    finally:
-        current_process = None
-        current_output_filename = None
+            # Start the subprocess
+            current_process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                env=env
+            )
+
+            last_progress = "Starting..."
+
+            # Stream output
+            while True:
+                if stop_event.is_set():
+                    current_process.terminate()
+                    try:
+                        current_process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        current_process.kill()
+                    yield all_outputs, "Generation stopped by user", last_progress
+                    return
+
+                line = current_process.stdout.readline()
+                if line:
+                    line = line.strip()
+                    if line:
+                        print(line)  # Print to terminal
+                        # Parse progress
+                        progress = parse_ltx_progress_line(line)
+                        if progress:
+                            last_progress = progress
+
+                yield all_outputs, f"{batch_status} Extending video: {last_progress}", last_progress
+
+                if current_process.poll() is not None:
+                    # Read remaining output
+                    for line in current_process.stdout:
+                        line = line.strip()
+                        if line:
+                            print(line)  # Print to terminal
+                            progress = parse_ltx_progress_line(line)
+                            if progress:
+                                last_progress = progress
+                    break
+
+            return_code = current_process.returncode
+            if return_code == 0 and os.path.exists(output_path):
+                all_outputs.append(output_path)
+                if batch_idx == batch_count - 1:
+                    yield all_outputs, f"All {batch_count} extension(s) complete!", "Done!"
+                else:
+                    yield all_outputs, f"{batch_status} Complete. Starting next...", "Done"
+            else:
+                yield all_outputs, f"{batch_status} Extension failed (code {return_code}). Check terminal for details.", "Error"
+
+        except Exception as e:
+            yield all_outputs, f"{batch_status} Extension error: {str(e)}", "Error"
+        finally:
+            current_process = None
+            current_output_filename = None
 
 
 # =============================================================================
@@ -3140,6 +3184,7 @@ Audio is synchronized with the video extension.
 
                 with gr.Row():
                     info_send_btn = gr.Button("Send to Generation", variant="primary")
+                    info_send_to_ext_btn = gr.Button("Send to Extension", variant="secondary")
 
             # =================================================================
             # SVI-LTX Tab
@@ -3618,6 +3663,11 @@ Audio is synchronized with the video extension.
                                     value=False,
                                     info="Faster but lower quality"
                                 )
+                            with gr.Row():
+                                ext_batch_size = gr.Number(
+                                    label="Batch Count", value=1, minimum=1, step=1,
+                                    info="Number of videos to generate"
+                                )
 
                     # Right column - Output, LoRAs and Model Settings
                     with gr.Column(scale=1):
@@ -4083,6 +4133,21 @@ Audio is synchronized with the video extension.
                 "Parameters sent to Generation tab (model paths unchanged)"  # status
             ]
 
+        def send_to_extension_handler(metadata, video_path):
+            """Send loaded video to Extension tab and switch to Extension tab."""
+            if not video_path:
+                return [gr.update()] * 5 + ["No video loaded - upload a video first"]
+
+            # Return updates for Extension tab parameters
+            return [
+                gr.Tabs(selected="ext_tab"),  # Switch to Extension tab
+                gr.update(value=video_path),  # ext_input_video
+                gr.update(value=metadata.get("prompt", "") if metadata else ""),  # ext_prompt
+                gr.update(value=metadata.get("negative_prompt", "") if metadata else ""),  # ext_negative_prompt
+                gr.update(value=metadata.get("seed", -1) if metadata else -1),  # ext_seed
+                "Video sent to Extension tab"  # status
+            ]
+
         info_send_btn.click(
             fn=send_to_generation_handler,
             inputs=[info_metadata_output, info_first_frame],
@@ -4110,6 +4175,19 @@ Audio is synchronized with the video extension.
                 # Distilled settings
                 distilled_checkpoint,
                 info_status
+            ]
+        )
+
+        info_send_to_ext_btn.click(
+            fn=send_to_extension_handler,
+            inputs=[info_metadata_output, info_video_input],
+            outputs=[
+                tabs,  # Switch tab
+                ext_input_video,  # Video to extend
+                ext_prompt,  # Prompt
+                ext_negative_prompt,  # Negative prompt
+                ext_seed,  # Seed
+                info_status  # Status
             ]
         )
 
@@ -4767,6 +4845,8 @@ Audio is synchronized with the video extension.
                 ext_user_lora_4, ext_user_lora_strength_4, ext_user_lora_stage_4,
                 # Output
                 ext_save_path,
+                # Batching
+                ext_batch_size,
             ],
             outputs=[ext_output_gallery, ext_status_text, ext_progress_text]
         )
