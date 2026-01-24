@@ -3912,7 +3912,9 @@ class LTXVideoGeneratorWithOffloading:
                     synchronize_and_cleanup()
                     phase_barrier("video_decoding_one_stage")
 
-                if not disable_audio:
+                # Skip audio VAE decode when audio_strength == 1.0 (frozen audio)
+                # to avoid corruption - original audio will be concatenated via ffmpeg
+                if not disable_audio and not (audio is not None and audio_strength == 1.0):
                     print(">>> Decoding audio...")
                     audio_decoder = self.stage_1_model_ledger.audio_decoder()
                     vocoder = self.stage_1_model_ledger.vocoder()
@@ -3925,6 +3927,9 @@ class LTXVideoGeneratorWithOffloading:
                     vocoder.to("cpu")
                     del audio_decoder, vocoder
                     synchronize_and_cleanup()
+                elif audio is not None and audio_strength == 1.0:
+                    print(">>> Skipping audio VAE decode (audio_strength=1.0, will use original audio)")
+                    decoded_audio = None
                 else:
                     decoded_audio = None
 
@@ -4508,7 +4513,9 @@ class LTXVideoGeneratorWithOffloading:
             synchronize_and_cleanup()
             phase_barrier("video_decoding_two_stage")
 
-        if not disable_audio:
+        # Skip audio VAE decode when audio_strength == 1.0 (frozen audio)
+        # to avoid corruption - original audio will be concatenated via ffmpeg
+        if not disable_audio and not (audio is not None and audio_strength == 1.0):
             print(">>> Decoding audio...")
             audio_decoder = self.stage_2_model_ledger.audio_decoder()
             vocoder = self.stage_2_model_ledger.vocoder()
@@ -4521,6 +4528,9 @@ class LTXVideoGeneratorWithOffloading:
             vocoder.to("cpu")
             del audio_decoder, vocoder
             synchronize_and_cleanup()
+        elif audio is not None and audio_strength == 1.0:
+            print(">>> Skipping audio VAE decode (audio_strength=1.0, will use original audio)")
+            decoded_audio = None
         else:
             decoded_audio = None
 
@@ -8917,6 +8927,43 @@ def main():
         ], check=True)
 
         os.unlink(temp_audio_path)
+    elif args.audio_strength == 1.0 and args.audio:
+        # Audio passthrough mode: audio_strength=1.0 means frozen audio
+        # Skip VAE decode (already done above) and concatenate original audio via ffmpeg
+        import subprocess
+        import tempfile
+        import os
+
+        print(">>> Audio Passthrough: Encoding video and concatenating original audio...")
+
+        # First encode video without audio to a temp file
+        temp_video = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
+        temp_video_path = temp_video.name
+        temp_video.close()
+
+        encode_video(
+            video=video,
+            fps=args.frame_rate,
+            audio=None,  # No audio in temp video
+            audio_sample_rate=None,
+            output_path=temp_video_path,
+            video_chunks_number=video_chunks_number,
+        )
+
+        # Use ffmpeg to combine generated video with original audio
+        subprocess.run([
+            'ffmpeg', '-y',
+            '-i', temp_video_path,
+            '-i', args.audio,
+            '-c:v', 'copy',
+            '-c:a', 'aac',
+            '-map', '0:v:0',
+            '-map', '1:a:0',
+            '-shortest',
+            args.output_path
+        ], check=True)
+
+        os.unlink(temp_video_path)
     else:
         encode_video(
             video=video,
