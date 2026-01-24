@@ -1583,9 +1583,9 @@ Examples:
     gen_group.add_argument(
         "--stg-scale",
         type=float,
-        default=1.0,
+        default=0.0,
         help="STG (Spatio-Temporal Guidance) scale. 0.0 disables STG. "
-             "Recommended: 1.0 for dev model. (default: 1.0)",
+             "Recommended: 1.0 for dev model. (default: 0.0)",
     )
     gen_group.add_argument(
         "--stg-blocks",
