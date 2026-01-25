@@ -252,7 +252,7 @@ class OOMRetryState:
     """Tracks OOM retry state across attempts."""
     stage: str  # "stage1" or "stage2"
     attempt: int = 0
-    max_attempts: int = 21  # Gradual block reduction + final memory optimization
+    max_attempts: int = 70  # Gradual block reduction + progressive chunk reduction
 
     # Configuration tracking
     original_blocks: int = 0
@@ -261,13 +261,25 @@ class OOMRetryState:
 
     original_ffn_chunk_size: Optional[int] = None
     ffn_chunking_enabled: bool = False
+    current_ffn_chunk_size: int = 0
 
     original_activation_offload: bool = False
     activation_offload_enabled: bool = False
 
     original_temporal_chunk_size: int = 0
     current_temporal_chunk_size: int = 0
+
+    # Initial (large) chunk sizes when first enabling chunking
+    initial_ffn_chunk_size: int = 4096
+    initial_temporal_chunk_size: int = 200000
+
+    # Minimum chunk sizes (floor)
+    min_ffn_chunk_size: int = 512
     min_temporal_chunk_size: int = 50000
+
+    # Step sizes for reduction
+    ffn_chunk_step: int = 512
+    temporal_chunk_step: int = 25000
 
     def can_retry(self) -> bool:
         return self.attempt < self.max_attempts
@@ -287,14 +299,36 @@ class OOMRetryState:
                 'description': f"Reducing blocks from {self.current_blocks} to {new_blocks}"
             }
 
-        # Strategy 2: At minimum blocks, enable activation offload + FFN chunking
+        # Strategy 2: At minimum blocks, enable activation offload + FFN chunking with LARGE initial chunks
         if not self.activation_offload_enabled:
             return {
                 'blocks': self.min_blocks,
-                'ffn_chunk_size': 512,
+                'ffn_chunk_size': self.initial_ffn_chunk_size,
                 'activation_offload': True,
-                'temporal_chunk_size': 50000,
-                'description': f"At minimum blocks ({self.min_blocks}), enabling activation offload + FFN chunking (512/50k)"
+                'temporal_chunk_size': self.initial_temporal_chunk_size,
+                'description': f"At minimum blocks ({self.min_blocks}), enabling activation offload + FFN chunking ({self.initial_ffn_chunk_size}/{self.initial_temporal_chunk_size})"
+            }
+
+        # Strategy 3: Reduce FFN chunk size first (minimal speed impact - no CPU-GPU transfers)
+        if self.current_ffn_chunk_size > self.min_ffn_chunk_size:
+            new_ffn = max(self.current_ffn_chunk_size - self.ffn_chunk_step, self.min_ffn_chunk_size)
+            return {
+                'blocks': self.min_blocks,
+                'ffn_chunk_size': new_ffn,
+                'activation_offload': True,
+                'temporal_chunk_size': self.current_temporal_chunk_size,
+                'description': f"Reducing FFN chunks: {self.current_ffn_chunk_size}→{new_ffn} (temporal stays at {self.current_temporal_chunk_size})"
+            }
+
+        # Strategy 4: Reduce temporal chunk size (significant speed impact - last resort)
+        if self.current_temporal_chunk_size > self.min_temporal_chunk_size:
+            new_temporal = max(self.current_temporal_chunk_size - self.temporal_chunk_step, self.min_temporal_chunk_size)
+            return {
+                'blocks': self.min_blocks,
+                'ffn_chunk_size': self.min_ffn_chunk_size,
+                'activation_offload': True,
+                'temporal_chunk_size': new_temporal,
+                'description': f"Reducing temporal chunks: {self.current_temporal_chunk_size}→{new_temporal} (FFN at minimum {self.min_ffn_chunk_size})"
             }
 
         # No more strategies
@@ -338,7 +372,7 @@ def oom_retry_wrapper(
                     )
                 if retry_state.activation_offload_enabled:
                     strategies_tried.append(
-                        f"  - Activation offload + FFN chunking: Enabled (FFN chunk=512, temporal chunk=50000)"
+                        f"  - Activation offload + FFN chunking: Enabled (FFN chunk={retry_state.min_ffn_chunk_size}, temporal chunk={retry_state.min_temporal_chunk_size})"
                     )
 
                 error_msg = f"""OUT OF MEMORY in {retry_state.stage} after exhausting all retry strategies.
@@ -386,6 +420,7 @@ Suggested actions:
             # Update state
             retry_state.current_blocks = strategy['blocks']
             retry_state.current_temporal_chunk_size = strategy['temporal_chunk_size']
+            retry_state.current_ffn_chunk_size = strategy['ffn_chunk_size'] or 0
             retry_state.ffn_chunking_enabled = strategy['ffn_chunk_size'] is not None
             retry_state.activation_offload_enabled = strategy['activation_offload']
 
