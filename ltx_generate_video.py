@@ -259,6 +259,10 @@ class OOMRetryState:
     current_blocks: int = 0
     min_blocks: int = 1
 
+    # When activation offload is enabled, activations move to CPU freeing VRAM for more blocks
+    # More blocks = better overlap of compute and weight transfers
+    blocks_with_activation_offload: int = 4
+
     original_ffn_chunk_size: Optional[int] = None
     ffn_chunking_enabled: bool = False
     current_ffn_chunk_size: int = 0
@@ -299,14 +303,14 @@ class OOMRetryState:
                 'description': f"Reducing blocks from {self.current_blocks} to {new_blocks}"
             }
 
-        # Strategy 2: At minimum blocks, enable activation offload + FFN chunking with LARGE initial chunks
+        # Strategy 2: Enable activation offload + FFN chunking with more blocks (activations on CPU frees VRAM)
         if not self.activation_offload_enabled:
             return {
-                'blocks': self.min_blocks,
+                'blocks': self.blocks_with_activation_offload,
                 'ffn_chunk_size': self.initial_ffn_chunk_size,
                 'activation_offload': True,
                 'temporal_chunk_size': self.initial_temporal_chunk_size,
-                'description': f"At minimum blocks ({self.min_blocks}), enabling activation offload + FFN chunking ({self.initial_ffn_chunk_size}/{self.initial_temporal_chunk_size})"
+                'description': f"Enabling activation offload + FFN chunking ({self.initial_ffn_chunk_size}/{self.initial_temporal_chunk_size}) with {self.blocks_with_activation_offload} blocks"
             }
 
         # Strategy 3: Reduce FFN chunk size first (minimal speed impact - no CPU-GPU transfers)
