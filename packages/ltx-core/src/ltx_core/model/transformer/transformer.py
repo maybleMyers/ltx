@@ -10,6 +10,12 @@ from ltx_core.model.transformer.transformer_args import TransformerArgs
 from ltx_core.utils import rms_norm
 
 
+# Maximum tokens to transfer to GPU at once during chunked forward.
+# This caps per-iteration GPU memory while allowing larger temporal_chunk_size
+# for fewer outer loop iterations and concatenations.
+MAX_GPU_TRANSFER_TOKENS = 50000
+
+
 # Helper functions for positional embeddings (which are tuples of (cos, sin) tensors)
 def _pe_to_cpu(pe: tuple[torch.Tensor, torch.Tensor] | None) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Move positional embedding tuple to CPU."""
@@ -348,6 +354,10 @@ class BasicAVTransformerBlock(torch.nn.Module):
         device = torch.device(device) if isinstance(device, str) else device
         batch_size = video.x.shape[0] if video is not None else audio.x.shape[0]
 
+        # Cap GPU transfer size to control memory usage.
+        # This allows larger chunk_size for API compatibility while preventing OOM.
+        gpu_chunk_size = min(chunk_size, MAX_GPU_TRANSFER_TOKENS)
+
         if perturbations is None:
             perturbations = BatchedPerturbationConfig.empty(batch_size)
 
@@ -376,8 +386,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 # Compute ada values chunk by chunk to avoid OOM
                 norm_vx_chunks = []
                 gate_chunks = []  # Store gate values for later use
-                for start in range(0, N_video, chunk_size):
-                    end = min(start + chunk_size, N_video)
+                for start in range(0, N_video, gpu_chunk_size):
+                    end = min(start + gpu_chunk_size, N_video)
                     vx_chunk = vx[:, start:end].to(device)
                     # Compute ada values for this chunk only
                     if ada_per_token:
@@ -402,8 +412,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 # Apply gate and residual in chunks
                 v_mask = perturbations.mask_like(PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx, vx[:, :1].to(device))
                 vx_new_chunks = []
-                for i, start in enumerate(range(0, N_video, chunk_size)):
-                    end = min(start + chunk_size, N_video)
+                for i, start in enumerate(range(0, N_video, gpu_chunk_size)):
+                    end = min(start + gpu_chunk_size, N_video)
                     vx_chunk = vx[:, start:end].to(device)
                     attn_chunk = attn_out[:, start:end].to(device)
                     vgate_chunk = gate_chunks[i]
@@ -415,8 +425,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
 
             # Cross-attention to text (text context is small, just chunk queries)
             text_attn_out_chunks = []
-            for start in range(0, N_video, chunk_size):
-                end = min(start + chunk_size, N_video)
+            for start in range(0, N_video, gpu_chunk_size):
+                end = min(start + gpu_chunk_size, N_video)
                 vx_chunk = vx[:, start:end].to(device)
                 norm_chunk = rms_norm(vx_chunk, eps=self.norm_eps)
                 attn_chunk = self.attn2(
@@ -485,8 +495,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 a2v_out_chunks = []
                 a2v_mask = perturbations.mask_like(PerturbationType.SKIP_A2V_CROSS_ATTN, self.idx, vx[:, :1].to(device))
 
-                for start in range(0, N_video, chunk_size):
-                    end = min(start + chunk_size, N_video)
+                for start in range(0, N_video, gpu_chunk_size):
+                    end = min(start + gpu_chunk_size, N_video)
                     vx_chunk = vx[:, start:end].to(device)
                     vx_norm_chunk = rms_norm(vx_chunk, eps=self.norm_eps)
                     # Compute video ada values for this chunk only
@@ -525,8 +535,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 # Video-to-audio: audio queries, video K/V (need to stream video)
                 # Prepare video K/V by computing in chunks and storing on CPU
                 V_kv_chunks = []
-                for start in range(0, N_video, chunk_size):
-                    end = min(start + chunk_size, N_video)
+                for start in range(0, N_video, gpu_chunk_size):
+                    end = min(start + gpu_chunk_size, N_video)
                     vx_chunk = vx[:, start:end].to(device)
                     vx_norm_chunk = rms_norm(vx_chunk, eps=self.norm_eps)
                     # Compute video ada values for this chunk only
@@ -575,8 +585,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
         # ============================================================
         if run_vx:
             vx_ffn_chunks = []
-            for start in range(0, N_video, chunk_size):
-                end = min(start + chunk_size, N_video)
+            for start in range(0, N_video, gpu_chunk_size):
+                end = min(start + gpu_chunk_size, N_video)
                 vx_chunk = vx[:, start:end].to(device)
                 # Compute ada values for this chunk only
                 if ada_per_token:
