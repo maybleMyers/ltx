@@ -270,8 +270,8 @@ class OOMRetryState:
     current_temporal_chunk_size: int = 0
 
     # Initial (large) chunk sizes when first enabling chunking
-    initial_ffn_chunk_size: int = 4096
-    initial_temporal_chunk_size: int = 200000
+    initial_ffn_chunk_size: int = 16384
+    initial_temporal_chunk_size: int = 400000
 
     # Minimum chunk sizes (floor)
     min_ffn_chunk_size: int = 512

@@ -13,7 +13,7 @@ from ltx_core.utils import rms_norm
 # Maximum tokens to transfer to GPU at once during chunked forward.
 # This caps per-iteration GPU memory while allowing larger temporal_chunk_size
 # for fewer outer loop iterations and concatenations.
-MAX_GPU_TRANSFER_TOKENS = 200000
+MAX_GPU_TRANSFER_TOKENS = 400000
 
 
 # Helper functions for positional embeddings (which are tuples of (cos, sin) tensors)
