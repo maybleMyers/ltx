@@ -36,7 +36,6 @@ def _move_transformer_args_to_device(args: TransformerArgs, device: torch.device
         return (to_device(pe[0]), to_device(pe[1]))
 
     return replace(args,
-        x=to_device(args.x),
         timesteps=to_device(args.timesteps),
         embedded_timestep=to_device(args.embedded_timestep),
         context=to_device(args.context),
@@ -199,12 +198,9 @@ def enable_block_swap_with_activation_offload(
 
         use_temporal_chunking = temporal_chunk_size > 0 and vx_pinned is not None
 
-        # Move non-activation tensors to GPU once (timesteps, positional_embeddings, etc.)
-        # These don't change between blocks, so we only need to transfer them once
         if not use_temporal_chunking:
             video_args_gpu = _move_transformer_args_to_device(video, device) if video is not None else None
             audio_args_gpu = _move_transformer_args_to_device(audio, device) if audio is not None else None
-            # Ensure async transfers complete before proceeding
             torch.cuda.synchronize(device)
         else:
             video_args_gpu = None
