@@ -559,6 +559,30 @@ GIMM_MODELS = {
     },
 }
 
+# Upscaler model configurations
+UPSCALER_MODELS = {
+    "Real-ESRGAN x2": {
+        "type": "esrgan",
+        "scale": 2,
+        "checkpoint": "GIMM-VFI/pretrained_ckpt/RealESRGAN_x2plus.pth",
+    },
+    "Real-ESRGAN x4": {
+        "type": "esrgan",
+        "scale": 4,
+        "checkpoint": "GIMM-VFI/pretrained_ckpt/RealESRGAN_x4plus.pth",
+    },
+    "SwinIR x4": {
+        "type": "swinir",
+        "scale": 4,
+        "checkpoint": "GIMM-VFI/pretrained_ckpt/003_realSR_BSRGAN_DFOWMFC_s64w8_SwinIR-L_x4_GAN.pth",
+    },
+    "BasicVSR++ x4 (Temporal)": {
+        "type": "basicvsr",
+        "scale": 4,
+        "checkpoint": "GIMM-VFI/pretrained_ckpt/basicvsr_plusplus_reds4.pth",
+    },
+}
+
 # Global cache for GIMM-VFI model
 _gimm_model_cache = {"model": None, "variant": None}
 
@@ -1271,6 +1295,141 @@ def interpolate_video(
             yield output_file, f"Done! Output saved to {output_file}", 1.0
         else:
             yield None, f"Interpolation failed (exit code {return_code})", 0.0
+
+    except Exception as e:
+        yield None, f"Error: {str(e)}", 0.0
+        import traceback
+        traceback.print_exc()
+
+
+def upscale_video(
+    input_video: str,
+    model_variant: str,
+    model_path_override: str,
+    tile_size: int,
+    half_precision: bool,
+    motion_blur: bool,
+    blur_strength: float,
+    blur_samples: int,
+    crf: int,
+    seed: int,
+) -> Generator[Tuple[Optional[str], str, float], None, None]:
+    """
+    Unified video upscaling dispatcher.
+    Launches upscale_video.py as subprocess for VRAM cleanup.
+    """
+    # Validate input
+    if not input_video or not os.path.exists(input_video):
+        yield None, "Error: No input video provided", 0.0
+        return
+
+    # Get model config
+    model_config = UPSCALER_MODELS.get(model_variant)
+    if not model_config:
+        yield None, f"Error: Unknown model variant: {model_variant}", 0.0
+        return
+
+    model_type = model_config["type"]
+    scale = model_config["scale"]
+
+    # Determine model path
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if model_path_override and model_path_override.strip():
+        model_path = model_path_override.strip()
+    else:
+        model_path = os.path.join(script_dir, model_config["checkpoint"])
+
+    # Check if model exists
+    if not os.path.exists(model_path):
+        yield None, f"Error: Model not found at {model_path}", 0.0
+        return
+
+    # Create output path
+    output_dir = os.path.join(script_dir, "outputs", "upscaled")
+    os.makedirs(output_dir, exist_ok=True)
+    timestamp = int(time.time())
+    input_name = os.path.splitext(os.path.basename(input_video))[0]
+    output_path = os.path.join(output_dir, f"{input_name}_upscaled_{scale}x_{timestamp}.mp4")
+
+    yield None, f"Starting {model_variant} upscaling...", 0.05
+
+    # Build command
+    cmd = [
+        sys.executable, os.path.join(script_dir, "upscale_video.py"),
+        "--input", input_video,
+        "--output", output_path,
+        "--model-type", model_type,
+        "--model-path", model_path,
+        "--scale", str(scale),
+        "--tile-size", str(tile_size),
+        "--crf", str(crf),
+        "--seed", str(seed),
+    ]
+
+    if half_precision:
+        cmd.append("--half")
+
+    if motion_blur:
+        cmd.extend([
+            "--motion-blur",
+            "--blur-strength", str(blur_strength),
+            "--blur-samples", str(blur_samples),
+        ])
+
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+        output_file = None
+        last_status = "Processing..."
+
+        while True:
+            line = process.stdout.readline()
+            if line:
+                line = line.strip()
+                if line:
+                    print(line)
+                    if line.startswith("PROGRESS:"):
+                        last_status = line[9:].strip()
+                        # Try to extract percentage
+                        progress = 0.1
+                        if "%" in last_status:
+                            try:
+                                pct = int(last_status.split("(")[1].split("%")[0])
+                                progress = 0.1 + (pct / 100) * 0.8
+                            except:
+                                pass
+                        yield None, last_status, progress
+                    elif line.startswith("OUTPUT:"):
+                        output_file = line[7:].strip()
+                    elif line.startswith("ERROR:"):
+                        yield None, line[6:].strip(), 0.0
+                        return
+
+            if process.poll() is not None:
+                # Read remaining output
+                for line in process.stdout:
+                    line = line.strip()
+                    if line:
+                        print(line)
+                        if line.startswith("OUTPUT:"):
+                            output_file = line[7:].strip()
+                        elif line.startswith("ERROR:"):
+                            yield None, line[6:].strip(), 0.0
+                            return
+                break
+
+        return_code = process.returncode
+
+        if return_code == 0 and output_file and os.path.exists(output_file):
+            yield output_file, f"Done! Output saved to {output_file}", 1.0
+        else:
+            yield None, f"Upscaling failed (exit code {return_code})", 0.0
 
     except Exception as e:
         yield None, f"Error: {str(e)}", 0.0
@@ -3601,9 +3760,74 @@ Audio is synchronized with the video extension.
                                 info="Random seed for reproducibility"
                             )
 
+                        # Upscaling Settings
+                        with gr.Accordion("Upscaling", open=False):
+                            upscale_enable = gr.Checkbox(
+                                label="Enable Upscaling",
+                                value=False,
+                                info="Apply spatial upscaling (standalone or after interpolation)"
+                            )
+                            upscale_model = gr.Dropdown(
+                                label="Upscaler Model",
+                                choices=list(UPSCALER_MODELS.keys()),
+                                value="Real-ESRGAN x2",
+                                info="ESRGAN/SwinIR: frame-by-frame, BasicVSR++: temporal-aware"
+                            )
+                            upscale_tile_size = gr.Slider(
+                                label="Tile Size",
+                                minimum=0,
+                                maximum=1024,
+                                value=512,
+                                step=64,
+                                info="0=no tiling (more VRAM), 512=balanced, lower=less VRAM"
+                            )
+                            upscale_half = gr.Checkbox(
+                                label="Half Precision (FP16)",
+                                value=True,
+                                info="Faster, less VRAM, slight quality loss"
+                            )
+                            upscale_model_path = gr.Textbox(
+                                label="Custom Model Path (optional)",
+                                placeholder="Leave empty for default model",
+                                info="Override the default checkpoint path"
+                            )
+                            upscale_crf = gr.Slider(
+                                label="Output CRF",
+                                minimum=10,
+                                maximum=30,
+                                value=18,
+                                step=1,
+                                info="Video quality: lower=better quality, larger file (18=good default)"
+                            )
+
+                        # Motion Blur Settings (for masking deformation artifacts)
+                        with gr.Accordion("Motion Blur (Artifact Masking)", open=False):
+                            motion_blur_enable = gr.Checkbox(
+                                label="Enable Motion Blur",
+                                value=False,
+                                info="Add blur along motion vectors to mask deformation artifacts"
+                            )
+                            motion_blur_strength = gr.Slider(
+                                label="Blur Strength",
+                                minimum=0.1,
+                                maximum=2.0,
+                                value=1.0,
+                                step=0.1,
+                                info="Higher = more blur along motion direction"
+                            )
+                            motion_blur_samples = gr.Slider(
+                                label="Blur Samples",
+                                minimum=3,
+                                maximum=15,
+                                value=7,
+                                step=2,
+                                info="More samples = smoother blur (use odd numbers)"
+                            )
+
                         # Action Buttons
                         with gr.Row():
                             interp_generate_btn = gr.Button("🎬 Interpolate", variant="primary", elem_classes="green-btn")
+                            upscale_btn = gr.Button("🔍 Upscale", variant="secondary")
 
                     # Output Column
                     with gr.Column(scale=1):
@@ -3625,6 +3849,12 @@ Audio is synchronized with the video extension.
                         - Place checkpoints in `GIMM-VFI/pretrained_ckpt/`
                         - For 2K/4K video with GIMM-VFI, reduce DS Scale to fit in VRAM
                         - BiM-VFI auto-detects pyramid level based on resolution (or set manually)
+
+                        **Upscaling:**
+                        - **Real-ESRGAN**: Download from [GitHub](https://github.com/xinntao/Real-ESRGAN/releases)
+                        - **SwinIR**: Download from [GitHub](https://github.com/JingyunLiang/SwinIR/releases)
+                        - Place upscaler checkpoints in `weights/` folder
+                        - Motion blur uses RAFT flow to mask deformation artifacts
                         """)
 
             # =================================================================
@@ -4920,6 +5150,24 @@ Audio is synchronized with the video extension.
                 interp_raft_iters,
                 interp_pyr_level,
                 interp_seed,
+            ],
+            outputs=[interp_output_video, interp_status, interp_progress]
+        )
+
+        # Upscaling event handler
+        upscale_btn.click(
+            fn=upscale_video,
+            inputs=[
+                interp_input_video,  # Use same input video
+                upscale_model,
+                upscale_model_path,
+                upscale_tile_size,
+                upscale_half,
+                motion_blur_enable,
+                motion_blur_strength,
+                motion_blur_samples,
+                upscale_crf,
+                interp_seed,  # Reuse same seed
             ],
             outputs=[interp_output_video, interp_status, interp_progress]
         )
