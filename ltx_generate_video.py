@@ -259,9 +259,7 @@ class OOMRetryState:
     current_blocks: int = 0
     min_blocks: int = 1
 
-    # When activation offload is enabled, activations move to CPU freeing VRAM for more blocks
-    # More blocks = better overlap of compute and weight transfers
-    blocks_with_activation_offload: int = 4
+    blocks_with_activation_offload: int = 2
 
     original_ffn_chunk_size: Optional[int] = None
     ffn_chunking_enabled: bool = False
@@ -292,8 +290,8 @@ class OOMRetryState:
         """Returns next retry strategy or None if exhausted."""
         self.attempt += 1
 
-        # Strategy 1: Gradual block reduction (reduce by 1 each attempt)
-        if self.current_blocks > self.min_blocks:
+        # Strategy 1: Gradual block reduction (only before activation offload is enabled)
+        if self.current_blocks > self.min_blocks and not self.activation_offload_enabled:
             new_blocks = self.current_blocks - 1
             return {
                 'blocks': new_blocks,
@@ -324,15 +322,26 @@ class OOMRetryState:
                 'description': f"Reducing FFN chunks: {self.current_ffn_chunk_size}→{new_ffn} (temporal stays at {self.current_temporal_chunk_size})"
             }
 
-        # Strategy 4: Reduce temporal chunk size (significant speed impact - last resort)
+        # Strategy 4: Reduce temporal chunk size
         if self.current_temporal_chunk_size > self.min_temporal_chunk_size:
             new_temporal = max(self.current_temporal_chunk_size - self.temporal_chunk_step, self.min_temporal_chunk_size)
             return {
-                'blocks': self.min_blocks,
+                'blocks': self.current_blocks,
                 'ffn_chunk_size': self.min_ffn_chunk_size,
                 'activation_offload': True,
                 'temporal_chunk_size': new_temporal,
                 'description': f"Reducing temporal chunks: {self.current_temporal_chunk_size}→{new_temporal} (FFN at minimum {self.min_ffn_chunk_size})"
+            }
+
+        # Strategy 5: Reduce blocks (last resort, after chunk sizes minimized)
+        if self.activation_offload_enabled and self.current_blocks > self.min_blocks:
+            new_blocks = self.current_blocks - 1
+            return {
+                'blocks': new_blocks,
+                'ffn_chunk_size': self.min_ffn_chunk_size,
+                'activation_offload': True,
+                'temporal_chunk_size': self.min_temporal_chunk_size,
+                'description': f"Reducing blocks {self.current_blocks}→{new_blocks} (chunks at minimum)"
             }
 
         # No more strategies
