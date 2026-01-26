@@ -8663,14 +8663,17 @@ def main():
     print(f"FP8: {args.enable_fp8}")
     if args.images:
         print(f"Image conditioning: {len(args.images)} image(s)")
-        if args.image_crf != 33:
-            crf_desc = "lossless" if args.image_crf == 0 else f"CRF {args.image_crf}"
-            print(f"  Image CRF: {crf_desc}")
+        for i, img in enumerate(args.images):
+            crf = img[3] if len(img) > 3 else 33
+            if crf != 33:
+                crf_desc = "lossless" if crf == 0 else f"CRF {int(crf)}"
+                print(f"  Image {i+1}: {crf_desc}")
     if args.anchor_interval:
         anchor_src = args.anchor_image if args.anchor_image else "first --image"
         num_anchors = len(range(args.anchor_interval, args.num_frames, args.anchor_interval))
         decay_info = f", decay: {args.anchor_decay}" if args.anchor_decay != "none" else ""
-        print(f"Anchor conditioning: {num_anchors} anchor(s) every {args.anchor_interval} frames (source: {anchor_src}, strength: {args.anchor_strength}{decay_info})")
+        crf_info = f", CRF: {'lossless' if args.anchor_crf == 0 else int(args.anchor_crf)}" if args.anchor_crf != 33 else ""
+        print(f"Anchor conditioning: {num_anchors} anchor(s) every {args.anchor_interval} frames (source: {anchor_src}, strength: {args.anchor_strength}{decay_info}{crf_info})")
     # SVI Pro mode info
     if args.svi_mode or args.extend_video:
         svi_mode_type = "Video Extension" if args.extend_video else "Multi-Clip Generation"
