@@ -2343,6 +2343,10 @@ def reconfigure_block_swap(
         del ltx_model._blocks_to_swap
     if hasattr(ltx_model, "_blocks_ref"):
         del ltx_model._blocks_ref
+    if hasattr(ltx_model, "_activation_offload_verbose"):
+        del ltx_model._activation_offload_verbose
+    if hasattr(ltx_model, "_temporal_chunk_size"):
+        del ltx_model._temporal_chunk_size
 
     if isinstance(transformer, X0Model):
         if hasattr(transformer, "_block_swap_offloader"):
@@ -2351,6 +2355,8 @@ def reconfigure_block_swap(
             del transformer._blocks_to_swap
         if hasattr(transformer, "_blocks_ref"):
             del transformer._blocks_ref
+        if hasattr(transformer, "_temporal_chunk_size"):
+            del transformer._temporal_chunk_size
 
     # Re-enable block swap with new configuration
     if enable_activation_offload:
