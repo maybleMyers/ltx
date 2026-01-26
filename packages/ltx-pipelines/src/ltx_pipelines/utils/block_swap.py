@@ -249,14 +249,14 @@ def enable_block_swap_with_activation_offload(
                     transfer_stream.synchronize()
                     pending_transfer = False
 
-                # Move activations from pinned CPU to GPU (fast DMA)
+                # Move activations from pinned CPU to GPU
                 if vx_pinned is not None:
-                    vx_gpu = vx_pinned.to(device, non_blocking=True)
+                    vx_gpu = vx_pinned.to(device)
                 else:
                     vx_gpu = None
 
                 if ax_pinned is not None:
-                    ax_gpu = ax_pinned.to(device, non_blocking=True)
+                    ax_gpu = ax_pinned.to(device)
                 else:
                     ax_gpu = None
 
@@ -285,13 +285,11 @@ def enable_block_swap_with_activation_offload(
                 vx_result = video_out.x if video_out is not None else None
                 ax_result = audio_out.x if audio_out is not None else None
 
-                # Start async GPU→CPU transfer on separate stream (overlaps with next block's weight load)
-                with torch.cuda.stream(transfer_stream):
-                    if vx_result is not None:
-                        vx_pinned.copy_(vx_result, non_blocking=True)
-                    if ax_result is not None:
-                        ax_pinned.copy_(ax_result, non_blocking=True)
-                pending_transfer = True
+                # Copy results back to pinned CPU memory
+                if vx_result is not None:
+                    vx_pinned.copy_(vx_result)
+                if ax_result is not None:
+                    ax_pinned.copy_(ax_result)
 
                 # Clean up GPU tensors (can happen while transfer runs)
                 del vx_gpu, ax_gpu, video_gpu, audio_gpu, video_out, audio_out
