@@ -473,8 +473,9 @@ def build_anchor_image_tuples(
     anchor_interval: int | None,
     anchor_strength: float,
     num_frames: int,
-    images: list[tuple[str, int, float]],
-) -> list[tuple[str, int, float]]:
+    images: list[tuple],
+    anchor_crf: float = 33.0,
+) -> list[tuple[str, int, float, float]]:
     """
     Build anchor conditioning tuples for guiding latent injection.
 
@@ -484,9 +485,10 @@ def build_anchor_image_tuples(
         anchor_strength: Conditioning strength for anchors
         num_frames: Total number of frames in the video
         images: Existing image conditionings (to extract first image if needed)
+        anchor_crf: H.264 CRF for anchor image preprocessing (0=lossless, 33=default)
 
     Returns:
-        List of (image_path, frame_idx, strength) tuples for anchor conditioning
+        List of (image_path, frame_idx, strength, crf) tuples for anchor conditioning
     """
     if anchor_interval is None:
         return []
@@ -501,7 +503,7 @@ def build_anchor_image_tuples(
 
     # Generate frames: [interval, 2*interval, ...] (skip 0, that's handled by i2v)
     anchor_frames = list(range(anchor_interval, num_frames, anchor_interval))
-    return [(anchor_path, frame_idx, anchor_strength) for frame_idx in anchor_frames]
+    return [(anchor_path, frame_idx, anchor_strength, anchor_crf) for frame_idx in anchor_frames]
 
 
 def build_stg_perturbation_config(
@@ -1455,14 +1457,18 @@ def resolve_path(path: str) -> str:
 
 
 class ImageAction(argparse.Action):
-    """Parse image conditioning arguments: PATH FRAME_IDX STRENGTH"""
+    """Parse image conditioning arguments: PATH FRAME_IDX STRENGTH [CRF]"""
     def __call__(self, parser, namespace, values, option_string=None):
-        path, frame_idx, strength_str = values
+        if len(values) < 3 or len(values) > 4:
+            msg = f"{option_string} requires 3-4 arguments (PATH FRAME_IDX STRENGTH [CRF]), got {len(values)}"
+            raise argparse.ArgumentError(self, msg)
+        path, frame_idx, strength_str = values[:3]
+        crf = float(values[3]) if len(values) > 3 else 33.0  # Default CRF
         resolved_path = resolve_path(path)
         frame_idx = int(frame_idx)
         strength = float(strength_str)
         current = getattr(namespace, self.dest) or []
-        current.append((resolved_path, frame_idx, strength))
+        current.append((resolved_path, frame_idx, strength, crf))
         setattr(namespace, self.dest, current)
 
 
@@ -1676,10 +1682,10 @@ Examples:
         "--image",
         dest="images",
         action=ImageAction,
-        nargs=3,
-        metavar=("PATH", "FRAME_IDX", "STRENGTH"),
+        nargs="+",
+        metavar="ARG",
         default=[],
-        help="Image conditioning: path, frame index, strength. Can be repeated.",
+        help="Image conditioning: PATH FRAME_IDX STRENGTH [CRF]. CRF is optional (0=lossless, 33=default). Can be repeated.",
     )
 
     # ==========================================================================
@@ -1691,6 +1697,12 @@ Examples:
         type=resolve_path,
         default=None,
         help="Anchor image path for periodic guidance. If not provided but --anchor-interval is set, uses first --image.",
+    )
+    anchor_group.add_argument(
+        "--anchor-crf",
+        type=float,
+        default=33,
+        help="H.264 CRF for anchor image preprocessing (0=lossless, 33=default).",
     )
     anchor_group.add_argument(
         "--anchor-interval",
@@ -2838,6 +2850,7 @@ class LTXVideoGeneratorWithOffloading:
         anchor_interval: int | None = None,
         anchor_strength: float = 0.8,
         anchor_decay: str | None = None,
+        anchor_crf: float = 33.0,
         audio: str | None = None,
         audio_strength: float = 1.0,
         # STG (Spatio-Temporal Guidance) parameters
@@ -3334,6 +3347,7 @@ class LTXVideoGeneratorWithOffloading:
                     anchor_strength=anchor_strength,
                     num_frames=num_frames,
                     images=images,
+                    anchor_crf=anchor_crf,
                 )
                 if anchor_tuples:
                     anchor_conditionings = image_conditionings_by_adding_guiding_latent(
@@ -4290,6 +4304,7 @@ class LTXVideoGeneratorWithOffloading:
                 anchor_strength=anchor_strength,
                 num_frames=num_frames,
                 images=images,
+                anchor_crf=anchor_crf,
             )
             if anchor_tuples:
                 # Load video encoder for anchor conditioning if needed
@@ -4745,6 +4760,7 @@ def generate_svi_multi_clip(
                 anchor_interval=args.anchor_interval if clip_idx > 0 else None,
                 anchor_strength=args.anchor_strength,
                 anchor_decay=args.anchor_decay,
+                anchor_crf=args.anchor_crf,
                 audio=args.audio,
                 audio_strength=args.audio_strength,
                 # STG parameters
@@ -8438,6 +8454,7 @@ def sliding_window_generate(
             anchor_interval=args.anchor_interval,
             anchor_strength=args.anchor_strength,
             anchor_decay=args.anchor_decay,
+            anchor_crf=args.anchor_crf,
             audio=args.audio,
             audio_strength=args.audio_strength,
             # STG parameters
@@ -8646,6 +8663,9 @@ def main():
     print(f"FP8: {args.enable_fp8}")
     if args.images:
         print(f"Image conditioning: {len(args.images)} image(s)")
+        if args.image_crf != 33:
+            crf_desc = "lossless" if args.image_crf == 0 else f"CRF {args.image_crf}"
+            print(f"  Image CRF: {crf_desc}")
     if args.anchor_interval:
         anchor_src = args.anchor_image if args.anchor_image else "first --image"
         num_anchors = len(range(args.anchor_interval, args.num_frames, args.anchor_interval))
@@ -8942,6 +8962,7 @@ def main():
             anchor_interval=args.anchor_interval,
             anchor_strength=args.anchor_strength,
             anchor_decay=args.anchor_decay,
+            anchor_crf=args.anchor_crf,
             audio=args.audio,
             audio_strength=args.audio_strength,
             stg_scale=args.stg_scale,

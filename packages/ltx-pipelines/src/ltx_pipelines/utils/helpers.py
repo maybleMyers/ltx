@@ -19,6 +19,7 @@ from ltx_core.text_encoders.gemma import GemmaTextEncoderModelBase
 from ltx_core.tools import AudioLatentTools, LatentTools, VideoLatentTools
 from ltx_core.types import AudioLatentShape, LatentState, VideoLatentShape, VideoPixelShape
 from ltx_core.utils import to_denoised, to_velocity
+from ltx_pipelines.utils.constants import DEFAULT_IMAGE_CRF
 from ltx_pipelines.utils.media_io import decode_image, load_image_conditioning, resize_aspect_ratio_preserving
 from ltx_pipelines.utils.types import (
     DenoisingFunc,
@@ -40,21 +41,30 @@ def cleanup_memory() -> None:
 
 
 def image_conditionings_by_replacing_latent(
-    images: list[tuple[str, int, float]],
+    images: list[tuple],
     height: int,
     width: int,
     video_encoder: VideoEncoder,
     dtype: torch.dtype,
     device: torch.device,
+    crf: float = DEFAULT_IMAGE_CRF,
 ) -> list[ConditioningItem]:
+    """
+    Args:
+        images: List of tuples (path, frame_idx, strength) or (path, frame_idx, strength, crf).
+                If crf is provided per-image, it overrides the global crf parameter.
+    """
     conditionings = []
-    for image_path, frame_idx, strength in images:
+    for img_tuple in images:
+        image_path, frame_idx, strength = img_tuple[:3]
+        img_crf = img_tuple[3] if len(img_tuple) > 3 else crf
         image = load_image_conditioning(
             image_path=image_path,
             height=height,
             width=width,
             dtype=dtype,
             device=device,
+            crf=img_crf,
         )
         encoded_image = video_encoder(image)
         conditionings.append(
@@ -69,21 +79,30 @@ def image_conditionings_by_replacing_latent(
 
 
 def image_conditionings_by_adding_guiding_latent(
-    images: list[tuple[str, int, float]],
+    images: list[tuple],
     height: int,
     width: int,
     video_encoder: VideoEncoder,
     dtype: torch.dtype,
     device: torch.device,
+    crf: float = DEFAULT_IMAGE_CRF,
 ) -> list[ConditioningItem]:
+    """
+    Args:
+        images: List of tuples (path, frame_idx, strength) or (path, frame_idx, strength, crf).
+                If crf is provided per-image, it overrides the global crf parameter.
+    """
     conditionings = []
-    for image_path, frame_idx, strength in images:
+    for img_tuple in images:
+        image_path, frame_idx, strength = img_tuple[:3]
+        img_crf = img_tuple[3] if len(img_tuple) > 3 else crf
         image = load_image_conditioning(
             image_path=image_path,
             height=height,
             width=width,
             dtype=dtype,
             device=device,
+            crf=img_crf,
         )
         encoded_image = video_encoder(image)
         conditionings.append(

@@ -76,14 +76,19 @@ def normalize_latent(latent: torch.Tensor, device: torch.device, dtype: torch.dt
 
 
 def load_image_conditioning(
-    image_path: str, height: int, width: int, dtype: torch.dtype, device: torch.device
+    image_path: str, height: int, width: int, dtype: torch.dtype, device: torch.device,
+    crf: float = DEFAULT_IMAGE_CRF,
 ) -> torch.Tensor:
     """
     Loads an image from a path and preprocesses it for conditioning.
     Note: The image is resized to the nearest multiple of 2 for compatibility with video codecs.
+
+    Args:
+        crf: H.264 compression quality (0=lossless, 33=default). Adds compression artifacts
+             to match training data distribution.
     """
     image = decode_image(image_path=image_path)
-    image = preprocess(image=image)
+    image = preprocess(image=image, crf=crf)
     image = torch.tensor(image, dtype=torch.float32, device=device)
     image = resize_and_center_crop(image, height, width)
     image = normalize_latent(image, device, dtype)

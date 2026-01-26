@@ -1315,14 +1315,17 @@ def generate_ltx_video(
     input_image: str,
     image_frame_idx: int,
     image_strength: float,
+    image_crf: float,
     # End image conditioning
     end_image: str,
     end_image_strength: float,
+    end_image_crf: float,
     # Anchor image conditioning
     anchor_image: str,
     anchor_interval: int,
     anchor_strength: float,
     anchor_decay: str,
+    anchor_crf: float,
     # Video input (for V2V / refine)
     input_video: str,
     refine_strength: float,
@@ -1543,14 +1546,14 @@ def generate_ltx_video(
             command.extend(["--v2v-overlap-frames", str(int(v2v_overlap_frames))])
             command.extend(["--refine-latent-stride", str(int(refine_latent_stride))])
 
-        # Image conditioning (I2V)
+        # Image conditioning (I2V) - with per-image CRF
         if mode == "i2v" and input_image:
-            command.extend(["--image", str(input_image), str(int(image_frame_idx)), str(float(image_strength))])
+            command.extend(["--image", str(input_image), str(int(image_frame_idx)), str(float(image_strength)), str(int(image_crf))])
 
-        # End image conditioning (place at last frame)
+        # End image conditioning (place at last frame) - with per-image CRF
         if end_image:
             last_frame_idx = int(num_frames) - 1
-            command.extend(["--image", str(end_image), str(last_frame_idx), str(float(end_image_strength))])
+            command.extend(["--image", str(end_image), str(last_frame_idx), str(float(end_image_strength)), str(int(end_image_crf))])
 
         # Anchor image conditioning (periodic guidance)
         if anchor_interval and int(anchor_interval) > 0:
@@ -1560,6 +1563,8 @@ def generate_ltx_video(
             command.extend(["--anchor-strength", str(float(anchor_strength))])
             if anchor_decay and anchor_decay != "none":
                 command.extend(["--anchor-decay", str(anchor_decay)])
+            if int(anchor_crf) != 33:  # Only add if non-default
+                command.extend(["--anchor-crf", str(int(anchor_crf))])
 
         # Depth Control (IC-LoRA)
         if depth_control_video and os.path.exists(depth_control_video):
@@ -2613,6 +2618,7 @@ def create_interface():
                             with gr.Row():
                                 image_frame_idx = gr.Number(label="Frame Index", value=0, minimum=0, info="Which frame to condition (0 = first)")
                                 image_strength = gr.Slider(minimum=0.0, maximum=1.0, value=0.9, step=0.05, label="Strength")
+                                image_crf = gr.Slider(minimum=0, maximum=51, value=33, step=1, label="CRF", info="H.264 compression (0=lossless, 33=default)")
 
                             with gr.Accordion("Anchor Image (periodic guidance)", open=False):
                                 gr.Markdown("Inject the anchor image at regular intervals to guide the video generation.")
@@ -2636,12 +2642,14 @@ def create_interface():
                                         value="cosine",
                                         info="Decay schedule: strong early, weak later for motion"
                                     )
+                                    anchor_crf = gr.Slider(minimum=0, maximum=51, value=33, step=1, label="CRF", info="H.264 compression (0=lossless, 33=default)")
 
                             with gr.Accordion("End Image (optional)", open=False):
                                 end_image = gr.Image(label="End Image (for start-to-end video)", type="filepath")
                                 gr.Markdown("Set an ending frame to generate video that transitions from start to end image.")
                                 with gr.Row():
                                     end_image_strength = gr.Slider(minimum=0.0, maximum=1.0, value=0.9, step=0.05, label="End Image Strength")
+                                    end_image_crf = gr.Slider(minimum=0, maximum=51, value=33, step=1, label="CRF", info="H.264 compression (0=lossless, 33=default)")
 
                         # Resolution Settings (always visible, outside accordions)
                         gr.Markdown("### Resolution Settings")
@@ -4016,9 +4024,9 @@ Audio is synchronized with the video extension.
                 mode, pipeline, enable_sliding_window, width, height, num_frames, frame_rate,
                 cfg_guidance_scale, num_inference_steps, stage2_steps, seed,
                 stg_scale, stg_blocks, stg_mode,
-                input_image, image_frame_idx, image_strength,
-                end_image, end_image_strength,
-                anchor_image, anchor_interval, anchor_strength, anchor_decay,
+                input_image, image_frame_idx, image_strength, image_crf,
+                end_image, end_image_strength, end_image_crf,
+                anchor_image, anchor_interval, anchor_strength, anchor_decay, anchor_crf,
                 input_video, refine_strength, refine_steps, v2v_chunk_frames, v2v_overlap_frames, refine_latent_stride,
                 disable_audio, audio_input, audio_strength, enhance_prompt,
                 offload, enable_fp8,
@@ -4074,7 +4082,7 @@ Audio is synchronized with the video extension.
         def send_to_generation_handler(metadata, first_frame):
             """Send loaded metadata to generation tab parameters and switch to Generation tab."""
             if not metadata:
-                return [gr.update()] * 42 + ["No metadata loaded - upload a video first"]
+                return [gr.update()] * 45 + ["No metadata loaded - upload a video first"]
 
             # Handle legacy metadata that used single enable_block_swap
             legacy_block_swap = metadata.get("enable_block_swap", True)
@@ -4120,11 +4128,14 @@ Audio is synchronized with the video extension.
                 gr.update(value=first_frame),  # input_image - use extracted first frame
                 gr.update(value=image_frame_idx),  # image_frame_idx
                 gr.update(value=image_strength),  # image_strength
+                gr.update(value=metadata.get("image_crf", 33)),  # image_crf
                 gr.update(value=metadata.get("end_image_strength", 0.9)),  # end_image_strength
+                gr.update(value=metadata.get("end_image_crf", 33)),  # end_image_crf
                 # Anchor conditioning
                 gr.update(value=metadata.get("anchor_interval", 0) or 0),  # anchor_interval
                 gr.update(value=metadata.get("anchor_strength", 0.8)),  # anchor_strength
                 gr.update(value=metadata.get("anchor_decay", "cosine") or "cosine"),  # anchor_decay
+                gr.update(value=metadata.get("anchor_crf", 33)),  # anchor_crf
                 # Refine settings
                 gr.update(value=metadata.get("refine_strength", 0.3)),  # refine_strength
                 gr.update(value=metadata.get("refine_steps", 10)),  # refine_steps
@@ -4177,9 +4188,9 @@ Audio is synchronized with the video extension.
                 # STG parameters
                 stg_scale, stg_blocks, stg_mode,
                 # Image conditioning
-                input_image, image_frame_idx, image_strength, end_image_strength,
+                input_image, image_frame_idx, image_strength, image_crf, end_image_strength, end_image_crf,
                 # Anchor conditioning
-                anchor_interval, anchor_strength, anchor_decay,
+                anchor_interval, anchor_strength, anchor_decay, anchor_crf,
                 # Refine settings
                 refine_strength, refine_steps, v2v_chunk_frames, v2v_overlap_frames, refine_latent_stride,
                 # Audio and prompt
@@ -4353,10 +4364,10 @@ Audio is synchronized with the video extension.
             cfg_guidance_scale, num_inference_steps, stage2_steps, seed,
             stg_scale, stg_blocks, stg_mode,
             # Image conditioning (not input_image itself - that's a file upload)
-            image_frame_idx, image_strength,
-            end_image_strength,
+            image_frame_idx, image_strength, image_crf,
+            end_image_strength, end_image_crf,
             # Anchor conditioning
-            anchor_interval, anchor_strength, anchor_decay,
+            anchor_interval, anchor_strength, anchor_decay, anchor_crf,
             # Refine settings
             refine_strength, refine_steps, v2v_chunk_frames, v2v_overlap_frames, refine_latent_stride,
             # Audio and prompt
@@ -4397,10 +4408,10 @@ Audio is synchronized with the video extension.
             "cfg_guidance_scale", "num_inference_steps", "stage2_steps", "seed",
             "stg_scale", "stg_blocks", "stg_mode",
             # Image conditioning
-            "image_frame_idx", "image_strength",
-            "end_image_strength",
+            "image_frame_idx", "image_strength", "image_crf",
+            "end_image_strength", "end_image_crf",
             # Anchor conditioning
-            "anchor_interval", "anchor_strength", "anchor_decay",
+            "anchor_interval", "anchor_strength", "anchor_decay", "anchor_crf",
             # Refine settings
             "refine_strength", "refine_steps", "v2v_chunk_frames", "v2v_overlap_frames", "refine_latent_stride",
             # Audio and prompt
