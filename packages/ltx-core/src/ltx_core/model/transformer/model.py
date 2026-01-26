@@ -423,62 +423,14 @@ class LTXModel(torch.nn.Module):
         if not self.model_type.is_audio_enabled() and audio is not None:
             raise ValueError("Audio is not enabled for this model")
 
-        use_cpu_preprocessing = getattr(self, '_activation_offload_verbose', None) is not None
-
-        if use_cpu_preprocessing:
-            from dataclasses import replace as dc_replace
-
-            def move_preprocessor_to_device(pp, device):
-                if hasattr(pp, 'simple_preprocessor'):
-                    pp.simple_preprocessor.patchify_proj.to(device)
-                    pp.simple_preprocessor.adaln.to(device)
-                    pp.simple_preprocessor.caption_projection.to(device)
-                else:
-                    pp.patchify_proj.to(device)
-                    pp.adaln.to(device)
-                    pp.caption_projection.to(device)
-                if hasattr(pp, 'cross_scale_shift_adaln'):
-                    pp.cross_scale_shift_adaln.to(device)
-                    pp.cross_gate_adaln.to(device)
-
-            def get_preprocessor_device(pp):
-                if hasattr(pp, 'simple_preprocessor'):
-                    return next(pp.simple_preprocessor.patchify_proj.parameters()).device
-                return next(pp.patchify_proj.parameters()).device
-
-            preprocessor_device = get_preprocessor_device(self.video_args_preprocessor)
-            move_preprocessor_to_device(self.video_args_preprocessor, 'cpu')
-            if hasattr(self, 'audio_args_preprocessor'):
-                move_preprocessor_to_device(self.audio_args_preprocessor, 'cpu')
-            if video is not None:
-                video = dc_replace(video,
-                    latent=video.latent.cpu(),
-                    timesteps=video.timesteps.cpu(),
-                    positions=video.positions.cpu(),
-                    context=video.context.cpu(),
-                    context_mask=video.context_mask.cpu() if video.context_mask is not None else None,
-                )
-            if audio is not None:
-                audio = dc_replace(audio,
-                    latent=audio.latent.cpu(),
-                    timesteps=audio.timesteps.cpu(),
-                    positions=audio.positions.cpu(),
-                    context=audio.context.cpu(),
-                    context_mask=audio.context_mask.cpu() if audio.context_mask is not None else None,
-                )
-            torch.cuda.empty_cache()
-
         video_args = self.video_args_preprocessor.prepare(video) if video is not None else None
         audio_args = self.audio_args_preprocessor.prepare(audio) if audio is not None else None
 
-        if use_cpu_preprocessing:
+        if getattr(self, '_activation_offload_verbose', None) is not None:
             if video_args is not None:
                 video_args = _offload_transformer_args_to_cpu(video_args)
             if audio_args is not None:
                 audio_args = _offload_transformer_args_to_cpu(audio_args)
-            move_preprocessor_to_device(self.video_args_preprocessor, preprocessor_device)
-            if hasattr(self, 'audio_args_preprocessor'):
-                move_preprocessor_to_device(self.audio_args_preprocessor, preprocessor_device)
 
         # Process transformer blocks
         video_out, audio_out = self._process_transformer_blocks(
