@@ -3466,15 +3466,15 @@ class LTXVideoGeneratorWithOffloading:
                             fps=frame_rate,
                         )
 
-                        # Create retry state for V2V sequential chunk denoising
+                        # Create retry state for V2V sequential chunk denoising (fast defaults)
                         chunk_retry_state = OOMRetryState(
                             stage=f"stage1_v2v_seq_chunk{chunk_idx}",
                             original_blocks=self.dit_blocks_in_memory if self.enable_dit_block_swap else 0,
                             current_blocks=self.dit_blocks_in_memory if self.enable_dit_block_swap else 0,
                             min_blocks=2,  # DiT minimum
-                            original_ffn_chunk_size=self.ffn_chunk_size,
-                            original_activation_offload=self.enable_activation_offload,
-                            original_temporal_chunk_size=self.temporal_chunk_size,
+                            original_ffn_chunk_size=None,
+                            original_activation_offload=False,
+                            original_temporal_chunk_size=0,
                         )
 
                         chunk_denoising_kwargs = {
@@ -3810,15 +3810,15 @@ class LTXVideoGeneratorWithOffloading:
                 else:
                     audio_noise_scale = v2a_strength if v2a_preserved_audio_latent is not None else 1.0
 
-                    # Create retry state for V2V sequential audio-only denoising
+                    # Create retry state for V2V sequential audio-only denoising (fast defaults)
                     audio_retry_state = OOMRetryState(
                         stage="stage1_audio",
                         original_blocks=self.dit_blocks_in_memory if self.enable_dit_block_swap else 0,
                         current_blocks=self.dit_blocks_in_memory if self.enable_dit_block_swap else 0,
                         min_blocks=2,  # DiT minimum
-                        original_ffn_chunk_size=self.ffn_chunk_size,
-                        original_activation_offload=self.enable_activation_offload,
-                        original_temporal_chunk_size=self.temporal_chunk_size,
+                        original_ffn_chunk_size=None,
+                        original_activation_offload=False,
+                        original_temporal_chunk_size=0,
                     )
 
                     audio_denoising_kwargs = {
@@ -3860,15 +3860,15 @@ class LTXVideoGeneratorWithOffloading:
                     video_noise_scale = stage_1_sigmas[0]  # Scale initial noise to match sigmas
                     print(f">>> V2V: Scaling sigmas by {refine_strength} to preserve input video (noise_scale={video_noise_scale:.4f})")
 
-                # Create retry state for Stage 1
+                # Create retry state for Stage 1 (fast defaults, chunking only enabled via OOM retry)
                 stage1_retry_state = OOMRetryState(
                     stage="stage1",
                     original_blocks=self.dit_blocks_in_memory if self.enable_dit_block_swap else 0,
                     current_blocks=self.dit_blocks_in_memory if self.enable_dit_block_swap else 0,
                     min_blocks=2,  # DiT minimum
-                    original_ffn_chunk_size=self.ffn_chunk_size,
-                    original_activation_offload=self.enable_activation_offload,
-                    original_temporal_chunk_size=self.temporal_chunk_size,
+                    original_ffn_chunk_size=None,
+                    original_activation_offload=False,
+                    original_temporal_chunk_size=0,
                 )
 
                 denoising_kwargs = {
@@ -5780,15 +5780,15 @@ def generate_av_extension(
         )
         audio_state = noiser(audio_state, noise_scale=1.0)
 
-    # Create retry state for AV-Extension Stage 1
+    # Create retry state for AV-Extension Stage 1 (fast defaults)
     av_stage1_retry_state = OOMRetryState(
         stage="av_extension_stage1",
         original_blocks=generator.dit_blocks_in_memory if generator.enable_dit_block_swap else 0,
         current_blocks=generator.dit_blocks_in_memory if generator.enable_dit_block_swap else 0,
         min_blocks=2,  # DiT minimum
-        original_ffn_chunk_size=generator.ffn_chunk_size,
-        original_activation_offload=generator.enable_activation_offload,
-        original_temporal_chunk_size=generator.temporal_chunk_size,
+        original_ffn_chunk_size=None,
+        original_activation_offload=False,
+        original_temporal_chunk_size=0,
     )
 
     def av_denoising_call(**kwargs):
@@ -7237,15 +7237,15 @@ def generate_v2v_join(
         audio_state = dataclass_replace(audio_state, denoise_mask=torch.zeros_like(audio_state.denoise_mask))
         audio_state = noiser(audio_state, noise_scale=1.0)
 
-    # Create retry state for V2V Join Stage 1
+    # Create retry state for V2V Join Stage 1 (fast defaults)
     v2v_join_stage1_retry_state = OOMRetryState(
         stage="v2v_join_stage1",
         original_blocks=generator.dit_blocks_in_memory if generator.enable_dit_block_swap else 0,
         current_blocks=generator.dit_blocks_in_memory if generator.enable_dit_block_swap else 0,
         min_blocks=2,  # DiT minimum
-        original_ffn_chunk_size=generator.ffn_chunk_size,
-        original_activation_offload=generator.enable_activation_offload,
-        original_temporal_chunk_size=generator.temporal_chunk_size,
+        original_ffn_chunk_size=None,
+        original_activation_offload=False,
+        original_temporal_chunk_size=0,
     )
 
     def v2v_join_denoising_call(**kwargs):
