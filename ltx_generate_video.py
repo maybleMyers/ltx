@@ -259,7 +259,7 @@ class OOMRetryState:
     current_blocks: int = 0
     min_blocks: int = 1
 
-    blocks_with_activation_offload: int = 2
+    blocks_with_activation_offload: int = 4
 
     original_ffn_chunk_size: Optional[int] = None
     ffn_chunking_enabled: bool = False
