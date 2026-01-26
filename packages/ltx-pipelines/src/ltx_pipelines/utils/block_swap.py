@@ -16,7 +16,7 @@ from torch import nn
 from ltx_core.model.transformer.model import LTXModel, X0Model
 from ltx_core.model.transformer.transformer_args import TransformerArgs
 
-from .custom_offloading_utils import ModelOffloader, clean_memory_on_device, weighs_to_device
+from .custom_offloading_utils import ModelOffloader, clean_memory_on_device, weighs_to_device, weights_to_pinned_cpu
 
 
 def _move_transformer_args_to_device(args: TransformerArgs, device: torch.device) -> TransformerArgs:
@@ -456,6 +456,44 @@ def offload_all_blocks(model: X0Model | LTXModel) -> None:
 # Text Encoder (Gemma3) Block Swapping
 # =============================================================================
 
+def _reset_text_encoder_blocks_for_forward(offloader: ModelOffloader, blocks: list, device: torch.device) -> None:
+    """
+    Reset block positions to initial state before each forward pass.
+
+    This is needed for model.generate() which calls forward() multiple times.
+    Without this reset, block positions get out of sync between iterations.
+    """
+    # Fast path: if no pending futures and first block is on GPU, we're good
+    if not offloader.futures:
+        first_block_device = next(blocks[0].parameters()).device
+        if first_block_device.type == device.type:
+            return  # Already in correct state
+
+    # Wait for any pending async operations
+    for idx in list(offloader.futures.keys()):
+        offloader._wait_blocks_move(idx)
+
+    # Synchronize CUDA to ensure all transfers are complete
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+    num_resident = offloader.num_blocks - offloader.blocks_to_swap
+
+    # Check if blocks are in correct position, reset if needed
+    # First num_resident blocks should be on GPU, rest on CPU
+    first_block_device = next(blocks[0].parameters()).device
+    if first_block_device.type != device.type:
+        # Blocks are out of position, need to reset
+        for i, block in enumerate(blocks[:num_resident]):
+            weighs_to_device(block, device)
+        for block in blocks[num_resident:]:
+            weighs_to_device(block, "cpu")
+            if offloader.use_pinned_weights:
+                weights_to_pinned_cpu(block)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+
+
 def enable_text_encoder_block_swap(
     text_encoder,
     blocks_in_memory: int = 6,
@@ -676,6 +714,12 @@ def enable_text_encoder_block_swap(
 
         offloader = self._block_swap_offloader
         blocks = self._blocks_ref
+        device = self._block_swap_device
+
+        # Reset block positions for generate() compatibility
+        # model.generate() calls forward() multiple times - we need to ensure
+        # blocks are in correct position at the start of each forward pass
+        _reset_text_encoder_blocks_for_forward(offloader, blocks, device)
 
         for block_idx, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
             if output_hidden_states:
