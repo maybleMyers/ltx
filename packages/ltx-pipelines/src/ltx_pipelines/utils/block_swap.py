@@ -36,6 +36,7 @@ def _move_transformer_args_to_device(args: TransformerArgs, device: torch.device
         return (to_device(pe[0]), to_device(pe[1]))
 
     return replace(args,
+        x=to_device(args.x),
         timesteps=to_device(args.timesteps),
         embedded_timestep=to_device(args.embedded_timestep),
         context=to_device(args.context),
@@ -201,7 +202,6 @@ def enable_block_swap_with_activation_offload(
         if not use_temporal_chunking:
             video_args_gpu = _move_transformer_args_to_device(video, device) if video is not None else None
             audio_args_gpu = _move_transformer_args_to_device(audio, device) if audio is not None else None
-            torch.cuda.synchronize(device)
         else:
             video_args_gpu = None
             audio_args_gpu = None
