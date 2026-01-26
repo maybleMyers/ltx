@@ -298,7 +298,7 @@ class Offloader:
         self.debug = debug
         self.use_pinned_weights = use_pinned_weights
 
-        self.thread_pool = ThreadPoolExecutor(max_workers=8)
+        self.thread_pool = ThreadPoolExecutor(max_workers=4)
         self.futures = {}
         self.cuda_available = device.type == "cuda"
 
@@ -321,7 +321,7 @@ class Offloader:
         thread_id = threading.current_thread().ident
         # Simple round-robin assignment
         with self._worker_id_lock:
-            worker_id = self._worker_id_counter % 8
+            worker_id = self._worker_id_counter % 4
             self._worker_id_counter += 1
         return worker_id
 
@@ -333,7 +333,7 @@ class Offloader:
         shapes = get_block_param_shapes(reference_block)
 
         # Create resources for each worker
-        for worker_id in range(8):
+        for worker_id in range(4):
             self.spare_buffers[worker_id] = create_pinned_buffer_for_block(shapes)
             self.streams_to_gpu[worker_id] = torch.cuda.Stream(device=self.device)
             self.streams_to_cpu[worker_id] = torch.cuda.Stream(device=self.device)
@@ -346,7 +346,7 @@ class Offloader:
 
         # Calculate memory usage
         total_spare_mem = sum(buf.numel() * buf.element_size() for buf in self.spare_buffers[0].values())
-        print(f"[{self.block_type}] Fast swap initialized: {total_spare_mem / 1e6:.1f}MB spare buffers x 8 workers = {total_spare_mem * 8 / 1e6:.1f}MB total")
+        print(f"[{self.block_type}] Fast swap initialized: {total_spare_mem / 1e6:.1f}MB spare buffers x 4 workers = {total_spare_mem * 4 / 1e6:.1f}MB total")
 
     def swap_weight_devices(self, block_to_cpu: nn.Module, block_to_cuda: nn.Module, worker_id: int = 0):
         if self.cuda_available:

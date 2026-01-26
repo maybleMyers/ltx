@@ -273,7 +273,7 @@ class OOMRetryState:
 
     # Initial (large) chunk sizes when first enabling chunking
     initial_ffn_chunk_size: int = 16384
-    initial_temporal_chunk_size: int = 400000
+    initial_temporal_chunk_size: int = 200000
 
     # Minimum chunk sizes (floor)
     min_ffn_chunk_size: int = 512
@@ -281,7 +281,7 @@ class OOMRetryState:
 
     # Step sizes for reduction
     ffn_chunk_step: int = 512
-    temporal_chunk_step: int = 25000
+    temporal_chunk_step: int = 50000
 
     def can_retry(self) -> bool:
         return self.attempt < self.max_attempts
