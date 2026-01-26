@@ -14,8 +14,38 @@ import torch
 from torch import nn
 
 from ltx_core.model.transformer.model import LTXModel, X0Model
+from ltx_core.model.transformer.transformer_args import TransformerArgs
 
 from .custom_offloading_utils import ModelOffloader, clean_memory_on_device, weighs_to_device
+
+
+def _move_transformer_args_to_device(args: TransformerArgs, device: torch.device) -> TransformerArgs:
+    """Move all TransformerArgs tensors to the specified device."""
+    from dataclasses import replace
+
+    def to_device(t):
+        if t is None:
+            return None
+        if t.device == device:
+            return t
+        return t.to(device, non_blocking=True)
+
+    def pe_to_device(pe):
+        if pe is None:
+            return None
+        return (to_device(pe[0]), to_device(pe[1]))
+
+    return replace(args,
+        x=to_device(args.x),
+        timesteps=to_device(args.timesteps),
+        embedded_timestep=to_device(args.embedded_timestep),
+        context=to_device(args.context),
+        context_mask=to_device(args.context_mask),
+        positional_embeddings=pe_to_device(args.positional_embeddings),
+        cross_positional_embeddings=pe_to_device(args.cross_positional_embeddings),
+        cross_scale_shift_timestep=to_device(args.cross_scale_shift_timestep),
+        cross_gate_timestep=to_device(args.cross_gate_timestep),
+    )
 
 
 def log_memory(label: str) -> None:
@@ -169,6 +199,15 @@ def enable_block_swap_with_activation_offload(
 
         use_temporal_chunking = temporal_chunk_size > 0 and vx_pinned is not None
 
+        # Move non-activation tensors to GPU once (timesteps, positional_embeddings, etc.)
+        # These don't change between blocks, so we only need to transfer them once
+        if not use_temporal_chunking:
+            video_args_gpu = _move_transformer_args_to_device(video, device) if video is not None else None
+            audio_args_gpu = _move_transformer_args_to_device(audio, device) if audio is not None else None
+        else:
+            video_args_gpu = None
+            audio_args_gpu = None
+
         # Track if we have a pending transfer
         pending_transfer = False
 
@@ -222,9 +261,16 @@ def enable_block_swap_with_activation_offload(
                 else:
                     ax_gpu = None
 
-                # Create video/audio args with GPU activations
-                video_gpu = replace(video, x=vx_gpu) if video is not None else None
-                audio_gpu = replace(audio, x=ax_gpu) if audio is not None else None
+                # Use pre-moved GPU args and replace x with the pinned activation buffer
+                if video_args_gpu is not None:
+                    video_gpu = replace(video_args_gpu, x=vx_gpu) if vx_gpu is not None else video_args_gpu
+                else:
+                    video_gpu = None
+
+                if audio_args_gpu is not None:
+                    audio_gpu = replace(audio_args_gpu, x=ax_gpu) if ax_gpu is not None else audio_args_gpu
+                else:
+                    audio_gpu = None
 
                 if verbose and block_idx % 10 == 0:
                     log_memory(f"Block {block_idx} (before)")
@@ -280,9 +326,20 @@ def enable_block_swap_with_activation_offload(
         if verbose:
             log_memory("After block loop")
 
-        # Return with final activations
-        video_final = replace(video, x=vx_final) if video is not None else None
-        audio_final = replace(audio, x=ax_final) if audio is not None else None
+        # Return with final activations (use GPU args if available for consistency)
+        if video_args_gpu is not None:
+            video_final = replace(video_args_gpu, x=vx_final)
+        elif video is not None:
+            video_final = replace(video, x=vx_final)
+        else:
+            video_final = None
+
+        if audio_args_gpu is not None:
+            audio_final = replace(audio_args_gpu, x=ax_final)
+        elif audio is not None:
+            audio_final = replace(audio, x=ax_final)
+        else:
+            audio_final = None
 
         return video_final, audio_final
 
