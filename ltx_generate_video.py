@@ -287,31 +287,49 @@ class OOMRetryState:
         return self.attempt < self.max_attempts
 
     def get_next_strategy(self) -> Optional[dict]:
-        """Returns next retry strategy or None if exhausted."""
+        """Returns next retry strategy or None if exhausted.
+
+        Strategy order:
+        1. Enable activation offload (if not already)
+        2. Reduce blocks down to 1 with activation offload (no FFN/temporal chunking)
+        3. Enable FFN chunking and reduce chunk size
+        4. Enable temporal chunking and reduce chunk size
+        """
         self.attempt += 1
 
-        # Strategy 1: Gradual block reduction (only before activation offload is enabled)
-        if self.current_blocks > self.min_blocks and not self.activation_offload_enabled:
+        # Strategy 1: Enable activation offload first (no FFN/temporal chunking yet)
+        if not self.activation_offload_enabled:
+            return {
+                'blocks': self.current_blocks,
+                'ffn_chunk_size': None,
+                'activation_offload': True,
+                'temporal_chunk_size': 0,
+                'description': f"Enabling activation offload with {self.current_blocks} blocks"
+            }
+
+        # Strategy 2: Reduce blocks while keeping activation offload on (no FFN/temporal chunking)
+        # Go all the way down to min_blocks before trying chunking
+        if self.current_blocks > self.min_blocks and self.current_ffn_chunk_size == 0:
             new_blocks = self.current_blocks - 1
             return {
                 'blocks': new_blocks,
                 'ffn_chunk_size': None,
-                'activation_offload': False,
+                'activation_offload': True,
                 'temporal_chunk_size': 0,
-                'description': f"Reducing blocks from {self.current_blocks} to {new_blocks}"
+                'description': f"Reducing blocks {self.current_blocks}→{new_blocks} (activation offload only)"
             }
 
-        # Strategy 2: Enable activation offload + FFN chunking with more blocks (activations on CPU frees VRAM)
-        if not self.activation_offload_enabled:
+        # Strategy 3: Enable FFN chunking (blocks already at minimum)
+        if self.current_ffn_chunk_size == 0:
             return {
-                'blocks': self.blocks_with_activation_offload,
+                'blocks': self.min_blocks,
                 'ffn_chunk_size': self.initial_ffn_chunk_size,
                 'activation_offload': True,
-                'temporal_chunk_size': self.initial_temporal_chunk_size,
-                'description': f"Enabling activation offload + FFN chunking ({self.initial_ffn_chunk_size}/{self.initial_temporal_chunk_size}) with {self.blocks_with_activation_offload} blocks"
+                'temporal_chunk_size': 0,
+                'description': f"Enabling FFN chunking ({self.initial_ffn_chunk_size}) with {self.min_blocks} blocks"
             }
 
-        # Strategy 3: Reduce FFN chunk size first (minimal speed impact - no CPU-GPU transfers)
+        # Strategy 4: Reduce FFN chunk size
         if self.current_ffn_chunk_size > self.min_ffn_chunk_size:
             new_ffn = max(self.current_ffn_chunk_size - self.ffn_chunk_step, self.min_ffn_chunk_size)
             return {
@@ -319,29 +337,28 @@ class OOMRetryState:
                 'ffn_chunk_size': new_ffn,
                 'activation_offload': True,
                 'temporal_chunk_size': self.current_temporal_chunk_size,
-                'description': f"Reducing FFN chunks: {self.current_ffn_chunk_size}→{new_ffn} (temporal stays at {self.current_temporal_chunk_size})"
+                'description': f"Reducing FFN chunks: {self.current_ffn_chunk_size}→{new_ffn}"
             }
 
-        # Strategy 4: Reduce temporal chunk size
+        # Strategy 5: Enable temporal chunking (FFN at minimum)
+        if self.current_temporal_chunk_size == 0:
+            return {
+                'blocks': self.min_blocks,
+                'ffn_chunk_size': self.min_ffn_chunk_size,
+                'activation_offload': True,
+                'temporal_chunk_size': self.initial_temporal_chunk_size,
+                'description': f"Enabling temporal chunking ({self.initial_temporal_chunk_size})"
+            }
+
+        # Strategy 6: Reduce temporal chunk size
         if self.current_temporal_chunk_size > self.min_temporal_chunk_size:
             new_temporal = max(self.current_temporal_chunk_size - self.temporal_chunk_step, self.min_temporal_chunk_size)
             return {
-                'blocks': self.current_blocks,
+                'blocks': self.min_blocks,
                 'ffn_chunk_size': self.min_ffn_chunk_size,
                 'activation_offload': True,
                 'temporal_chunk_size': new_temporal,
-                'description': f"Reducing temporal chunks: {self.current_temporal_chunk_size}→{new_temporal} (FFN at minimum {self.min_ffn_chunk_size})"
-            }
-
-        # Strategy 5: Reduce blocks (last resort, after chunk sizes minimized)
-        if self.activation_offload_enabled and self.current_blocks > self.min_blocks:
-            new_blocks = self.current_blocks - 1
-            return {
-                'blocks': new_blocks,
-                'ffn_chunk_size': self.min_ffn_chunk_size,
-                'activation_offload': True,
-                'temporal_chunk_size': self.min_temporal_chunk_size,
-                'description': f"Reducing blocks {self.current_blocks}→{new_blocks} (chunks at minimum)"
+                'description': f"Reducing temporal chunks: {self.current_temporal_chunk_size}→{new_temporal}"
             }
 
         # No more strategies
