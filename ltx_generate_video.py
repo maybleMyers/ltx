@@ -3150,10 +3150,11 @@ class LTXVideoGeneratorWithOffloading:
                     transformer.velocity_model.av_ca_v2a_gate_adaln_single.to(self.device)
 
                 # Try to enable block swap with OOM retry (reduce blocks if needed)
+                # Stage 1 uses fast defaults - activation offload/chunking only enabled via OOM retry
                 current_blocks = self.dit_blocks_in_memory
                 min_blocks = 1
                 block_swap_manager = None
-                use_activation_offload = self.enable_activation_offload
+                use_activation_offload = False
 
                 while current_blocks >= min_blocks:
                     try:
@@ -3163,7 +3164,7 @@ class LTXVideoGeneratorWithOffloading:
                                 blocks_in_memory=current_blocks,
                                 device=self.device,
                                 verbose=True,
-                                temporal_chunk_size=self.temporal_chunk_size,
+                                temporal_chunk_size=0,
                             )
                         else:
                             block_swap_manager = enable_block_swap(
@@ -3198,9 +3199,7 @@ class LTXVideoGeneratorWithOffloading:
             else:
                 transformer = self.stage_1_model_ledger.transformer()
 
-            # Enable FFN chunking for long sequences if configured
-            if self.ffn_chunk_size is not None:
-                set_ffn_chunk_size(transformer, self.ffn_chunk_size)
+            # Stage 1 does not use FFN chunking by default (only enabled via OOM retry)
 
             # Create diffusion schedule
             # Both distilled and standard checkpoints use configurable LTX2Scheduler

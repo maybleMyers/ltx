@@ -452,7 +452,7 @@ class LTXModel(torch.nn.Module):
         video_args = self.video_args_preprocessor.prepare(video) if video is not None else None
         audio_args = self.audio_args_preprocessor.prepare(audio) if audio is not None else None
 
-        if getattr(self, '_activation_offload_verbose', None) is not None:
+        if getattr(self, '_activation_offload_verbose', False):
             if video_args is not None:
                 video_args = _offload_transformer_args_to_cpu(video_args)
             if audio_args is not None:
