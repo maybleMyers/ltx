@@ -415,7 +415,7 @@ class LTXModel(torch.nn.Module):
         """Process output for LTXV."""
         # Apply scale-shift modulation
         scale_shift_values = (
-            scale_shift_table[None, None].to(device=x.device, dtype=x.dtype) + embedded_timestep[:, :, None]
+            scale_shift_table[None, None].to(device=x.device, dtype=x.dtype) + embedded_timestep.to(device=x.device)[:, :, None]
         )
         shift, scale = scale_shift_values[:, :, 0], scale_shift_values[:, :, 1]
 
