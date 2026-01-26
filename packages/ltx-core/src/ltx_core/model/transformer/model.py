@@ -47,6 +47,32 @@ def _offload_transformer_args_to_cpu(args: TransformerArgs) -> TransformerArgs:
     )
 
 
+def _move_transformer_args_to_device(args: TransformerArgs, device: torch.device) -> TransformerArgs:
+    from dataclasses import replace
+
+    def to_device(t):
+        if t is None or t.device == device:
+            return t
+        return t.to(device)
+
+    def pe_to_device(pe):
+        if pe is None:
+            return None
+        return (to_device(pe[0]), to_device(pe[1]))
+
+    return replace(args,
+        x=to_device(args.x),
+        timesteps=to_device(args.timesteps),
+        embedded_timestep=to_device(args.embedded_timestep),
+        context=to_device(args.context),
+        context_mask=to_device(args.context_mask),
+        positional_embeddings=pe_to_device(args.positional_embeddings),
+        cross_positional_embeddings=pe_to_device(args.cross_positional_embeddings),
+        cross_scale_shift_timestep=to_device(args.cross_scale_shift_timestep),
+        cross_gate_timestep=to_device(args.cross_gate_timestep),
+    )
+
+
 class LTXModelType(Enum):
     AudioVideo = "ltx av model"
     VideoOnly = "ltx video only model"
@@ -431,6 +457,12 @@ class LTXModel(torch.nn.Module):
                 video_args = _offload_transformer_args_to_cpu(video_args)
             if audio_args is not None:
                 audio_args = _offload_transformer_args_to_cpu(audio_args)
+        else:
+            device = video.latent.device if video is not None else audio.latent.device
+            if video_args is not None:
+                video_args = _move_transformer_args_to_device(video_args, device)
+            if audio_args is not None:
+                audio_args = _move_transformer_args_to_device(audio_args, device)
 
         # Process transformer blocks
         video_out, audio_out = self._process_transformer_blocks(

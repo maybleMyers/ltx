@@ -75,9 +75,9 @@ class TransformerArgsPreprocessor:
                 end = min(start + chunk_size, N)
                 ts_chunk = timestep[:, start:end] if timestep.ndim > 1 else timestep.view(batch_size, -1)[:, start:end]
                 ts_out, emb_out = self.adaln(ts_chunk.flatten(), hidden_dtype=hidden_dtype)
-                ts_chunks.append(ts_out)
-                emb_chunks.append(emb_out)
-                del ts_chunk
+                ts_chunks.append(ts_out.cpu())
+                emb_chunks.append(emb_out.cpu())
+                del ts_chunk, ts_out, emb_out
             timestep_all = torch.cat(ts_chunks, dim=0)
             embedded_all = torch.cat(emb_chunks, dim=0)
             del ts_chunks, emb_chunks
@@ -261,9 +261,9 @@ class MultiModalTransformerArgsPreprocessor:
                 ts_chunk = timestep[:, start:end] if timestep.ndim > 1 else timestep.view(batch_size, -1)[:, start:end]
                 ss_chunk, _ = self.cross_scale_shift_adaln(ts_chunk.flatten(), hidden_dtype=hidden_dtype)
                 gate_chunk, _ = self.cross_gate_adaln(ts_chunk.flatten() * av_ca_factor, hidden_dtype=hidden_dtype)
-                ss_chunks.append(ss_chunk)
-                gate_chunks.append(gate_chunk)
-                del ts_chunk
+                ss_chunks.append(ss_chunk.cpu())
+                gate_chunks.append(gate_chunk.cpu())
+                del ts_chunk, ss_chunk, gate_chunk
             scale_shift_all = torch.cat(ss_chunks, dim=0)
             gate_all = torch.cat(gate_chunks, dim=0)
             del ss_chunks, gate_chunks
