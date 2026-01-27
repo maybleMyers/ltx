@@ -1503,8 +1503,6 @@ def generate_ltx_video(
     # Video input (for V2V / refine)
     input_video: str,
     refine_strength: float,
-    refine_steps: int,
-    refine_latent_stride: int,
     # Audio & prompt
     disable_audio: bool,
     audio_input: str,
@@ -1728,8 +1726,6 @@ def generate_ltx_video(
         if input_video:
             command.extend(["--input-video", str(input_video)])
             command.extend(["--refine-strength", str(float(refine_strength))])
-            command.extend(["--refine-steps", str(int(refine_steps))])
-            command.extend(["--refine-latent-stride", str(int(refine_latent_stride))])
 
         # Image conditioning (I2V) - with per-image CRF
         if mode == "i2v" and input_image:
@@ -2913,17 +2909,6 @@ def create_interface():
                                     minimum=0.0, maximum=1.0, value=0.3, step=0.05,
                                     label="Refine Strength",
                                     info="Amount of noise to add before refinement (0=none, 1=full denoise)"
-                                )
-                                refine_steps = gr.Slider(
-                                    minimum=1, maximum=30, value=10, step=1,
-                                    label="Refine Steps",
-                                    info="Number of refinement denoising steps"
-                                )
-                            with gr.Row():
-                                refine_latent_stride = gr.Slider(
-                                    minimum=1, maximum=8, value=8, step=1,
-                                    label="Refine Latent Stride",
-                                    info="Condition every Nth frame in refine-only mode. Lower values (1-4) produce smoother video but use more VRAM."
                                 )
 
                         # Depth Control (IC-LoRA)
@@ -4298,7 +4283,7 @@ Audio is synchronized with the video extension.
                 input_image, image_frame_idx, image_strength, image_crf,
                 end_image, end_image_strength, end_image_crf,
                 anchor_image, anchor_interval, anchor_strength, anchor_decay, anchor_crf,
-                input_video, refine_strength, refine_steps, refine_latent_stride,
+                input_video, refine_strength,
                 disable_audio, audio_input, audio_strength, enhance_prompt,
                 offload, enable_fp8,
                 enable_dit_block_swap, dit_blocks_in_memory,
@@ -4353,7 +4338,7 @@ Audio is synchronized with the video extension.
         def send_to_generation_handler(metadata, first_frame):
             """Send loaded metadata to generation tab parameters and switch to Generation tab."""
             if not metadata:
-                return [gr.update()] * 48 + ["No metadata loaded - upload a video first"]
+                return [gr.update()] * 46 + ["No metadata loaded - upload a video first"]
 
             # Handle legacy metadata that used single enable_block_swap
             legacy_block_swap = metadata.get("enable_block_swap", True)
@@ -4424,8 +4409,6 @@ Audio is synchronized with the video extension.
                 gr.update(value=metadata.get("anchor_crf", 33)),  # anchor_crf
                 # Refine settings
                 gr.update(value=metadata.get("refine_strength", 0.3)),  # refine_strength
-                gr.update(value=metadata.get("refine_steps", 10)),  # refine_steps
-                gr.update(value=metadata.get("refine_latent_stride", 8)),  # refine_latent_stride
                 # Audio and prompt
                 gr.update(value=metadata.get("disable_audio", False)),  # disable_audio
                 gr.update(value=metadata.get("audio_strength", 1.0)),  # audio_strength
@@ -4476,7 +4459,7 @@ Audio is synchronized with the video extension.
                 # Anchor conditioning
                 anchor_interval, anchor_strength, anchor_decay, anchor_crf,
                 # Refine settings
-                refine_strength, refine_steps, refine_latent_stride,
+                refine_strength,
                 # Audio and prompt
                 disable_audio, audio_strength, enhance_prompt,
                 # Memory optimization
@@ -4653,7 +4636,7 @@ Audio is synchronized with the video extension.
             # Anchor conditioning
             anchor_interval, anchor_strength, anchor_decay, anchor_crf,
             # Refine settings
-            refine_strength, refine_steps, refine_latent_stride,
+            refine_strength,
             # Audio and prompt
             disable_audio, audio_strength, enhance_prompt,
             # Memory optimization
@@ -4697,7 +4680,7 @@ Audio is synchronized with the video extension.
             # Anchor conditioning
             "anchor_interval", "anchor_strength", "anchor_decay", "anchor_crf",
             # Refine settings
-            "refine_strength", "refine_steps", "refine_latent_stride",
+            "refine_strength",
             # Audio and prompt
             "disable_audio", "audio_strength", "enhance_prompt",
             # Memory optimization
