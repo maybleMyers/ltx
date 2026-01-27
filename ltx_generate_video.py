@@ -1834,6 +1834,30 @@ Examples:
              "Uses LTX2Scheduler to generate sigma schedule.",
     )
     model_group.add_argument(
+        "--stage3-steps",
+        type=int,
+        default=3,
+        help="Number of denoising steps for stage 3 refinement (default: 3). "
+             "Only used when --num-stages is 3.",
+    )
+    model_group.add_argument(
+        "--num-stages",
+        type=int,
+        choices=[1, 2, 3],
+        default=2,
+        help="Number of pipeline stages: 1 (single-stage), 2 (default two-stage), "
+             "or 3 (three-stage with additional refinement).",
+    )
+    model_group.add_argument(
+        "--pipeline-mode",
+        type=str,
+        choices=["exponential", "linear"],
+        default="exponential",
+        help="Pipeline mode for multi-stage generation. "
+             "'exponential': stage 1 at half resolution, then upsample (default). "
+             "'linear': all stages at full resolution (no upsampling).",
+    )
+    model_group.add_argument(
         "--vae",
         type=resolve_path,
         default=None,
@@ -2013,6 +2037,16 @@ Examples:
         default=[],
         help="User LoRA for stage 2 (refinement) only: path and optional strength. Can be repeated.",
     )
+    lora_group.add_argument(
+        "--stage3-lora",
+        dest="stage3_loras",
+        action=LoraAction,
+        nargs="+",
+        metavar=("PATH", "STRENGTH"),
+        default=[],
+        help="User LoRA for stage 3 (refinement) only: path and optional strength. "
+             "Only used when --num-stages is 3 and --pipeline-mode is 'exponential'.",
+    )
 
     # ==========================================================================
     # Depth Control (IC-LoRA)
@@ -2097,6 +2131,19 @@ Examples:
         type=int,
         default=22,
         help="Number of refiner transformer blocks to keep in GPU (default: 22).",
+    )
+    # Stage 3 block swapping
+    mem_group.add_argument(
+        "--enable-stage3-block-swap",
+        action="store_true",
+        help="Enable block swapping for stage 3 transformer. "
+             "Only used when --num-stages is 3.",
+    )
+    mem_group.add_argument(
+        "--stage3-blocks-in-memory",
+        type=int,
+        default=22,
+        help="Number of stage 3 transformer blocks to keep in GPU (default: 22).",
     )
     # FFN chunking for long sequences
     mem_group.add_argument(
@@ -3002,6 +3049,7 @@ class LTXVideoGeneratorWithOffloading:
         gemma_root: str,
         loras: list[LoraPathStrengthAndSDOps],
         stage2_loras: list[LoraPathStrengthAndSDOps] = None,
+        stage3_loras: list[LoraPathStrengthAndSDOps] = None,
         device: str = None,
         fp8transformer: bool = False,
         offload: bool = False,
@@ -3012,6 +3060,8 @@ class LTXVideoGeneratorWithOffloading:
         text_encoder_blocks_in_memory: int = 6,
         enable_refiner_block_swap: bool = False,
         refiner_blocks_in_memory: int = 22,
+        enable_stage3_block_swap: bool = False,
+        stage3_blocks_in_memory: int = 22,
         enable_activation_offload: bool = False,
         temporal_chunk_size: int = 0,
         one_stage: bool = False,
@@ -3020,6 +3070,8 @@ class LTXVideoGeneratorWithOffloading:
         stage2_checkpoint: str | None = None,
         ffn_chunk_size: int | None = None,
         vae_path: str | None = None,
+        num_stages: int = 2,
+        pipeline_mode: str = "exponential",
     ):
         self.device = device or get_device()
         self.dtype = torch.bfloat16
@@ -3031,6 +3083,8 @@ class LTXVideoGeneratorWithOffloading:
         self.text_encoder_blocks_in_memory = text_encoder_blocks_in_memory
         self.enable_refiner_block_swap = enable_refiner_block_swap
         self.refiner_blocks_in_memory = refiner_blocks_in_memory
+        self.enable_stage3_block_swap = enable_stage3_block_swap
+        self.stage3_blocks_in_memory = stage3_blocks_in_memory
         self.enable_activation_offload = enable_activation_offload
         self.temporal_chunk_size = temporal_chunk_size
         self.one_stage = one_stage
@@ -3039,6 +3093,15 @@ class LTXVideoGeneratorWithOffloading:
         self.stage2_checkpoint = stage2_checkpoint
         self.ffn_chunk_size = ffn_chunk_size
         self.vae_path = vae_path
+        self.num_stages = num_stages
+        self.pipeline_mode = pipeline_mode
+
+        # If num_stages=1, treat as one_stage mode
+        if num_stages == 1:
+            self.one_stage = True
+
+        # Store stage 1 loras for use in linear mode
+        self._stage_1_loras = loras
 
         # Create model ledger for stage 1
         self.stage_1_model_ledger = ModelLedger(
@@ -3062,6 +3125,18 @@ class LTXVideoGeneratorWithOffloading:
         self._stage_2_loras = stage2_loras or []
         self._stage_2_distilled_lora = distilled_lora
         self._stage_2_fp8transformer = fp8transformer
+
+        # Store params for stage 3 (only used when num_stages >= 3)
+        # Use same checkpoint as stage 2 by default
+        self._stage_3_checkpoint_path = stage2_checkpoint if stage2_checkpoint else checkpoint_path
+        self._stage_3_gemma_root = gemma_root
+        self._stage_3_spatial_upsampler_path = spatial_upsampler_path
+        self._stage_3_vae_path = vae_path
+        # In exponential mode: stage3_loras + distilled_lora
+        # In linear mode: use stage 1 loras (same as all stages)
+        self._stage_3_loras = stage3_loras or []
+        self._stage_3_distilled_lora = distilled_lora
+        self._stage_3_fp8transformer = fp8transformer
 
         # Create model ledger for stage 2 (with distilled LoRA)
         # Note: Creating via with_loras for now, will create fresh in generate if needed
@@ -3148,6 +3223,8 @@ class LTXVideoGeneratorWithOffloading:
         refine_latent_stride: int = 8,
         # Sampler selection
         sampler: str = "euler",
+        # Stage 3 parameters
+        stage3_steps: int = 3,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor | None, str | None]:
         """
         Generate video with optional audio.
@@ -3580,6 +3657,16 @@ class LTXVideoGeneratorWithOffloading:
 
             # Stage 1 output shape (half resolution for two-stage, full for one-stage)
             if self.one_stage:
+                # One-stage: full resolution
+                stage_1_output_shape = VideoPixelShape(
+                    batch=1,
+                    frames=num_frames,
+                    width=width,
+                    height=height,
+                    fps=frame_rate,
+                )
+            elif self.pipeline_mode == "linear":
+                # Linear mode: all stages at full resolution (no upsampling)
                 stage_1_output_shape = VideoPixelShape(
                     batch=1,
                     frames=num_frames,
@@ -3588,6 +3675,7 @@ class LTXVideoGeneratorWithOffloading:
                     fps=frame_rate,
                 )
             else:
+                # Exponential mode: stage 1 at half resolution
                 stage_1_output_shape = VideoPixelShape(
                     batch=1,
                     frames=num_frames,
@@ -4290,21 +4378,27 @@ class LTXVideoGeneratorWithOffloading:
                 return decoded_video, decoded_audio, enhanced_prompt
 
             # =====================================================================
-            # Phase 3: Spatial Upsampling (two-stage only)
+            # Phase 3: Spatial Upsampling (exponential mode only)
             # =====================================================================
-            print(">>> Upsampling latents (2x)...", flush=True)
-            upsample_start = time.time()
+            if self.pipeline_mode == "linear":
+                # Linear mode: no upsampling needed, use latent directly
+                print(">>> Linear mode: skipping upsampling (all stages at same resolution)")
+                upscaled_video_latent = video_state.latent[:1]
+            else:
+                # Exponential mode: upsample 2x
+                print(">>> Upsampling latents (2x)...", flush=True)
+                upsample_start = time.time()
 
-            spatial_upsampler = self.stage_2_model_ledger.spatial_upsampler()
-            upscaled_video_latent = upsample_video(
-                latent=video_state.latent[:1],
-                video_encoder=video_encoder,
-                upsampler=spatial_upsampler,
-            )
+                spatial_upsampler = self.stage_2_model_ledger.spatial_upsampler()
+                upscaled_video_latent = upsample_video(
+                    latent=video_state.latent[:1],
+                    video_encoder=video_encoder,
+                    upsampler=spatial_upsampler,
+                )
 
-            torch.cuda.synchronize()
-            cleanup_memory()
-            print(f">>> Upsampling completed in {time.time() - upsample_start:.1f}s", flush=True)
+                torch.cuda.synchronize()
+                cleanup_memory()
+                print(f">>> Upsampling completed in {time.time() - upsample_start:.1f}s", flush=True)
         # End of skip_stage_1 block
 
         # =====================================================================
@@ -4836,6 +4930,311 @@ class LTXVideoGeneratorWithOffloading:
         phase_barrier("stage_2_denoising")
 
         # =====================================================================
+        # Phase 4.5: Stage 3 - Additional Refinement (3-stage pipelines only)
+        # =====================================================================
+        if self.num_stages >= 3:
+            print(">>> Stage 3: Loading transformer for final refinement...", flush=True)
+            stage3_start = time.time()
+
+            # Force complete cleanup before loading stage 3 transformer
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+
+            # Determine which LoRAs to use for stage 3
+            # Exponential mode: stage3_loras + distilled_lora
+            # Linear mode: stage 1 loras (same as all stages)
+            if self.pipeline_mode == "linear":
+                stage_3_loras_to_apply = self._stage_1_loras
+            else:
+                # Exponential mode: combine stage3_loras with distilled_lora
+                stage_3_loras_to_apply = (*self._stage_3_loras, *self._stage_3_distilled_lora) if self._stage_3_distilled_lora else self._stage_3_loras
+
+            # Load stage 3 transformer with LoRAs
+            block_swap_manager = None
+            if self.enable_stage3_block_swap and stage_3_loras_to_apply:
+                # Create ledger WITHOUT LoRAs - loading will be fast
+                stage_3_ledger_no_lora = ModelLedger(
+                    dtype=self.dtype,
+                    device=torch.device("cpu"),
+                    checkpoint_path=self._stage_3_checkpoint_path,
+                    gemma_root_path=self._stage_3_gemma_root,
+                    spatial_upsampler_path=self._stage_3_spatial_upsampler_path,
+                    vae_path=self._stage_3_vae_path,
+                    loras=(),  # No LoRAs - load base model only
+                    fp8transformer=self._stage_3_fp8transformer,
+                )
+                transformer = stage_3_ledger_no_lora.transformer()
+
+                # Load LoRA state dicts (same pattern as stage 2)
+                print(f">>> Stage 3: Loading {len(stage_3_loras_to_apply)} LoRA(s)...", flush=True)
+                from ltx_core.loader.sft_loader import SafetensorsStateDictLoader
+                lora_loader = SafetensorsStateDictLoader()
+                lora_state_dicts = []
+                lora_strengths = []
+                for lora_spec in stage_3_loras_to_apply:
+                    lora_sd = lora_loader.load(lora_spec.path, sd_ops=lora_spec.sd_ops, device=torch.device("cpu"))
+                    lora_state_dicts.append(lora_sd)
+                    lora_strengths.append(lora_spec.strength)
+
+                # Apply LoRAs using chunked GPU computation
+                apply_loras_chunked_gpu(
+                    model=transformer,
+                    lora_state_dicts=lora_state_dicts,
+                    lora_strengths=lora_strengths,
+                    gpu_device=self.device,
+                    dtype=self.dtype,
+                )
+
+                # Clean up LoRA state dicts
+                del lora_state_dicts
+                synchronize_and_cleanup()
+
+                # Move non-block components to GPU (same pattern as stage 2)
+                print(f">>> Enabling stage 3 block swapping ({self.stage3_blocks_in_memory} blocks in GPU)...")
+                transformer.velocity_model.patchify_proj.to(self.device)
+                transformer.velocity_model.adaln_single.to(self.device)
+                transformer.velocity_model.caption_projection.to(self.device)
+                transformer.velocity_model.norm_out.to(self.device)
+                transformer.velocity_model.proj_out.to(self.device)
+                transformer.velocity_model.scale_shift_table = torch.nn.Parameter(
+                    transformer.velocity_model.scale_shift_table.to(self.device)
+                )
+                if hasattr(transformer.velocity_model, "audio_patchify_proj"):
+                    transformer.velocity_model.audio_patchify_proj.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_adaln_single"):
+                    transformer.velocity_model.audio_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_caption_projection"):
+                    transformer.velocity_model.audio_caption_projection.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_norm_out"):
+                    transformer.velocity_model.audio_norm_out.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_proj_out"):
+                    transformer.velocity_model.audio_proj_out.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_scale_shift_table"):
+                    transformer.velocity_model.audio_scale_shift_table = torch.nn.Parameter(
+                        transformer.velocity_model.audio_scale_shift_table.to(self.device)
+                    )
+                # Cross-attention adaln components
+                if hasattr(transformer.velocity_model, "av_ca_video_scale_shift_adaln_single"):
+                    transformer.velocity_model.av_ca_video_scale_shift_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "av_ca_audio_scale_shift_adaln_single"):
+                    transformer.velocity_model.av_ca_audio_scale_shift_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "av_ca_a2v_gate_adaln_single"):
+                    transformer.velocity_model.av_ca_a2v_gate_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "av_ca_v2a_gate_adaln_single"):
+                    transformer.velocity_model.av_ca_v2a_gate_adaln_single.to(self.device)
+
+                # Enable block swap
+                block_swap_manager = enable_block_swap(transformer, self.stage3_blocks_in_memory)
+            elif self.enable_stage3_block_swap:
+                # Block swap without LoRAs
+                stage_3_ledger = ModelLedger(
+                    dtype=self.dtype,
+                    device=torch.device("cpu"),
+                    checkpoint_path=self._stage_3_checkpoint_path,
+                    gemma_root_path=self._stage_3_gemma_root,
+                    spatial_upsampler_path=self._stage_3_spatial_upsampler_path,
+                    vae_path=self._stage_3_vae_path,
+                    loras=(),
+                    fp8transformer=self._stage_3_fp8transformer,
+                )
+                transformer = stage_3_ledger.transformer()
+
+                # Move non-block components to GPU (same pattern as stage 2)
+                print(f">>> Enabling stage 3 block swapping ({self.stage3_blocks_in_memory} blocks in GPU)...")
+                transformer.velocity_model.patchify_proj.to(self.device)
+                transformer.velocity_model.adaln_single.to(self.device)
+                transformer.velocity_model.caption_projection.to(self.device)
+                transformer.velocity_model.norm_out.to(self.device)
+                transformer.velocity_model.proj_out.to(self.device)
+                transformer.velocity_model.scale_shift_table = torch.nn.Parameter(
+                    transformer.velocity_model.scale_shift_table.to(self.device)
+                )
+                if hasattr(transformer.velocity_model, "audio_patchify_proj"):
+                    transformer.velocity_model.audio_patchify_proj.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_adaln_single"):
+                    transformer.velocity_model.audio_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_caption_projection"):
+                    transformer.velocity_model.audio_caption_projection.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_norm_out"):
+                    transformer.velocity_model.audio_norm_out.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_proj_out"):
+                    transformer.velocity_model.audio_proj_out.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_scale_shift_table"):
+                    transformer.velocity_model.audio_scale_shift_table = torch.nn.Parameter(
+                        transformer.velocity_model.audio_scale_shift_table.to(self.device)
+                    )
+                # Cross-attention adaln components
+                if hasattr(transformer.velocity_model, "av_ca_video_scale_shift_adaln_single"):
+                    transformer.velocity_model.av_ca_video_scale_shift_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "av_ca_audio_scale_shift_adaln_single"):
+                    transformer.velocity_model.av_ca_audio_scale_shift_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "av_ca_a2v_gate_adaln_single"):
+                    transformer.velocity_model.av_ca_a2v_gate_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "av_ca_v2a_gate_adaln_single"):
+                    transformer.velocity_model.av_ca_v2a_gate_adaln_single.to(self.device)
+
+                block_swap_manager = enable_block_swap(transformer, self.stage3_blocks_in_memory)
+            else:
+                # No block swap - load with LoRAs directly to GPU
+                stage_3_ledger = ModelLedger(
+                    dtype=self.dtype,
+                    device=self.device,
+                    checkpoint_path=self._stage_3_checkpoint_path,
+                    gemma_root_path=self._stage_3_gemma_root,
+                    spatial_upsampler_path=self._stage_3_spatial_upsampler_path,
+                    vae_path=self._stage_3_vae_path,
+                    loras=stage_3_loras_to_apply,
+                    fp8transformer=self._stage_3_fp8transformer,
+                )
+                transformer = stage_3_ledger.transformer()
+
+            # Generate sigma schedule for stage 3 (same pattern as stage 2)
+            if stage3_steps == 3:
+                stage3_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
+            elif stage3_steps == 8:
+                stage3_sigmas = torch.Tensor(DISTILLED_SIGMA_VALUES).to(self.device)
+                print(f">>> Stage 3 using full trained 8-step distilled schedule")
+            else:
+                # Interpolate tuned values
+                tuned = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES)
+                orig_positions = torch.linspace(0, 1, len(tuned))
+                new_positions = torch.linspace(0, 1, stage3_steps + 1)
+                stage3_sigmas = torch.zeros(stage3_steps + 1)
+                for i, pos in enumerate(new_positions):
+                    idx = torch.searchsorted(orig_positions, pos, right=True)
+                    if idx == 0:
+                        stage3_sigmas[i] = tuned[0]
+                    elif idx >= len(tuned):
+                        stage3_sigmas[i] = tuned[-1]
+                    else:
+                        t = (pos - orig_positions[idx-1]) / (orig_positions[idx] - orig_positions[idx-1])
+                        stage3_sigmas[i] = tuned[idx-1] * (1 - t) + tuned[idx] * t
+                stage3_sigmas = stage3_sigmas.to(self.device)
+                print(f">>> Stage 3 using {stage3_steps} steps (interpolated from tuned schedule)")
+
+            # Move text embeddings to GPU for stage 3 denoising
+            v_context_p = v_context_p.to(self.device)
+            a_context_p = a_context_p.to(self.device)
+
+            # Define denoising function for stage 3
+            effective_anchor_decay = anchor_decay if anchor_decay and anchor_decay != "none" else None
+            def third_stage_denoising_loop(
+                sigmas: torch.Tensor,
+                video_state: LatentState,
+                audio_state: LatentState,
+                stepper: DiffusionStepProtocol,
+            ) -> tuple[LatentState, LatentState]:
+                return euler_denoising_loop(
+                    sigmas=sigmas,
+                    video_state=video_state,
+                    audio_state=audio_state,
+                    stepper=stepper,
+                    denoise_fn=simple_denoising_func(
+                        video_context=v_context_p,
+                        audio_context=a_context_p,
+                        transformer=transformer,
+                    ),
+                    anchor_decay=effective_anchor_decay,
+                    callback=preview_callback,
+                    callback_interval=preview_callback_interval,
+                    latent_norm_fn=latent_norm_fn,
+                )
+
+            # Stage 3 output shape (always full resolution)
+            stage_3_output_shape = VideoPixelShape(
+                batch=1,
+                frames=num_frames,
+                width=width,
+                height=height,
+                fps=frame_rate,
+            )
+
+            # Stage 3 conditionings (similar to stage 2)
+            stage_3_conditionings = image_conditionings_by_replacing_latent(
+                images=images,
+                height=stage_3_output_shape.height,
+                width=stage_3_output_shape.width,
+                num_frames=num_frames,
+                device=self.device,
+                dtype=dtype,
+                video_encoder=None,  # Video encoder already released
+            )
+
+            print(f">>> Stage 3: Refining at {stage_3_output_shape.width}x{stage_3_output_shape.height}...")
+
+            # Use stage 2 output as initial latent for stage 3
+            stage_3_initial_video = video_state.latent
+            stage_3_initial_audio = audio_state.latent
+
+            # OOM retry for stage 3
+            stage3_retry_state = OOMRetryState(
+                initial_blocks=self.stage3_blocks_in_memory,
+                min_blocks=1,
+            )
+
+            denoising_kwargs = {
+                'output_shape': stage_3_output_shape,
+                'conditionings': stage_3_conditionings,
+                'noiser': noiser,
+                'sigmas': stage3_sigmas,
+                'stepper': stepper,
+                'denoising_loop_fn': third_stage_denoising_loop,
+                'components': self.pipeline_components,
+                'dtype': dtype,
+                'device': self.device,
+                'noise_scale': stage3_sigmas[0],
+                'initial_video_latent': stage_3_initial_video,
+                'initial_audio_latent': stage_3_initial_audio,
+                'audio_conditionings': audio_conditionings if audio_conditionings else None,
+            }
+
+            # Execute with OOM retry
+            (video_state, audio_state), block_swap_manager = oom_retry_wrapper(
+                retry_state=stage3_retry_state,
+                denoising_fn=denoise_audio_video,
+                transformer=transformer,
+                generator_instance=self,
+                block_swap_manager=block_swap_manager,
+                seed=seed,
+                **denoising_kwargs
+            )
+
+            print(f">>> Stage 3 completed in {time.time() - stage3_start:.1f}s")
+
+            # Clear closure references
+            third_stage_denoising_loop = None
+
+            # Cleanup stage 3 models
+            if block_swap_manager:
+                offload_all_blocks(transformer)
+                if hasattr(transformer, 'velocity_model'):
+                    if hasattr(transformer.velocity_model, '_block_swap_offloader'):
+                        transformer.velocity_model._block_swap_offloader = None
+                    if hasattr(transformer.velocity_model, '_blocks_ref'):
+                        transformer.velocity_model._blocks_ref = None
+                if hasattr(transformer, '_block_swap_offloader'):
+                    transformer._block_swap_offloader = None
+                if hasattr(transformer, '_blocks_ref'):
+                    transformer._blocks_ref = None
+                block_swap_manager = None
+
+            if transformer is not None:
+                transformer.to("cpu")
+            transformer = None
+
+            del stage_3_conditionings
+
+            # Move text embeddings to CPU
+            v_context_p = v_context_p.cpu()
+            a_context_p = a_context_p.cpu()
+
+            torch.cuda.synchronize()
+            cleanup_memory()
+            phase_barrier("stage_3_denoising")
+
+        # =====================================================================
         # Phase 5: VAE Decoding (Sequential loading to minimize peak memory)
         # =====================================================================
 
@@ -5049,6 +5448,8 @@ def generate_svi_multi_clip(
                 latent_norm_fn=latent_norm_fn,
                 # Sampler
                 sampler=args.sampler,
+                # Stage 3 parameters
+                stage3_steps=args.stage3_steps,
             )
 
             # Collect video frames from iterator - move to CPU immediately to save GPU memory
@@ -8750,6 +9151,8 @@ def sliding_window_generate(
             latent_norm_fn=latent_norm_fn,
             # Sampler
             sampler=args.sampler,
+            # Stage 3 parameters
+            stage3_steps=args.stage3_steps,
         )
 
         # Collect video frames from iterator - move to CPU immediately to save GPU memory
@@ -8984,6 +9387,7 @@ def main():
         gemma_root=args.gemma_root,
         loras=args.loras,
         stage2_loras=args.stage2_loras,
+        stage3_loras=args.stage3_loras,
         fp8transformer=args.enable_fp8,
         offload=args.offload,
         enable_dit_block_swap=args.enable_dit_block_swap,
@@ -8992,6 +9396,8 @@ def main():
         text_encoder_blocks_in_memory=args.text_encoder_blocks_in_memory,
         enable_refiner_block_swap=args.enable_refiner_block_swap,
         refiner_blocks_in_memory=args.refiner_blocks_in_memory,
+        enable_stage3_block_swap=args.enable_stage3_block_swap,
+        stage3_blocks_in_memory=args.stage3_blocks_in_memory,
         enable_activation_offload=args.enable_activation_offload,
         temporal_chunk_size=args.temporal_chunk_size,
         one_stage=args.one_stage,
@@ -9000,6 +9406,8 @@ def main():
         stage2_checkpoint=args.stage2_checkpoint,
         ffn_chunk_size=args.ffn_chunk_size,
         vae_path=args.vae,
+        num_stages=args.num_stages,
+        pipeline_mode=args.pipeline_mode,
     )
 
     # Set up tiling config for VAE
@@ -9260,6 +9668,7 @@ def main():
             v2v_overlap_frames=args.v2v_overlap_frames,
             refine_latent_stride=args.refine_latent_stride,
             sampler=args.sampler,
+            stage3_steps=args.stage3_steps,
         )
 
     # Encode and save video

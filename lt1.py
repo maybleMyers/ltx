@@ -94,6 +94,17 @@ def parse_ltx_progress_line(line: str) -> Optional[str]:
         match = re.search(r'(\d+\.?\d*)s', line)
         if match:
             return f"Stage 2 completed ({match.group(1)}s)"
+    # Stage 3 progress
+    if ">>> Stage 3: Loading" in line:
+        return "Stage 3: Loading transformer..."
+    if ">>> Stage 3: Refining" in line:
+        return "Stage 3: Final refinement..."
+    if ">>> Stage 3 completed" in line:
+        match = re.search(r'(\d+\.?\d*)s', line)
+        if match:
+            return f"Stage 3 completed ({match.group(1)}s)"
+    if ">>> Linear mode: skipping upsampling" in line:
+        return "Linear mode: same resolution..."
     if ">>> Decoding video" in line:
         return "Decoding video from latents..."
     if ">>> Decoding audio" in line:
@@ -1603,9 +1614,11 @@ def generate_ltx_video(
 
     is_one_stage = (pipeline == "one-stage")
     is_refine_only = (pipeline == "refine-only")
+    is_three_stage_exp = (pipeline == "three-stage-exp")
+    is_three_stage_linear = (pipeline == "three-stage-linear")
     error = validate_model_paths(checkpoint_path, spatial_upsampler_path,
                                   distilled_lora_path, gemma_root,
-                                  is_one_stage=is_one_stage,
+                                  is_one_stage=is_one_stage or is_three_stage_linear,
                                   is_refine_only=is_refine_only)
     if error:
         yield [], None, error, ""
@@ -1683,6 +1696,15 @@ def generate_ltx_video(
             # Refine-only: distilled LoRA is optional, skip if stage2 checkpoint or distilled checkpoint
             if not distilled_checkpoint and not stage2_checkpoint and distilled_lora_path and distilled_lora_path.strip() and os.path.exists(distilled_lora_path):
                 command.extend(["--distilled-lora", distilled_lora_path, str(distilled_lora_strength)])
+        elif is_three_stage_exp:
+            # Three-stage exponential: stage 1 at half res, stages 2 & 3 at full res
+            command.extend(["--num-stages", "3", "--pipeline-mode", "exponential"])
+            command.extend(["--spatial-upsampler-path", spatial_upsampler_path])
+            if not distilled_checkpoint and not stage2_checkpoint:
+                command.extend(["--distilled-lora", distilled_lora_path, str(distilled_lora_strength)])
+        elif is_three_stage_linear:
+            # Three-stage linear: all stages at full resolution
+            command.extend(["--num-stages", "3", "--pipeline-mode", "linear"])
         else:
             # Two-stage specific: spatial upsampler and distilled LoRA
             command.extend(["--spatial-upsampler-path", spatial_upsampler_path])
@@ -1790,9 +1812,12 @@ def generate_ltx_video(
                         command.extend(["--lora", lora_path, str(user_lora_strength)])
                     elif user_lora_stage == "Stage 2 (Refine)":
                         command.extend(["--stage2-lora", lora_path, str(user_lora_strength)])
-                    else:  # "Both"
+                    elif user_lora_stage == "Stage 3 (Refine)":
+                        command.extend(["--stage3-lora", lora_path, str(user_lora_strength)])
+                    else:  # "All"
                         command.extend(["--lora", lora_path, str(user_lora_strength)])
                         command.extend(["--stage2-lora", lora_path, str(user_lora_strength)])
+                        command.extend(["--stage3-lora", lora_path, str(user_lora_strength)])
 
         # Audio handling
         if audio_input and os.path.exists(audio_input):
@@ -2823,9 +2848,9 @@ def create_interface():
                             )
                             pipeline = gr.Dropdown(
                                 label="Pipeline",
-                                choices=["two-stage", "one-stage", "refine-only"],
+                                choices=["two-stage", "one-stage", "refine-only", "three-stage-exp", "three-stage-linear"],
                                 value="two-stage",
-                                info="two-stage = higher quality, one-stage = faster, refine-only = stage 2 only on input video"
+                                info="two-stage = higher quality, three-stage-exp = 3 stages with upsampling, three-stage-linear = 3 stages same res"
                             )
                             sampler = gr.Dropdown(
                                 label="Sampler",
@@ -3081,7 +3106,7 @@ Audio is synchronized with the video extension.
                                 )
                                 user_lora_stage_1 = gr.Dropdown(
                                     label="Stage",
-                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Both"],
+                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Stage 3 (Refine)", "All"],
                                     value="Stage 2 (Refine)",
                                     scale=1
                                 )
@@ -3099,7 +3124,7 @@ Audio is synchronized with the video extension.
                                 )
                                 user_lora_stage_2 = gr.Dropdown(
                                     label="Stage",
-                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Both"],
+                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Stage 3 (Refine)", "All"],
                                     value="Stage 2 (Refine)",
                                     scale=1
                                 )
@@ -3117,7 +3142,7 @@ Audio is synchronized with the video extension.
                                 )
                                 user_lora_stage_3 = gr.Dropdown(
                                     label="Stage",
-                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Both"],
+                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Stage 3 (Refine)", "All"],
                                     value="Stage 2 (Refine)",
                                     scale=1
                                 )
@@ -3135,7 +3160,7 @@ Audio is synchronized with the video extension.
                                 )
                                 user_lora_stage_4 = gr.Dropdown(
                                     label="Stage",
-                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Both"],
+                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Stage 3 (Refine)", "All"],
                                     value="Stage 2 (Refine)",
                                     scale=1
                                 )
@@ -3961,7 +3986,7 @@ Audio is synchronized with the video extension.
                                 )
                                 ext_user_lora_stage_1 = gr.Dropdown(
                                     label="Stage",
-                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Both"],
+                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Stage 3 (Refine)", "All"],
                                     value="Stage 2 (Refine)",
                                     scale=1
                                 )
@@ -3979,7 +4004,7 @@ Audio is synchronized with the video extension.
                                 )
                                 ext_user_lora_stage_2 = gr.Dropdown(
                                     label="Stage",
-                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Both"],
+                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Stage 3 (Refine)", "All"],
                                     value="Stage 2 (Refine)",
                                     scale=1
                                 )
@@ -3997,7 +4022,7 @@ Audio is synchronized with the video extension.
                                 )
                                 ext_user_lora_stage_3 = gr.Dropdown(
                                     label="Stage",
-                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Both"],
+                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Stage 3 (Refine)", "All"],
                                     value="Stage 2 (Refine)",
                                     scale=1
                                 )
@@ -4015,7 +4040,7 @@ Audio is synchronized with the video extension.
                                 )
                                 ext_user_lora_stage_4 = gr.Dropdown(
                                     label="Stage",
-                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Both"],
+                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Stage 3 (Refine)", "All"],
                                     value="Stage 2 (Refine)",
                                     scale=1
                                 )
