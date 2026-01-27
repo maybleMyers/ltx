@@ -4351,13 +4351,24 @@ Audio is synchronized with the video extension.
             legacy_block_swap = metadata.get("enable_block_swap", True)
 
             # Extract image conditioning info from metadata
+            # Image tuple format: (path, frame_idx, strength, crf) - crf may be missing in older metadata
             images = metadata.get("images", [])
             image_strength = 0.9
             image_frame_idx = 0
+            image_crf = 33
+            end_image_strength = 0.9
+            end_image_crf = 33
+
             if images and len(images) > 0:
-                # First image entry: (path, frame_idx, strength)
+                # First image entry (start image): (path, frame_idx, strength, crf)
                 image_frame_idx = images[0][1] if len(images[0]) > 1 else 0
                 image_strength = images[0][2] if len(images[0]) > 2 else 0.9
+                image_crf = images[0][3] if len(images[0]) > 3 else 33
+
+                # Check for end image (second entry, typically at last frame)
+                if len(images) > 1:
+                    end_image_strength = images[1][2] if len(images[1]) > 2 else 0.9
+                    end_image_crf = images[1][3] if len(images[1]) > 3 else 33
 
             # Determine mode based on whether images were used
             mode = "t2v"
@@ -4388,13 +4399,13 @@ Audio is synchronized with the video extension.
                 gr.update(value=metadata.get("stg_scale", 0.0)),  # stg_scale
                 gr.update(value=metadata.get("stg_blocks", "29")),  # stg_blocks
                 gr.update(value=metadata.get("stg_mode", "stg_av") or "stg_av"),  # stg_mode
-                # Image conditioning
+                # Image conditioning (extracted from images tuple)
                 gr.update(value=first_frame),  # input_image - use extracted first frame
                 gr.update(value=image_frame_idx),  # image_frame_idx
                 gr.update(value=image_strength),  # image_strength
-                gr.update(value=metadata.get("image_crf", 33)),  # image_crf
-                gr.update(value=metadata.get("end_image_strength", 0.9)),  # end_image_strength
-                gr.update(value=metadata.get("end_image_crf", 33)),  # end_image_crf
+                gr.update(value=image_crf),  # image_crf
+                gr.update(value=end_image_strength),  # end_image_strength
+                gr.update(value=end_image_crf),  # end_image_crf
                 # Anchor conditioning
                 gr.update(value=metadata.get("anchor_interval", 0) or 0),  # anchor_interval
                 gr.update(value=metadata.get("anchor_strength", 0.8)),  # anchor_strength

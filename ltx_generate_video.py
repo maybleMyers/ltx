@@ -9790,9 +9790,19 @@ def main():
     print(f">>> Video saved in {time.time() - encode_start:.1f}s")
 
     # Build and save metadata
+    # Determine pipeline type string
+    if args.refine_only:
+        pipeline_type = "refine-only"
+    elif args.one_stage:
+        pipeline_type = "one-stage"
+    elif args.num_stages == 3:
+        pipeline_type = f"three-stage-{args.pipeline_mode}"
+    else:
+        pipeline_type = "two-stage"
+
     metadata = {
         "model_type": "LTX-2",
-        "pipeline": "refine-only" if args.refine_only else ("one-stage" if args.one_stage else "two-stage"),
+        "pipeline": pipeline_type,
         "distilled_checkpoint": args.distilled_checkpoint,
         "checkpoint_path": args.checkpoint_path,
         "stage2_checkpoint": args.stage2_checkpoint,
@@ -9809,6 +9819,7 @@ def main():
         "stg_mode": args.stg_mode if args.stg_scale > 0 else None,
         "num_inference_steps": args.num_inference_steps,
         "seed": args.seed,
+        "sampler": args.sampler,
         "offload": args.offload,
         "enable_fp8": args.enable_fp8,
         # Separate block swap settings
@@ -9818,21 +9829,45 @@ def main():
         "text_encoder_blocks_in_memory": args.text_encoder_blocks_in_memory if args.enable_text_encoder_block_swap else None,
         "enable_refiner_block_swap": args.enable_refiner_block_swap,
         "refiner_blocks_in_memory": args.refiner_blocks_in_memory if args.enable_refiner_block_swap else None,
-        "images": [(img[0], img[1], img[2]) for img in args.images] if args.images else None,
+        # Memory optimization settings
+        "ffn_chunk_size": args.ffn_chunk_size,
+        "enable_activation_offload": args.enable_activation_offload,
+        "temporal_chunk_size": args.temporal_chunk_size if args.temporal_chunk_size > 0 else None,
+        # Image conditioning (includes CRF in tuple: path, frame_idx, strength, crf)
+        "images": [(img[0], img[1], img[2], img[3] if len(img) > 3 else 33) for img in args.images] if args.images else None,
+        # LoRA settings
         "loras": [(lora.path, lora.strength) for lora in args.loras] if args.loras else None,
+        "stage2_loras": [(lora.path, lora.strength) for lora in args.stage2_loras] if args.stage2_loras else None,
+        "stage3_loras": [(lora.path, lora.strength) for lora in args.stage3_loras] if args.stage3_loras else None,
         "distilled_lora": [(lora.path, lora.strength) for lora in args.distilled_lora] if args.distilled_lora else None,
+        # V2V / Refine settings
         "input_video": args.input_video,
         "refine_strength": args.refine_strength if args.input_video else None,
         "refine_steps": args.refine_steps if args.input_video else None,
+        "v2v_chunk_frames": args.v2v_chunk_frames if args.input_video else None,
+        "v2v_overlap_frames": args.v2v_overlap_frames if args.input_video else None,
+        "refine_latent_stride": args.refine_latent_stride if args.input_video else None,
+        # Anchor settings
         "anchor_image": args.anchor_image,
         "anchor_interval": args.anchor_interval,
         "anchor_strength": args.anchor_strength if args.anchor_interval else None,
         "anchor_decay": args.anchor_decay if args.anchor_interval and args.anchor_decay != "none" else None,
+        "anchor_crf": args.anchor_crf if args.anchor_interval and args.anchor_crf != 33 else None,
+        # Audio settings
         "disable_audio": args.disable_audio,
         "audio": args.audio,
         "audio_strength": args.audio_strength if args.audio else None,
         "enhance_prompt": args.enhance_prompt,
         "enhanced_prompt": enhanced_prompt,
+        # Latent normalization settings
+        "latent_norm_mode": args.latent_norm if args.latent_norm != "none" else None,
+        "latent_norm_factors": args.latent_norm_factors if args.latent_norm != "none" else None,
+        "latent_norm_target_mean": args.latent_norm_target_mean if args.latent_norm != "none" else None,
+        "latent_norm_target_std": args.latent_norm_target_std if args.latent_norm != "none" else None,
+        "latent_norm_percentile": args.latent_norm_percentile if args.latent_norm != "none" else None,
+        "latent_norm_clip_outliers": args.latent_norm_clip_outliers if args.latent_norm != "none" else None,
+        "latent_norm_video_only": args.latent_norm_video_only if args.latent_norm != "none" else None,
+        "latent_norm_audio_only": args.latent_norm_audio_only if args.latent_norm != "none" else None,
         # SVI Pro metadata
         "svi_mode": args.svi_mode,
         "svi_num_clips": args.num_clips if (args.svi_mode or args.extend_video) else None,
