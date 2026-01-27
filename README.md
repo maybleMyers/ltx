@@ -81,6 +81,60 @@ Place upscaler checkpoints in `GIMM-VFI/pretrained_ckpt/`
 |-------|------|
 | ZoeDepth (Intel/zoedepth-nyu-kitti) | [HuggingFace](https://huggingface.co/Intel/zoedepth-nyu-kitti) (auto-downloaded by transformers) |
 
+## Model Directory Structure
+
+The default directory structure expected by lt1.py:
+
+```
+ltx/
+├── weights/                                    # LTX-2 core models
+│   ├── ltx-2-19b-dev.safetensors              # Main checkpoint
+│   ├── ltx-2-19b-distilled.safetensors        # Distilled model (optional)
+│   ├── ltx-2-19b-distilled-lora-384.safetensors  # Distilled LoRA
+│   └── ltx-2-spatial-upscaler-x2-1.0.safetensors # Spatial upscaler
+│
+├── gemma-3-12b-it-qat-q4_0-unquantized/       # Text encoder
+│   ├── config.json
+│   ├── model-00001-of-00005.safetensors
+│   ├── model-00002-of-00005.safetensors
+│   ├── model-00003-of-00005.safetensors
+│   ├── model-00004-of-00005.safetensors
+│   ├── model-00005-of-00005.safetensors
+│   └── ...
+│
+├── GIMM-VFI/pretrained_ckpt/                  # Interpolation & upscaler models
+│   ├── gimmvfi_r_arb.pt                       # GIMM-VFI-R
+│   ├── gimmvfi_r_arb_lpips.pt                 # GIMM-VFI-R-P
+│   ├── gimmvfi_f_arb.pt                       # GIMM-VFI-F
+│   ├── gimmvfi_f_arb_lpips.pt                 # GIMM-VFI-F-P
+│   ├── flowformer_sintel.pth                  # Required for FlowFormer variants
+│   ├── raft-things.pth                        # Required for RAFT variants
+│   ├── bim_vfi.pth                            # BiM-VFI model
+│   ├── RealESRGAN_x2plus.pth                  # 2x upscaler
+│   ├── RealESRGAN_x4plus.pth                  # 4x upscaler
+│   ├── 003_realSR_BSRGAN_DFOWMFC_s64w8_SwinIR-L_x4_GAN.pth  # SwinIR 4x
+│   └── basicvsr_plusplus_reds4.pth            # BasicVSR++ video upscaler
+│
+├── lora/                                       # Custom LoRAs (optional)
+│   └── your-lora.safetensors
+│
+└── outputs/                                    # Generated videos
+```
+
+### Saving Custom Model Paths
+
+All model paths in the GUI can be customized. Use the **Save Defaults** button to persist your settings:
+
+| Tab | Button | What Gets Saved |
+|-----|--------|-----------------|
+| Generation | Save Defaults | LTX checkpoint, Gemma path, spatial upscaler, VAE, distilled LoRA, LoRA folder, all generation parameters |
+| SVI-LTX | Save Defaults | Same core model paths plus SVI-specific settings |
+| Extension | Save Defaults | Same core model paths plus extension-specific settings |
+
+Settings are saved to `ui_configs/` as JSON files and automatically loaded on startup.
+
+**Note:** The Post-Processing tab (interpolation/upscaling) does not have a Save Defaults button. These models use hardcoded paths in `GIMM-VFI/pretrained_ckpt/`. You can override paths per-session using the "Custom Model Path" fields, but they won't persist.
+
 ## Troubleshooting
 
 ### CUDA / GPU Issues

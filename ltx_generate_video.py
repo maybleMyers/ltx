@@ -5162,15 +5162,25 @@ class LTXVideoGeneratorWithOffloading:
             )
 
             # Stage 3 conditionings (similar to stage 2)
+            # Load video encoder for stage 3 image conditioning if needed
+            stage_3_video_encoder = None
+            if images:
+                stage_3_video_encoder = self.stage_1_model_ledger.video_encoder()
+
             stage_3_conditionings = image_conditionings_by_replacing_latent(
                 images=images,
                 height=stage_3_output_shape.height,
                 width=stage_3_output_shape.width,
-                num_frames=num_frames,
-                device=self.device,
+                video_encoder=stage_3_video_encoder,
                 dtype=dtype,
-                video_encoder=None,  # Video encoder already released
+                device=self.device,
             )
+
+            # Cleanup video encoder after conditioning
+            if stage_3_video_encoder is not None:
+                stage_3_video_encoder.to("cpu")
+                del stage_3_video_encoder
+                synchronize_and_cleanup()
 
             print(f">>> Stage 3: Refining at {stage_3_output_shape.width}x{stage_3_output_shape.height}...")
 
