@@ -1457,6 +1457,7 @@ def generate_ltx_video(
     # Generation parameters
     mode: str,
     pipeline: str,
+    sampler: str,
     enable_sliding_window: bool,
     width: int,
     height: int,
@@ -1660,6 +1661,7 @@ def generate_ltx_video(
             "--stage2-steps", str(int(stage2_steps)),
             "--seed", str(current_seed),
             "--output-path", output_filename,
+            "--sampler", str(sampler),
         ]
 
         # STG parameters (only include when stg_scale > 0)
@@ -2824,6 +2826,12 @@ def create_interface():
                                 choices=["two-stage", "one-stage", "refine-only"],
                                 value="two-stage",
                                 info="two-stage = higher quality, one-stage = faster, refine-only = stage 2 only on input video"
+                            )
+                            sampler = gr.Dropdown(
+                                label="Sampler",
+                                choices=["euler", "unipc", "lcm"],
+                                value="euler",
+                                info="euler = default, unipc = higher-order (10-25 steps), lcm = fast (4-8 steps) with SGM Uniform"
                             )
                         scale_slider = gr.Slider(
                             minimum=1, maximum=200, value=100, step=1,
@@ -4251,7 +4259,7 @@ Audio is synchronized with the video extension.
                 prompt, negative_prompt,
                 checkpoint_path, distilled_checkpoint, stage2_checkpoint, gemma_root, spatial_upsampler_path,
                 vae_path, distilled_lora_path, distilled_lora_strength,
-                mode, pipeline, enable_sliding_window, width, height, num_frames, frame_rate,
+                mode, pipeline, sampler, enable_sliding_window, width, height, num_frames, frame_rate,
                 cfg_guidance_scale, num_inference_steps, stage2_steps, seed,
                 stg_scale, stg_blocks, stg_mode,
                 input_image, image_frame_idx, image_strength, image_crf,
@@ -4342,6 +4350,7 @@ Audio is synchronized with the video extension.
                 gr.update(value=metadata.get("negative_prompt", "")),  # negative_prompt
                 gr.update(value=mode),  # mode
                 gr.update(value=metadata.get("pipeline", "two-stage")),  # pipeline
+                gr.update(value=metadata.get("sampler", "euler")),  # sampler
                 gr.update(value=metadata.get("width", 1024)),  # width
                 gr.update(value=metadata.get("height", 1024)),  # height
                 gr.update(value=metadata.get("num_frames", 121)),  # num_frames
@@ -4412,7 +4421,7 @@ Audio is synchronized with the video extension.
             inputs=[info_metadata_output, info_first_frame],
             outputs=[
                 tabs,  # Switch tab
-                prompt, negative_prompt, mode, pipeline,
+                prompt, negative_prompt, mode, pipeline, sampler,
                 width, height, num_frames, frame_rate,
                 cfg_guidance_scale, num_inference_steps, stage2_steps, seed,
                 # STG parameters
@@ -4590,7 +4599,7 @@ Audio is synchronized with the video extension.
             checkpoint_path, distilled_checkpoint, stage2_checkpoint, gemma_root,
             spatial_upsampler_path, vae_path, distilled_lora_path, distilled_lora_strength,
             # Generation parameters
-            mode, pipeline, width, height, num_frames, frame_rate,
+            mode, pipeline, sampler, width, height, num_frames, frame_rate,
             cfg_guidance_scale, num_inference_steps, stage2_steps, seed,
             stg_scale, stg_blocks, stg_mode,
             # Image conditioning (not input_image itself - that's a file upload)
@@ -4634,7 +4643,7 @@ Audio is synchronized with the video extension.
             "checkpoint_path", "distilled_checkpoint", "stage2_checkpoint", "gemma_root",
             "spatial_upsampler_path", "vae_path", "distilled_lora_path", "distilled_lora_strength",
             # Generation parameters
-            "mode", "pipeline", "width", "height", "num_frames", "frame_rate",
+            "mode", "pipeline", "sampler", "width", "height", "num_frames", "frame_rate",
             "cfg_guidance_scale", "num_inference_steps", "stage2_steps", "seed",
             "stg_scale", "stg_blocks", "stg_mode",
             # Image conditioning

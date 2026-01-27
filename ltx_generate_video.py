@@ -101,6 +101,260 @@ DEFAULT_DISTILLED_LORA_PATH = "./weights/ltx-2-19b-distilled-lora-384.safetensor
 
 
 # =============================================================================
+# Alternative Samplers (UniPC, LCM)
+# =============================================================================
+
+class UniPCDiffusionStep(DiffusionStepProtocol):
+    """
+    UniPC (Unified Predictor-Corrector) sampler for flow matching models.
+
+    A training-free framework for fast sampling that uses a predictor-corrector
+    approach with B(h) coefficients. Works well with 10-25 steps.
+
+    Based on: https://arxiv.org/abs/2302.04867
+    Adapted from FlowUniPCMultistepScheduler for LTX-2's DiffusionStepProtocol interface.
+    """
+
+    def __init__(self, solver_order: int = 2, predict_x0: bool = True, solver_type: str = "bh2"):
+        """
+        Args:
+            solver_order: Order of the UniPC solver (2 or 3 recommended). Higher = more accurate but needs more history.
+            predict_x0: Whether to predict x0 (True) or epsilon (False). x0 prediction is more stable.
+            solver_type: "bh1" for unconditional sampling with few steps, "bh2" otherwise.
+        """
+        self.solver_order = solver_order
+        self.predict_x0 = predict_x0
+        self.solver_type = solver_type
+
+        # History buffers for multi-step
+        self.model_outputs: list = []
+        self.timestep_list: list = []
+        self.last_sample: torch.Tensor | None = None
+        self.lower_order_nums = 0
+
+    def reset(self):
+        """Reset history buffers for a new denoising run."""
+        self.model_outputs = []
+        self.timestep_list = []
+        self.last_sample = None
+        self.lower_order_nums = 0
+
+    def _sigma_to_alpha_sigma_t(self, sigma: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Convert sigma to (alpha_t, sigma_t) for flow matching."""
+        return 1 - sigma, sigma
+
+    def step(
+        self, sample: torch.Tensor, denoised_sample: torch.Tensor, sigmas: torch.Tensor, step_index: int
+    ) -> torch.Tensor:
+        """
+        Perform one UniPC step.
+
+        Args:
+            sample: Current noisy sample x_t
+            denoised_sample: Model's prediction of x_0
+            sigmas: Full sigma schedule
+            step_index: Current step index
+
+        Returns:
+            Next sample x_{t+1}
+        """
+        # Convert denoised prediction to model output format
+        sigma = sigmas[step_index]
+        if self.predict_x0:
+            model_output = denoised_sample
+        else:
+            # Convert x0 prediction to velocity/epsilon
+            model_output = (sample - denoised_sample) / sigma if sigma > 0 else torch.zeros_like(sample)
+
+        # Store history
+        if len(self.model_outputs) >= self.solver_order:
+            self.model_outputs.pop(0)
+            self.timestep_list.pop(0)
+        self.model_outputs.append(model_output)
+        self.timestep_list.append(step_index)
+
+        # Determine effective order (warm up from order 1)
+        this_order = min(self.solver_order, len(self.model_outputs), self.lower_order_nums + 1)
+
+        # Get sigma values
+        sigma_t = sigmas[step_index + 1]  # Next sigma
+        sigma_s0 = sigmas[step_index]     # Current sigma
+
+        alpha_t, sigma_t_val = self._sigma_to_alpha_sigma_t(sigma_t)
+        alpha_s0, sigma_s0_val = self._sigma_to_alpha_sigma_t(sigma_s0)
+
+        # Compute lambda values (log-SNR)
+        lambda_t = torch.log(alpha_t) - torch.log(sigma_t_val) if sigma_t_val > 0 else torch.tensor(float('inf'))
+        lambda_s0 = torch.log(alpha_s0) - torch.log(sigma_s0_val) if sigma_s0_val > 0 else torch.tensor(float('inf'))
+
+        h = lambda_t - lambda_s0
+
+        m0 = self.model_outputs[-1]
+
+        # Handle edge case of h being inf or zero
+        if torch.isinf(h) or h == 0:
+            # Fall back to simple Euler step
+            from ltx_core.utils import to_velocity
+            velocity = to_velocity(sample, sigma_s0, denoised_sample)
+            dt = sigma_t - sigma_s0
+            self.lower_order_nums = min(self.lower_order_nums + 1, self.solver_order)
+            return (sample.to(torch.float32) + velocity.to(torch.float32) * dt).to(sample.dtype)
+
+        device = sample.device
+
+        # Compute B(h) coefficient
+        hh = -h if self.predict_x0 else h
+        h_phi_1 = torch.expm1(hh)  # e^h - 1
+
+        if self.solver_type == "bh1":
+            B_h = hh
+        else:  # bh2
+            B_h = torch.expm1(hh)
+
+        if this_order == 1:
+            # First-order update (similar to Euler)
+            if self.predict_x0:
+                x_t = sigma_t_val / sigma_s0_val * sample - alpha_t * h_phi_1 * m0
+            else:
+                x_t = alpha_t / alpha_s0 * sample - sigma_t_val * h_phi_1 * m0
+        else:
+            # Higher-order update with history
+            rks = []
+            D1s = []
+
+            for i in range(1, this_order):
+                if step_index - i >= 0:
+                    si = step_index - i
+                    mi = self.model_outputs[-(i + 1)] if i < len(self.model_outputs) else m0
+                    alpha_si, sigma_si = self._sigma_to_alpha_sigma_t(sigmas[si])
+                    lambda_si = torch.log(alpha_si) - torch.log(sigma_si) if sigma_si > 0 else torch.tensor(float('inf'))
+                    rk = (lambda_si - lambda_s0) / h if h != 0 else torch.tensor(1.0)
+                    rks.append(rk)
+                    D1s.append((mi - m0) / rk if rk != 0 else torch.zeros_like(m0))
+
+            rks.append(1.0)
+            rks = torch.tensor(rks, device=device)
+
+            # Compute coefficients
+            h_phi_k = h_phi_1 / hh - 1 if hh != 0 else torch.tensor(0.0)
+
+            if len(D1s) > 0 and this_order == 2:
+                rhos_p = torch.tensor([0.5], dtype=sample.dtype, device=device)
+                D1s_tensor = torch.stack(D1s, dim=0)
+                pred_res = torch.einsum("k,k...->...", rhos_p[:len(D1s)], D1s_tensor)
+            else:
+                pred_res = 0
+
+            if self.predict_x0:
+                x_t = sigma_t_val / sigma_s0_val * sample - alpha_t * h_phi_1 * m0 - alpha_t * B_h * pred_res
+            else:
+                x_t = alpha_t / alpha_s0 * sample - sigma_t_val * h_phi_1 * m0 - sigma_t_val * B_h * pred_res
+
+        self.lower_order_nums = min(self.lower_order_nums + 1, self.solver_order)
+        self.last_sample = sample
+
+        return x_t.to(sample.dtype)
+
+
+class LCMDiffusionStep(DiffusionStepProtocol):
+    """
+    LCM (Latent Consistency Model) sampler for flow matching.
+
+    Optimized for very few steps (4-8) with distilled/consistency-trained models.
+    Uses SGM Uniform sigma schedule internally for optimal step distribution.
+
+    Based on: https://arxiv.org/abs/2310.04378
+    """
+
+    def __init__(self):
+        """Initialize LCM sampler."""
+        pass
+
+    def step(
+        self, sample: torch.Tensor, denoised_sample: torch.Tensor, sigmas: torch.Tensor, step_index: int
+    ) -> torch.Tensor:
+        """
+        Perform one LCM step.
+
+        LCM uses a consistency model approach where the model is trained to
+        directly predict the clean sample from any noise level. This allows
+        for very few steps while maintaining quality.
+
+        Args:
+            sample: Current noisy sample x_t
+            denoised_sample: Model's prediction of x_0
+            sigmas: Full sigma schedule
+            step_index: Current step index
+
+        Returns:
+            Next sample x_{t+1}
+        """
+        sigma = sigmas[step_index]
+        sigma_next = sigmas[step_index + 1]
+
+        # LCM step: Linear interpolation toward the denoised prediction
+        # This is equivalent to: x_{t+1} = x_t + (x_0 - x_t) * (1 - sigma_next/sigma)
+        # Simplified: x_{t+1} = denoised + (sample - denoised) * (sigma_next / sigma)
+
+        if sigma > 0:
+            # Ratio-based interpolation (more stable)
+            ratio = sigma_next / sigma
+            x_t = denoised_sample + (sample - denoised_sample) * ratio
+        else:
+            # At sigma=0, just return denoised
+            x_t = denoised_sample
+
+        return x_t.to(sample.dtype)
+
+
+class SGMUniformScheduler:
+    """
+    SGM Uniform scheduler that generates uniformly-spaced sigmas.
+
+    Used with LCM for optimal step distribution. Creates sigmas that are
+    evenly spaced in sigma-space (not log-space), which works well with
+    consistency models.
+    """
+
+    @staticmethod
+    def get_sigmas(num_steps: int, sigma_min: float = 0.0, sigma_max: float = 1.0) -> torch.Tensor:
+        """
+        Generate uniformly-spaced sigmas for SGM Uniform schedule.
+
+        Args:
+            num_steps: Number of inference steps
+            sigma_min: Minimum sigma value (typically 0)
+            sigma_max: Maximum sigma value (typically 1 for flow matching)
+
+        Returns:
+            Tensor of sigmas with shape (num_steps + 1,)
+        """
+        # Uniform spacing from max to min
+        sigmas = torch.linspace(sigma_max, sigma_min, num_steps + 1)
+        return sigmas.to(torch.float32)
+
+
+def get_sampler(sampler_name: str) -> DiffusionStepProtocol:
+    """
+    Factory function to get the appropriate sampler.
+
+    Args:
+        sampler_name: One of "euler", "unipc", "lcm"
+
+    Returns:
+        Sampler instance implementing DiffusionStepProtocol
+    """
+    if sampler_name == "euler":
+        return EulerDiffusionStep()
+    elif sampler_name == "unipc":
+        return UniPCDiffusionStep(solver_order=2, predict_x0=True, solver_type="bh2")
+    elif sampler_name == "lcm":
+        return LCMDiffusionStep()
+    else:
+        raise ValueError(f"Unknown sampler: {sampler_name}. Choose from: euler, unipc, lcm")
+
+
+# =============================================================================
 # LTX-V RGB Factors for Latent Preview (128 channels)
 # =============================================================================
 # These factors enable fast latent-to-RGB conversion without VAE decoding.
@@ -1646,6 +1900,16 @@ Examples:
         help=f"Number of denoising steps for stage 1 (default: {DEFAULT_NUM_INFERENCE_STEPS}).",
     )
     gen_group.add_argument(
+        "--sampler",
+        type=str,
+        default="euler",
+        choices=["euler", "unipc", "lcm"],
+        help="Sampler to use for denoising. 'euler' is the default first-order method. "
+             "'unipc' is a higher-order predictor-corrector (good with 10-25 steps). "
+             "'lcm' is optimized for few steps (4-8) with distilled models using SGM Uniform schedule. "
+             "(default: euler)",
+    )
+    gen_group.add_argument(
         "--cfg-guidance-scale",
         type=float,
         default=DEFAULT_CFG_GUIDANCE_SCALE,
@@ -2882,6 +3146,8 @@ class LTXVideoGeneratorWithOffloading:
         v2v_chunk_frames: int = 121,
         v2v_overlap_frames: int = 24,
         refine_latent_stride: int = 8,
+        # Sampler selection
+        sampler: str = "euler",
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor | None, str | None]:
         """
         Generate video with optional audio.
@@ -2895,7 +3161,8 @@ class LTXVideoGeneratorWithOffloading:
         # Initialize diffusion components
         generator = torch.Generator(device=self.device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
-        stepper = EulerDiffusionStep()
+        stepper = get_sampler(sampler)
+        print(f">>> Using {sampler} sampler")
         cfg_guider = CFGGuider(cfg_guidance_scale)
         # Initialize STG (Spatio-Temporal Guidance) components
         effective_stg_blocks = stg_blocks if stg_blocks is not None else [29]
@@ -4780,6 +5047,8 @@ def generate_svi_multi_clip(
                 depth_stage2=args.depth_stage2,
                 # Latent normalization
                 latent_norm_fn=latent_norm_fn,
+                # Sampler
+                sampler=args.sampler,
             )
 
             # Collect video frames from iterator - move to CPU immediately to save GPU memory
@@ -5636,7 +5905,9 @@ def generate_av_extension(
     # Initialize diffusion components
     generator_torch = torch.Generator(device=device).manual_seed(args.seed)
     noiser = GaussianNoiser(generator=generator_torch)
-    stepper = EulerDiffusionStep()
+    sampler_name = getattr(args, 'sampler', 'euler')
+    stepper = get_sampler(sampler_name)
+    print(f">>> Using {sampler_name} sampler")
     cfg_guider = CFGGuider(args.cfg_guidance_scale)
     # Initialize STG (Spatio-Temporal Guidance) components
     effective_stg_blocks = args.stg_blocks if args.stg_blocks is not None else [29]
@@ -7051,7 +7322,9 @@ def generate_v2v_join(
     # Initialize diffusion components
     generator_torch = torch.Generator(device=device).manual_seed(args.seed)
     noiser = GaussianNoiser(generator=generator_torch)
-    stepper = EulerDiffusionStep()
+    sampler_name = getattr(args, 'sampler', 'euler')
+    stepper = get_sampler(sampler_name)
+    print(f">>> Using {sampler_name} sampler")
     cfg_guider = CFGGuider(args.cfg_guidance_scale)
     effective_stg_blocks = args.stg_blocks if args.stg_blocks is not None else [29]
     stg_guider = STGGuider(args.stg_scale)
@@ -8475,6 +8748,8 @@ def sliding_window_generate(
             depth_stage2=args.depth_stage2,
             # Latent normalization
             latent_norm_fn=latent_norm_fn,
+            # Sampler
+            sampler=args.sampler,
         )
 
         # Collect video frames from iterator - move to CPU immediately to save GPU memory
@@ -8984,6 +9259,7 @@ def main():
             v2v_chunk_frames=args.v2v_chunk_frames,
             v2v_overlap_frames=args.v2v_overlap_frames,
             refine_latent_stride=args.refine_latent_stride,
+            sampler=args.sampler,
         )
 
     # Encode and save video
