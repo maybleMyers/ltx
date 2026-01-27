@@ -311,6 +311,100 @@ class VideoEncoder(nn.Module):
         means, _ = torch.chunk(sample, 2, dim=1)
         return self.per_channel_statistics.normalize(means)
 
+    def encode_with_offload(
+        self,
+        video: torch.Tensor,
+        target_device: torch.device,
+    ) -> torch.Tensor:
+        """
+        Encode video with layer-by-layer offloading to manage memory.
+        Processes full video without temporal chunking to preserve consistency.
+
+        This method moves each encoder layer to GPU one at a time, processes
+        the full video through that layer, then offloads the layer back to CPU.
+        This preserves temporal consistency (no chunking artifacts) while
+        managing GPU memory.
+
+        Args:
+            video: Input video (B, C, F, H, W) on CPU or GPU.
+                   F must be 1 + 8*k (e.g., 1, 9, 17, 25, 33...).
+            target_device: GPU device for processing each layer.
+
+        Returns:
+            Encoded latent tensor on target_device.
+        """
+        # Validate frame count
+        frames_count = video.shape[2]
+        if ((frames_count - 1) % 8) != 0:
+            raise ValueError(
+                "Invalid number of frames: Encode input must have 1 + 8 * x frames "
+                "(e.g., 1, 9, 17, ...). Please check your input."
+            )
+
+        # Ensure video is on target device
+        sample = video.to(device=target_device)
+
+        # patchify - always on GPU (fast, no parameters to offload)
+        sample = patchify(sample, patch_size_hw=self.patch_size, patch_size_t=1)
+
+        # conv_in with offload
+        self.conv_in.to(target_device)
+        sample = self.conv_in(sample)
+        self.conv_in.cpu()
+        torch.cuda.empty_cache()
+
+        # Process each down_block with offload
+        for i, down_block in enumerate(self.down_blocks):
+            down_block.to(target_device)
+            sample = down_block(sample)
+            down_block.cpu()
+            torch.cuda.empty_cache()
+
+        # conv_norm_out with offload
+        self.conv_norm_out.to(target_device)
+        sample = self.conv_norm_out(sample)
+        self.conv_norm_out.cpu()
+
+        # conv_act (SiLU) - no parameters, just apply
+        sample = self.conv_act(sample)
+
+        # conv_out with offload
+        self.conv_out.to(target_device)
+        sample = self.conv_out(sample)
+        self.conv_out.cpu()
+        torch.cuda.empty_cache()
+
+        # Handle latent_log_var modes (same logic as forward)
+        if self.latent_log_var == LogVarianceType.UNIFORM:
+            if sample.shape[1] < 2:
+                raise ValueError(
+                    f"Invalid channel count for UNIFORM mode: expected at least 2 channels "
+                    f"(N means + 1 logvar), got {sample.shape[1]}"
+                )
+            means = sample[:, :-1, ...]
+            logvar = sample[:, -1:, ...]
+            num_channels = means.shape[1]
+            repeat_shape = [1, num_channels] + [1] * (sample.ndim - 2)
+            repeated_logvar = logvar.repeat(*repeat_shape)
+            sample = torch.cat([means, repeated_logvar], dim=1)
+        elif self.latent_log_var == LogVarianceType.CONSTANT:
+            sample = sample[:, :-1, ...]
+            approx_ln_0 = -30
+            sample = torch.cat(
+                [sample, torch.ones_like(sample, device=sample.device) * approx_ln_0],
+                dim=1,
+            )
+
+        # Split means/logvar and normalize
+        means, _ = torch.chunk(sample, 2, dim=1)
+
+        # per_channel_statistics with offload
+        self.per_channel_statistics.to(target_device)
+        result = self.per_channel_statistics.normalize(means)
+        self.per_channel_statistics.cpu()
+
+        return result
+
     def tiled_encode(
         self,
         video: torch.Tensor,

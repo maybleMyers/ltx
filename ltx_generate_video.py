@@ -2888,33 +2888,34 @@ def apply_loras_chunked_gpu(
 def encode_video_chunked(
     video_tensor: torch.Tensor,
     video_encoder,
-    chunk_frames: int = 65,  # 8*8 + 1
-    overlap_frames: int = 24,  # overlap for blending between chunks
+    chunk_frames: int = 65,  # Ignored - kept for API compatibility
+    overlap_frames: int = 24,  # Ignored - kept for API compatibility
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """
-    Encode video in temporal chunks to reduce memory usage.
+    Encode video using layer-by-layer offloading to avoid temporal chunking.
+    Processes full video to preserve temporal consistency.
 
-    Uses tiled encoding with proper trapezoidal blending masks to handle chunk
-    boundaries smoothly. This approach mirrors tiled_decode for consistency.
+    This function uses encode_with_offload() which moves each encoder layer
+    to GPU one at a time, processes the full video through that layer, then
+    offloads the layer back to CPU. This preserves temporal consistency
+    (no chunking artifacts) while managing GPU memory.
 
     Args:
         video_tensor: Shape (1, C, F, H, W) normalized video (can be on CPU)
-        video_encoder: VideoEncoder model (must have tiled_encode method)
-        chunk_frames: Frames per chunk (will be adjusted to 8*k+1 if needed)
-        overlap_frames: Overlap between chunks for blending (will be adjusted to 8*k)
-        device: Device to use for encoding (if None, uses video_tensor's device)
+        video_encoder: VideoEncoder model (must have encode_with_offload method)
+        chunk_frames: Ignored - kept for API compatibility
+        overlap_frames: Ignored - kept for API compatibility
+        device: Device to use for encoding (if None, uses encoder's device)
         dtype: Dtype to use for encoding (if None, uses video_tensor's dtype)
 
     Returns:
         Encoded latent tensor (1, latent_channels, F', H', W') on the specified device
     """
-    from ltx_core.model.video_vae.tiling import TilingConfig, TemporalTilingConfig
-
     # Determine device and dtype
     if device is None:
-        device = video_tensor.device
+        device = next(video_encoder.parameters()).device
     if dtype is None:
         dtype = video_tensor.dtype
 
@@ -2930,60 +2931,15 @@ def encode_video_chunked(
         video_tensor = torch.cat([video_tensor, padding], dim=2)
         total_frames = target_frames
 
-    # If video fits in one chunk, encode directly
-    if total_frames <= chunk_frames:
-        video_tensor = video_tensor.to(device=device, dtype=dtype)
-        with torch.no_grad():
-            result = video_encoder(video_tensor)
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        return result
+    print(f">>> Encoding {total_frames} frames with layer offloading...")
 
-    # Adjust chunk_frames to be divisible by 8 for TilingConfig validation
-    # The actual encoding will handle the 8k+1 constraint internally
-    if chunk_frames % 8 != 0:
-        chunk_frames = (chunk_frames // 8) * 8
-    chunk_frames = max(chunk_frames, 64)  # Minimum 64 frames per chunk
-
-    # Adjust overlap_frames to be divisible by 8
-    if overlap_frames % 8 != 0:
-        overlap_frames = (overlap_frames // 8) * 8
-
-    # Ensure minimum overlap for good blending (at least 3 latent tokens = 24 frames)
-    overlap_frames = max(overlap_frames, 24)
-
-    # Ensure overlap is less than tile size
-    if overlap_frames >= chunk_frames:
-        overlap_frames = chunk_frames - 8
-
-    # Create tiling config for temporal chunking
-    # Note: TilingConfig expects values divisible by 8, our custom encode functions
-    # handle the 8k+1 constraint for actual encoding
-    tiling_config = TilingConfig(
-        temporal_config=TemporalTilingConfig(
-            tile_size_in_frames=chunk_frames,
-            tile_overlap_in_frames=overlap_frames,
-        ),
-        spatial_config=None,  # No spatial tiling - process full resolution
-    )
-
-    # Keep video on CPU, convert dtype only (memory efficient)
-    # tiled_encode will move individual tiles to GPU
+    # Convert dtype (keep on CPU to save memory, encode_with_offload will move to GPU)
     video_tensor = video_tensor.to(dtype=dtype)
 
-    # Calculate number of tiles for progress reporting
-    stride = chunk_frames - overlap_frames
-    num_tiles = max(1, (total_frames - overlap_frames - 1) // stride + 1)
-    print(f">>> Encoding {total_frames} frames using tiled encoding ({num_tiles} tile(s), {overlap_frames}-frame overlap)...")
-
-    # Use tiled_encode for proper blending
-    # Pass target_device so tiles are encoded on GPU but video stays on CPU
+    # Use layer-by-layer offloading for memory-efficient encoding
+    # This processes the full video without temporal chunking
     with torch.no_grad():
-        result = video_encoder.tiled_encode(
-            video_tensor,
-            tiling_config,
-            target_device=device,
-        )
+        result = video_encoder.encode_with_offload(video_tensor, target_device=device)
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
