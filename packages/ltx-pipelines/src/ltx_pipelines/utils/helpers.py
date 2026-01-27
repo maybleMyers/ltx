@@ -1,3 +1,4 @@
+import copy
 import gc
 import logging
 import math
@@ -256,6 +257,11 @@ def euler_denoising_loop(
     """
     total_steps = len(sigmas) - 1
 
+    # Use separate stepper instances for video and audio to avoid state contamination
+    # (Some steppers like UniPC maintain internal history that differs between modalities)
+    video_stepper = stepper
+    audio_stepper = copy.deepcopy(stepper)
+
     # Store original masks for anchor decay computation
     if anchor_decay:
         original_video_mask = video_state.denoise_mask.clone()
@@ -290,8 +296,8 @@ def euler_denoising_loop(
         denoised_video = post_process_latent(denoised_video, video_state.denoise_mask, video_state.clean_latent)
         denoised_audio = post_process_latent(denoised_audio, audio_state.denoise_mask, audio_state.clean_latent)
 
-        video_state = replace(video_state, latent=stepper.step(video_state.latent, denoised_video, sigmas, step_idx))
-        audio_state = replace(audio_state, latent=stepper.step(audio_state.latent, denoised_audio, sigmas, step_idx))
+        video_state = replace(video_state, latent=video_stepper.step(video_state.latent, denoised_video, sigmas, step_idx))
+        audio_state = replace(audio_state, latent=audio_stepper.step(audio_state.latent, denoised_audio, sigmas, step_idx))
 
         # Invoke callback for preview generation
         if callback is not None and step_idx % callback_interval == 0:
@@ -331,6 +337,11 @@ def gradient_estimating_euler_denoising_loop(
         See :func:`euler_denoising_loop` for return value description.
     """
     total_steps = len(sigmas) - 1
+
+    # Use separate stepper instances for video and audio to avoid state contamination
+    # (Some steppers like UniPC maintain internal history that differs between modalities)
+    video_stepper = stepper
+    audio_stepper = copy.deepcopy(stepper)
 
     # Store original masks for anchor decay computation
     if anchor_decay:
@@ -375,8 +386,8 @@ def gradient_estimating_euler_denoising_loop(
             audio_state.latent, denoised_audio, sigmas[step_idx], previous_audio_velocity
         )
 
-        video_state = replace(video_state, latent=stepper.step(video_state.latent, denoised_video, sigmas, step_idx))
-        audio_state = replace(audio_state, latent=stepper.step(audio_state.latent, denoised_audio, sigmas, step_idx))
+        video_state = replace(video_state, latent=video_stepper.step(video_state.latent, denoised_video, sigmas, step_idx))
+        audio_state = replace(audio_state, latent=audio_stepper.step(audio_state.latent, denoised_audio, sigmas, step_idx))
 
     return (video_state, audio_state)
 

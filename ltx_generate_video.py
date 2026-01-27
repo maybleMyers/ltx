@@ -1841,6 +1841,18 @@ Examples:
              "Only used when --num-stages is 3.",
     )
     model_group.add_argument(
+        "--stage2-strength",
+        type=float,
+        default=1.0,
+        help="Sigma scaling for stage 2 (0.0-1.0). Lower = less noise = more preservation. Default: 1.0",
+    )
+    model_group.add_argument(
+        "--stage3-strength",
+        type=float,
+        default=1.0,
+        help="Sigma scaling for stage 3 (0.0-1.0). Lower = less noise = more preservation. Default: 1.0",
+    )
+    model_group.add_argument(
         "--num-stages",
         type=int,
         choices=[1, 2, 3],
@@ -1928,9 +1940,18 @@ Examples:
         type=str,
         default="euler",
         choices=["euler", "unipc", "lcm"],
-        help="Sampler to use for denoising. 'euler' is the default first-order method. "
+        help="Sampler to use for stage 1 denoising. 'euler' is the default first-order method. "
              "'unipc' is a higher-order predictor-corrector (good with 10-25 steps). "
              "'lcm' is optimized for few steps (4-8) with distilled models using SGM Uniform schedule. "
+             "(default: euler)",
+    )
+    gen_group.add_argument(
+        "--stage2-sampler",
+        type=str,
+        default="euler",
+        choices=["euler", "unipc", "lcm"],
+        help="Sampler to use for stage 2/3 denoising. 'euler' is recommended for distilled models "
+             "with few steps. If not specified, defaults to 'euler'. Stage 3 inherits this choice. "
              "(default: euler)",
     )
     gen_group.add_argument(
@@ -2879,154 +2900,144 @@ def apply_loras_chunked_gpu(
 def encode_video_chunked(
     video_tensor: torch.Tensor,
     video_encoder,
-    chunk_frames: int = 65,  # 8*8 + 1
-    overlap_frames: int = 8,  # kept for API compatibility, but we use context_frames internally
+    chunk_frames: int = 65,  # Ignored - kept for API compatibility
+    overlap_frames: int = 24,  # Ignored - kept for API compatibility
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
+    spatial_tile_size: int = 256,  # Spatial tile size in pixels (smaller = less memory)
+    spatial_overlap: int = 64,     # Overlap between spatial tiles
+    min_tile_size: int = 64,       # Minimum tile size before giving up on OOM
 ) -> torch.Tensor:
     """
-    Encode video in temporal chunks to reduce memory usage.
+    Encode video using spatial tiling with full temporal extent.
 
-    Uses autoregressive chunking to handle the causal VAE encoder properly:
-    - The VAE encoder uses causal convolutions where each frame depends on previous frames
-    - For chunks after the first, we include context frames and discard the corresponding
-      latent tokens (the "warm-up" region where the encoder lacks sufficient context)
-    - This avoids blending artifacts from mismatched latents at chunk boundaries
+    Uses spatial tiles to reduce memory while keeping all frames together
+    to preserve temporal consistency (no chunking artifacts from temporal splits).
+
+    Automatically handles CUDA OOM by reducing tile size and retrying.
 
     Args:
         video_tensor: Shape (1, C, F, H, W) normalized video (can be on CPU)
-        video_encoder: VideoEncoder model
-        chunk_frames: Frames per chunk (must be 8*k+1)
-        overlap_frames: Legacy parameter, context_frames is used internally
-        device: Device to use for encoding (if None, uses video_tensor's device)
+        video_encoder: VideoEncoder model (must have tiled_encode method)
+        chunk_frames: Ignored - kept for API compatibility
+        overlap_frames: Ignored - kept for API compatibility
+        device: Device to use for encoding (if None, uses encoder's device)
         dtype: Dtype to use for encoding (if None, uses video_tensor's dtype)
+        spatial_tile_size: Size of spatial tiles in pixels (default 256)
+        spatial_overlap: Overlap between spatial tiles in pixels (default 64)
+        min_tile_size: Minimum tile size to try before raising OOM error (default 64)
 
     Returns:
         Encoded latent tensor (1, latent_channels, F', H', W') on the specified device
     """
-    # Determine device and dtype
+    from ltx_core.model.video_vae.tiling import TilingConfig, SpatialTilingConfig
+
     if device is None:
-        device = video_tensor.device
+        device = next(video_encoder.parameters()).device
     if dtype is None:
         dtype = video_tensor.dtype
 
     _, c, total_frames, h, w = video_tensor.shape
 
-    # If video fits in one chunk, encode directly
-    if total_frames <= chunk_frames:
-        chunk = video_tensor.to(device=device, dtype=dtype)
-        with torch.no_grad():
-            result = video_encoder(chunk)
-        del chunk
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        return result
+    # Ensure total_frames satisfies 8k+1 constraint
+    if (total_frames - 1) % 8 != 0:
+        target_frames = ((total_frames - 1) // 8 + 1) * 8 + 1
+        pad_frames = target_frames - total_frames
+        print(f">>> Padding video from {total_frames} to {target_frames} frames for encoding...")
+        last_frame = video_tensor[:, :, -1:, :, :]
+        padding = last_frame.expand(-1, -1, pad_frames, -1, -1)
+        video_tensor = torch.cat([video_tensor, padding], dim=2)
+        total_frames = target_frames
 
-    # Validate
-    assert (chunk_frames - 1) % 8 == 0, "chunk_frames must be 8*k+1"
+    video_tensor = video_tensor.to(dtype=dtype)
 
-    # Context frames for causal encoder warm-up (must be 8*k for clean latent boundaries)
-    # Using 24 frames (3 latent tokens) provides enough context for the encoder's receptive field
-    context_frames = 24
-    context_latents = context_frames // 8  # 3 latent tokens to discard
+    # Track current tile size for OOM retry loop
+    current_tile_size = spatial_tile_size
+    original_overlap = spatial_overlap
 
-    # Calculate how many new frames each chunk contributes (excluding context)
-    new_frames_per_chunk = chunk_frames - context_frames  # e.g., 65 - 24 = 41 frames
-    new_latents_per_chunk = new_frames_per_chunk // 8  # e.g., 41 // 8 = 5 latent tokens
+    while current_tile_size >= min_tile_size:
+        # Scale overlap proportionally with tile size, minimum 32 (must be divisible by 32)
+        current_overlap = max(32, (original_overlap * current_tile_size) // spatial_tile_size)
+        current_overlap = (current_overlap // 32) * 32
 
-    # Build chunk list: (start_frame, end_frame, is_first)
-    chunks_info = []
+        # Determine if spatial tiling is needed
+        needs_spatial_tiling = h > current_tile_size or w > current_tile_size
 
-    # First chunk: starts at 0, uses all latent tokens
-    first_end = min(chunk_frames, total_frames)
-    chunks_info.append((0, first_end, True))
+        if not needs_spatial_tiling:
+            # Small enough to encode directly
+            print(f">>> Encoding {total_frames} frames at {w}x{h} directly...")
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                video_on_device = video_tensor.to(device=device)
+                with torch.no_grad():
+                    result = video_encoder(video_on_device)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                return result
+            except torch.cuda.OutOfMemoryError:
+                # Can't reduce further for direct encoding, re-raise
+                raise RuntimeError(
+                    f"CUDA OOM during direct video encoding at {w}x{h}. "
+                    f"Video is too large to encode even without tiling."
+                )
 
-    # Subsequent chunks: start with context overlap, discard context latents
-    current_frame = first_end - context_frames  # Where the next chunk's "new" content starts
-    while current_frame + context_frames < total_frames:
-        chunk_start = current_frame  # Include context frames
-        chunk_end = min(chunk_start + chunk_frames, total_frames)
-        chunks_info.append((chunk_start, chunk_end, False))
-        current_frame = chunk_end - context_frames
+        # Calculate tile grid for progress message
+        stride = current_tile_size - current_overlap
+        h_tiles = max(1, (h - current_overlap + stride - 1) // stride)
+        w_tiles = max(1, (w - current_overlap + stride - 1) // stride)
+        total_tiles = h_tiles * w_tiles
 
-    print(f">>> Encoding {len(chunks_info)} chunk(s) with {context_frames}-frame context...")
+        print(f">>> Encoding {total_frames} frames at {w}x{h} using {total_tiles} spatial tiles ({w_tiles}x{h_tiles}, tile_size={current_tile_size})...")
 
-    # Encode chunks and collect latent segments
-    latent_segments = []
+        # Create spatial-only tiling config (NO temporal tiling to preserve causality)
+        tiling_config = TilingConfig(
+            temporal_config=None,  # Keep full temporal extent
+            spatial_config=SpatialTilingConfig(
+                tile_size_in_pixels=current_tile_size,
+                tile_overlap_in_pixels=current_overlap,
+            ),
+        )
 
-    for i, (start, end, is_first) in enumerate(chunks_info):
-        actual_frames = end - start
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-        # Pad if needed to satisfy 8*k+1
-        if (actual_frames - 1) % 8 != 0:
-            target = 8 * ((actual_frames - 1) // 8 + 1) + 1
-            pad_frames = target - actual_frames
-        else:
-            pad_frames = 0
+            with torch.no_grad():
+                result = video_encoder.tiled_encode(
+                    video_tensor,
+                    tiling_config,
+                    target_device=device,
+                )
 
-        print(f">>> Encoding chunk {i+1}/{len(chunks_info)} (frames {start}-{end})...")
-        # Extract chunk from CPU tensor
-        chunk = video_tensor[:, :, start:end, :, :]
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-        # Pad if necessary (on CPU)
-        if pad_frames > 0:
-            last_frame = chunk[:, :, -1:, :, :]
-            padding = last_frame.expand(-1, -1, pad_frames, -1, -1)
-            chunk = torch.cat([chunk, padding], dim=2)
+            return result
 
-        # Move chunk to GPU for encoding
-        chunk = chunk.to(device=device, dtype=dtype)
+        except torch.cuda.OutOfMemoryError:
+            # Clear CUDA cache and try with smaller tiles
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
 
-        # Encode
-        with torch.no_grad():
-            latent = video_encoder(chunk)
+            old_size = current_tile_size
+            current_tile_size = current_tile_size // 2
 
-        # Free GPU memory immediately
-        del chunk
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            # Ensure tile size meets constraints (divisible by 32, >= min_tile_size)
+            current_tile_size = (current_tile_size // 32) * 32
+            current_tile_size = max(current_tile_size, min_tile_size)
 
-        # Remove padded latent tokens if we padded
-        if pad_frames > 0:
-            valid_tokens = (actual_frames - 1) // 8 + 1
-            latent = latent[:, :, :valid_tokens, :, :]
+            if current_tile_size < min_tile_size or current_tile_size == old_size:
+                raise RuntimeError(
+                    f"CUDA OOM during video encoding. Failed even with minimum tile size {min_tile_size}. "
+                    f"Try reducing video resolution or frame count."
+                )
 
-        # Move latent to CPU to save GPU memory
-        latent = latent.cpu()
+            print(f">>> OOM at tile size {old_size}, retrying with tile size {current_tile_size}...")
 
-        # For first chunk: use all latent tokens
-        # For subsequent chunks: discard context latents (warm-up region)
-        if is_first:
-            latent_segments.append(latent)
-        else:
-            # Discard the first context_latents tokens (the warm-up region)
-            if latent.shape[2] > context_latents:
-                latent_segments.append(latent[:, :, context_latents:, :, :])
-            # If chunk is very short, it might be entirely context - skip it
-
-        del latent
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    # Concatenate all segments directly (no blending needed with this approach)
-    if len(latent_segments) == 1:
-        result = latent_segments[0]
-    else:
-        result = torch.cat(latent_segments, dim=2)
-
-    # Trim to exact expected length
-    total_latent_frames = (total_frames - 1) // 8 + 1
-    if result.shape[2] > total_latent_frames:
-        result = result[:, :, :total_latent_frames, :, :]
-    elif result.shape[2] < total_latent_frames:
-        # Pad with last token if we're short (shouldn't happen with correct chunking)
-        pad_latents = total_latent_frames - result.shape[2]
-        last_latent = result[:, :, -1:, :, :]
-        padding = last_latent.expand(-1, -1, pad_latents, -1, -1)
-        result = torch.cat([result, padding], dim=2)
-
-    # Move final result to target device
-    return result.to(device=device)
+    # Should not reach here, but just in case
+    raise RuntimeError(f"CUDA OOM during video encoding with minimum tile size {min_tile_size}")
 
 
 # =============================================================================
@@ -3187,6 +3198,8 @@ class LTXVideoGeneratorWithOffloading:
         refine_strength: float = 0.3,
         refine_steps: int = 10,
         stage2_steps: int = 3,
+        stage2_strength: float = 1.0,
+        stage3_strength: float = 1.0,
         anchor_image: str | None = None,
         anchor_interval: int | None = None,
         anchor_strength: float = 0.8,
@@ -3225,6 +3238,7 @@ class LTXVideoGeneratorWithOffloading:
         refine_latent_stride: int = 8,
         # Sampler selection
         sampler: str = "euler",
+        stage2_sampler: str = "euler",
         # Stage 3 parameters
         stage3_steps: int = 3,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor | None, str | None]:
@@ -3241,7 +3255,8 @@ class LTXVideoGeneratorWithOffloading:
         generator = torch.Generator(device=self.device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
         stepper = get_sampler(sampler)
-        print(f">>> Using {sampler} sampler")
+        stage2_stepper = get_sampler(stage2_sampler)
+        print(f">>> Using {sampler} sampler (stage 1), {stage2_sampler} sampler (stage 2/3)")
         cfg_guider = CFGGuider(cfg_guidance_scale)
         # Initialize STG (Spatio-Temporal Guidance) components
         effective_stg_blocks = stg_blocks if stg_blocks is not None else [29]
@@ -4605,13 +4620,18 @@ class LTXVideoGeneratorWithOffloading:
                 distilled_sigmas = distilled_sigmas.to(self.device)
                 print(f">>> Stage 2 using {stage2_steps} steps (interpolated from tuned schedule)")
 
+        # Apply stage2_strength scaling
+        if stage2_strength < 1.0:
+            distilled_sigmas = distilled_sigmas * stage2_strength
+            print(f">>> Stage 2: Scaling sigmas by {stage2_strength} (noise_scale={distilled_sigmas[0]:.4f})")
+
         # Move text embeddings to GPU for stage 2 denoising
         v_context_p = v_context_p.to(self.device)
         a_context_p = a_context_p.to(self.device)
 
-        # Reset stepper history for stage 2 (important for UniPC which stores model outputs)
-        if hasattr(stepper, 'reset'):
-            stepper.reset()
+        # Reset stage2 stepper history (important for UniPC which stores model outputs)
+        if hasattr(stage2_stepper, 'reset'):
+            stage2_stepper.reset()
 
         # Define denoising function for stage 2 (no CFG, just positive)
         # Convert anchor_decay "none" to None for the denoising loop (if not already done in stage 1)
@@ -4879,7 +4899,7 @@ class LTXVideoGeneratorWithOffloading:
             'conditionings': stage_2_conditionings,
             'noiser': noiser,
             'sigmas': distilled_sigmas,
-            'stepper': stepper,
+            'stepper': stage2_stepper,
             'denoising_loop_fn': second_stage_denoising_loop,
             'components': self.pipeline_components,
             'dtype': dtype,
@@ -5133,13 +5153,18 @@ class LTXVideoGeneratorWithOffloading:
                 stage3_sigmas = stage3_sigmas.to(self.device)
                 print(f">>> Stage 3 using {stage3_steps} steps (interpolated from tuned schedule)")
 
+            # Apply stage3_strength scaling
+            if stage3_strength < 1.0:
+                stage3_sigmas = stage3_sigmas * stage3_strength
+                print(f">>> Stage 3: Scaling sigmas by {stage3_strength} (noise_scale={stage3_sigmas[0]:.4f})")
+
             # Move text embeddings to GPU for stage 3 denoising
             v_context_p = v_context_p.to(self.device)
             a_context_p = a_context_p.to(self.device)
 
-            # Reset stepper history for stage 3 (important for UniPC which stores model outputs)
-            if hasattr(stepper, 'reset'):
-                stepper.reset()
+            # Reset stage2 stepper history for stage 3 (stage 3 inherits stage2_sampler choice)
+            if hasattr(stage2_stepper, 'reset'):
+                stage2_stepper.reset()
 
             # Define denoising function for stage 3
             effective_anchor_decay = anchor_decay if anchor_decay and anchor_decay != "none" else None
@@ -5213,7 +5238,7 @@ class LTXVideoGeneratorWithOffloading:
                 'conditionings': stage_3_conditionings,
                 'noiser': noiser,
                 'sigmas': stage3_sigmas,
-                'stepper': stepper,
+                'stepper': stage2_stepper,
                 'denoising_loop_fn': third_stage_denoising_loop,
                 'components': self.pipeline_components,
                 'dtype': dtype,
@@ -5482,6 +5507,7 @@ def generate_svi_multi_clip(
                 latent_norm_fn=latent_norm_fn,
                 # Sampler
                 sampler=args.sampler,
+                stage2_sampler=args.stage2_sampler,
                 # Stage 3 parameters
                 stage3_steps=args.stage3_steps,
             )
@@ -9185,6 +9211,7 @@ def sliding_window_generate(
             latent_norm_fn=latent_norm_fn,
             # Sampler
             sampler=args.sampler,
+            stage2_sampler=args.stage2_sampler,
             # Stage 3 parameters
             stage3_steps=args.stage3_steps,
         )
@@ -9678,6 +9705,8 @@ def main():
             refine_strength=args.refine_strength,
             refine_steps=args.refine_steps,
             stage2_steps=args.stage2_steps,
+            stage2_strength=args.stage2_strength,
+            stage3_strength=args.stage3_strength,
             anchor_image=args.anchor_image,
             anchor_interval=args.anchor_interval,
             anchor_strength=args.anchor_strength,
@@ -9702,6 +9731,7 @@ def main():
             v2v_overlap_frames=args.v2v_overlap_frames,
             refine_latent_stride=args.refine_latent_stride,
             sampler=args.sampler,
+            stage2_sampler=args.stage2_sampler,
             stage3_steps=args.stage3_steps,
         )
 
@@ -9790,9 +9820,19 @@ def main():
     print(f">>> Video saved in {time.time() - encode_start:.1f}s")
 
     # Build and save metadata
+    # Determine pipeline type string
+    if args.refine_only:
+        pipeline_type = "refine-only"
+    elif args.one_stage:
+        pipeline_type = "one-stage"
+    elif args.num_stages == 3:
+        pipeline_type = f"three-stage-{args.pipeline_mode}"
+    else:
+        pipeline_type = "two-stage"
+
     metadata = {
         "model_type": "LTX-2",
-        "pipeline": "refine-only" if args.refine_only else ("one-stage" if args.one_stage else "two-stage"),
+        "pipeline": pipeline_type,
         "distilled_checkpoint": args.distilled_checkpoint,
         "checkpoint_path": args.checkpoint_path,
         "stage2_checkpoint": args.stage2_checkpoint,
@@ -9809,6 +9849,7 @@ def main():
         "stg_mode": args.stg_mode if args.stg_scale > 0 else None,
         "num_inference_steps": args.num_inference_steps,
         "seed": args.seed,
+        "sampler": args.sampler,
         "offload": args.offload,
         "enable_fp8": args.enable_fp8,
         # Separate block swap settings
@@ -9818,21 +9859,45 @@ def main():
         "text_encoder_blocks_in_memory": args.text_encoder_blocks_in_memory if args.enable_text_encoder_block_swap else None,
         "enable_refiner_block_swap": args.enable_refiner_block_swap,
         "refiner_blocks_in_memory": args.refiner_blocks_in_memory if args.enable_refiner_block_swap else None,
-        "images": [(img[0], img[1], img[2]) for img in args.images] if args.images else None,
+        # Memory optimization settings
+        "ffn_chunk_size": args.ffn_chunk_size,
+        "enable_activation_offload": args.enable_activation_offload,
+        "temporal_chunk_size": args.temporal_chunk_size if args.temporal_chunk_size > 0 else None,
+        # Image conditioning (includes CRF in tuple: path, frame_idx, strength, crf)
+        "images": [(img[0], img[1], img[2], img[3] if len(img) > 3 else 33) for img in args.images] if args.images else None,
+        # LoRA settings
         "loras": [(lora.path, lora.strength) for lora in args.loras] if args.loras else None,
+        "stage2_loras": [(lora.path, lora.strength) for lora in args.stage2_loras] if args.stage2_loras else None,
+        "stage3_loras": [(lora.path, lora.strength) for lora in args.stage3_loras] if args.stage3_loras else None,
         "distilled_lora": [(lora.path, lora.strength) for lora in args.distilled_lora] if args.distilled_lora else None,
+        # V2V / Refine settings
         "input_video": args.input_video,
         "refine_strength": args.refine_strength if args.input_video else None,
         "refine_steps": args.refine_steps if args.input_video else None,
+        "v2v_chunk_frames": args.v2v_chunk_frames if args.input_video else None,
+        "v2v_overlap_frames": args.v2v_overlap_frames if args.input_video else None,
+        "refine_latent_stride": args.refine_latent_stride if args.input_video else None,
+        # Anchor settings
         "anchor_image": args.anchor_image,
         "anchor_interval": args.anchor_interval,
         "anchor_strength": args.anchor_strength if args.anchor_interval else None,
         "anchor_decay": args.anchor_decay if args.anchor_interval and args.anchor_decay != "none" else None,
+        "anchor_crf": args.anchor_crf if args.anchor_interval and args.anchor_crf != 33 else None,
+        # Audio settings
         "disable_audio": args.disable_audio,
         "audio": args.audio,
         "audio_strength": args.audio_strength if args.audio else None,
         "enhance_prompt": args.enhance_prompt,
         "enhanced_prompt": enhanced_prompt,
+        # Latent normalization settings
+        "latent_norm_mode": args.latent_norm if args.latent_norm != "none" else None,
+        "latent_norm_factors": args.latent_norm_factors if args.latent_norm != "none" else None,
+        "latent_norm_target_mean": args.latent_norm_target_mean if args.latent_norm != "none" else None,
+        "latent_norm_target_std": args.latent_norm_target_std if args.latent_norm != "none" else None,
+        "latent_norm_percentile": args.latent_norm_percentile if args.latent_norm != "none" else None,
+        "latent_norm_clip_outliers": args.latent_norm_clip_outliers if args.latent_norm != "none" else None,
+        "latent_norm_video_only": args.latent_norm_video_only if args.latent_norm != "none" else None,
+        "latent_norm_audio_only": args.latent_norm_audio_only if args.latent_norm != "none" else None,
         # SVI Pro metadata
         "svi_mode": args.svi_mode,
         "svi_num_clips": args.num_clips if (args.svi_mode or args.extend_video) else None,

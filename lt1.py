@@ -1469,6 +1469,7 @@ def generate_ltx_video(
     mode: str,
     pipeline: str,
     sampler: str,
+    stage2_sampler: str,
     enable_sliding_window: bool,
     width: int,
     height: int,
@@ -1477,6 +1478,8 @@ def generate_ltx_video(
     cfg_guidance_scale: float,
     num_inference_steps: int,
     stage2_steps: int,
+    stage2_strength: float,
+    stage3_strength: float,
     seed: int,
     # STG parameters
     stg_scale: float,
@@ -1501,8 +1504,6 @@ def generate_ltx_video(
     input_video: str,
     refine_strength: float,
     refine_steps: int,
-    v2v_chunk_frames: int,
-    v2v_overlap_frames: int,
     refine_latent_stride: int,
     # Audio & prompt
     disable_audio: bool,
@@ -1672,9 +1673,12 @@ def generate_ltx_video(
             "--cfg-guidance-scale", str(float(cfg_guidance_scale)),
             "--num-inference-steps", str(int(num_inference_steps)),
             "--stage2-steps", str(int(stage2_steps)),
+            "--stage2-strength", str(float(stage2_strength)),
+            "--stage3-strength", str(float(stage3_strength)),
             "--seed", str(current_seed),
             "--output-path", output_filename,
             "--sampler", str(sampler),
+            "--stage2-sampler", str(stage2_sampler),
         ]
 
         # STG parameters (only include when stg_scale > 0)
@@ -1725,8 +1729,6 @@ def generate_ltx_video(
             command.extend(["--input-video", str(input_video)])
             command.extend(["--refine-strength", str(float(refine_strength))])
             command.extend(["--refine-steps", str(int(refine_steps))])
-            command.extend(["--v2v-chunk-frames", str(int(v2v_chunk_frames))])
-            command.extend(["--v2v-overlap-frames", str(int(v2v_overlap_frames))])
             command.extend(["--refine-latent-stride", str(int(refine_latent_stride))])
 
         # Image conditioning (I2V) - with per-image CRF
@@ -2853,10 +2855,27 @@ def create_interface():
                                 info="two-stage = higher quality, three-stage-exp = 3 stages with upsampling, three-stage-linear = 3 stages same res"
                             )
                             sampler = gr.Dropdown(
-                                label="Sampler",
+                                label="Sampler (Stage 1)",
                                 choices=["euler", "unipc", "lcm"],
                                 value="euler",
-                                info="euler = default, unipc = higher-order (10-25 steps), lcm = fast (4-8 steps) with SGM Uniform"
+                                info="euler = default, unipc = higher-order (10-25 steps), lcm = fast (4-8 steps)"
+                            )
+                            stage2_sampler = gr.Dropdown(
+                                label="Sampler (Stage 2/3)",
+                                choices=["euler", "unipc", "lcm"],
+                                value="euler",
+                                info="euler recommended for distilled models with few steps"
+                            )
+                        with gr.Row():
+                            stage2_strength = gr.Slider(
+                                minimum=0.01, maximum=1.0, value=1.0, step=0.01,
+                                label="Stage 2 Strength",
+                                info="Sigma scaling (lower = less noise = more preservation)"
+                            )
+                            stage3_strength = gr.Slider(
+                                minimum=0.01, maximum=1.0, value=1.0, step=0.01,
+                                label="Stage 3 Strength",
+                                info="Sigma scaling (lower = less noise = more preservation)"
                             )
                         scale_slider = gr.Slider(
                             minimum=1, maximum=200, value=100, step=1,
@@ -2899,17 +2918,6 @@ def create_interface():
                                     minimum=1, maximum=30, value=10, step=1,
                                     label="Refine Steps",
                                     info="Number of refinement denoising steps"
-                                )
-                            with gr.Row():
-                                v2v_chunk_frames = gr.Slider(
-                                    minimum=25, maximum=257, value=121, step=8,
-                                    label="V2V Chunk Frames",
-                                    info="Frames per chunk for sequential V2V (8k+1)"
-                                )
-                                v2v_overlap_frames = gr.Slider(
-                                    minimum=8, maximum=64, value=24, step=8,
-                                    label="V2V Overlap Frames",
-                                    info="Overlap frames between chunks (divisible by 8)"
                                 )
                             with gr.Row():
                                 refine_latent_stride = gr.Slider(
@@ -4284,13 +4292,13 @@ Audio is synchronized with the video extension.
                 prompt, negative_prompt,
                 checkpoint_path, distilled_checkpoint, stage2_checkpoint, gemma_root, spatial_upsampler_path,
                 vae_path, distilled_lora_path, distilled_lora_strength,
-                mode, pipeline, sampler, enable_sliding_window, width, height, num_frames, frame_rate,
-                cfg_guidance_scale, num_inference_steps, stage2_steps, seed,
+                mode, pipeline, sampler, stage2_sampler, enable_sliding_window, width, height, num_frames, frame_rate,
+                cfg_guidance_scale, num_inference_steps, stage2_steps, stage2_strength, stage3_strength, seed,
                 stg_scale, stg_blocks, stg_mode,
                 input_image, image_frame_idx, image_strength, image_crf,
                 end_image, end_image_strength, end_image_crf,
                 anchor_image, anchor_interval, anchor_strength, anchor_decay, anchor_crf,
-                input_video, refine_strength, refine_steps, v2v_chunk_frames, v2v_overlap_frames, refine_latent_stride,
+                input_video, refine_strength, refine_steps, refine_latent_stride,
                 disable_audio, audio_input, audio_strength, enhance_prompt,
                 offload, enable_fp8,
                 enable_dit_block_swap, dit_blocks_in_memory,
@@ -4345,19 +4353,30 @@ Audio is synchronized with the video extension.
         def send_to_generation_handler(metadata, first_frame):
             """Send loaded metadata to generation tab parameters and switch to Generation tab."""
             if not metadata:
-                return [gr.update()] * 45 + ["No metadata loaded - upload a video first"]
+                return [gr.update()] * 48 + ["No metadata loaded - upload a video first"]
 
             # Handle legacy metadata that used single enable_block_swap
             legacy_block_swap = metadata.get("enable_block_swap", True)
 
             # Extract image conditioning info from metadata
+            # Image tuple format: (path, frame_idx, strength, crf) - crf may be missing in older metadata
             images = metadata.get("images", [])
             image_strength = 0.9
             image_frame_idx = 0
+            image_crf = 33
+            end_image_strength = 0.9
+            end_image_crf = 33
+
             if images and len(images) > 0:
-                # First image entry: (path, frame_idx, strength)
+                # First image entry (start image): (path, frame_idx, strength, crf)
                 image_frame_idx = images[0][1] if len(images[0]) > 1 else 0
                 image_strength = images[0][2] if len(images[0]) > 2 else 0.9
+                image_crf = images[0][3] if len(images[0]) > 3 else 33
+
+                # Check for end image (second entry, typically at last frame)
+                if len(images) > 1:
+                    end_image_strength = images[1][2] if len(images[1]) > 2 else 0.9
+                    end_image_crf = images[1][3] if len(images[1]) > 3 else 33
 
             # Determine mode based on whether images were used
             mode = "t2v"
@@ -4376,6 +4395,7 @@ Audio is synchronized with the video extension.
                 gr.update(value=mode),  # mode
                 gr.update(value=metadata.get("pipeline", "two-stage")),  # pipeline
                 gr.update(value=metadata.get("sampler", "euler")),  # sampler
+                gr.update(value=metadata.get("stage2_sampler", "euler")),  # stage2_sampler
                 gr.update(value=metadata.get("width", 1024)),  # width
                 gr.update(value=metadata.get("height", 1024)),  # height
                 gr.update(value=metadata.get("num_frames", 121)),  # num_frames
@@ -4383,18 +4403,20 @@ Audio is synchronized with the video extension.
                 gr.update(value=metadata.get("cfg_guidance_scale", 4.0)),  # cfg_guidance_scale
                 gr.update(value=metadata.get("num_inference_steps", 40)),  # num_inference_steps
                 gr.update(value=metadata.get("stage2_steps", 3)),  # stage2_steps
+                gr.update(value=metadata.get("stage2_strength", 1.0)),  # stage2_strength
+                gr.update(value=metadata.get("stage3_strength", 1.0)),  # stage3_strength
                 gr.update(value=metadata.get("seed", -1)),  # seed
                 # STG parameters
                 gr.update(value=metadata.get("stg_scale", 0.0)),  # stg_scale
                 gr.update(value=metadata.get("stg_blocks", "29")),  # stg_blocks
                 gr.update(value=metadata.get("stg_mode", "stg_av") or "stg_av"),  # stg_mode
-                # Image conditioning
+                # Image conditioning (extracted from images tuple)
                 gr.update(value=first_frame),  # input_image - use extracted first frame
                 gr.update(value=image_frame_idx),  # image_frame_idx
                 gr.update(value=image_strength),  # image_strength
-                gr.update(value=metadata.get("image_crf", 33)),  # image_crf
-                gr.update(value=metadata.get("end_image_strength", 0.9)),  # end_image_strength
-                gr.update(value=metadata.get("end_image_crf", 33)),  # end_image_crf
+                gr.update(value=image_crf),  # image_crf
+                gr.update(value=end_image_strength),  # end_image_strength
+                gr.update(value=end_image_crf),  # end_image_crf
                 # Anchor conditioning
                 gr.update(value=metadata.get("anchor_interval", 0) or 0),  # anchor_interval
                 gr.update(value=metadata.get("anchor_strength", 0.8)),  # anchor_strength
@@ -4403,8 +4425,6 @@ Audio is synchronized with the video extension.
                 # Refine settings
                 gr.update(value=metadata.get("refine_strength", 0.3)),  # refine_strength
                 gr.update(value=metadata.get("refine_steps", 10)),  # refine_steps
-                gr.update(value=metadata.get("v2v_chunk_frames", 121)),  # v2v_chunk_frames
-                gr.update(value=metadata.get("v2v_overlap_frames", 24)),  # v2v_overlap_frames
                 gr.update(value=metadata.get("refine_latent_stride", 8)),  # refine_latent_stride
                 # Audio and prompt
                 gr.update(value=metadata.get("disable_audio", False)),  # disable_audio
@@ -4446,9 +4466,9 @@ Audio is synchronized with the video extension.
             inputs=[info_metadata_output, info_first_frame],
             outputs=[
                 tabs,  # Switch tab
-                prompt, negative_prompt, mode, pipeline, sampler,
+                prompt, negative_prompt, mode, pipeline, sampler, stage2_sampler,
                 width, height, num_frames, frame_rate,
-                cfg_guidance_scale, num_inference_steps, stage2_steps, seed,
+                cfg_guidance_scale, num_inference_steps, stage2_steps, stage2_strength, stage3_strength, seed,
                 # STG parameters
                 stg_scale, stg_blocks, stg_mode,
                 # Image conditioning
@@ -4456,7 +4476,7 @@ Audio is synchronized with the video extension.
                 # Anchor conditioning
                 anchor_interval, anchor_strength, anchor_decay, anchor_crf,
                 # Refine settings
-                refine_strength, refine_steps, v2v_chunk_frames, v2v_overlap_frames, refine_latent_stride,
+                refine_strength, refine_steps, refine_latent_stride,
                 # Audio and prompt
                 disable_audio, audio_strength, enhance_prompt,
                 # Memory optimization
@@ -4624,8 +4644,8 @@ Audio is synchronized with the video extension.
             checkpoint_path, distilled_checkpoint, stage2_checkpoint, gemma_root,
             spatial_upsampler_path, vae_path, distilled_lora_path, distilled_lora_strength,
             # Generation parameters
-            mode, pipeline, sampler, width, height, num_frames, frame_rate,
-            cfg_guidance_scale, num_inference_steps, stage2_steps, seed,
+            mode, pipeline, sampler, stage2_sampler, width, height, num_frames, frame_rate,
+            cfg_guidance_scale, num_inference_steps, stage2_steps, stage2_strength, stage3_strength, seed,
             stg_scale, stg_blocks, stg_mode,
             # Image conditioning (not input_image itself - that's a file upload)
             image_frame_idx, image_strength, image_crf,
@@ -4633,7 +4653,7 @@ Audio is synchronized with the video extension.
             # Anchor conditioning
             anchor_interval, anchor_strength, anchor_decay, anchor_crf,
             # Refine settings
-            refine_strength, refine_steps, v2v_chunk_frames, v2v_overlap_frames, refine_latent_stride,
+            refine_strength, refine_steps, refine_latent_stride,
             # Audio and prompt
             disable_audio, audio_strength, enhance_prompt,
             # Memory optimization
@@ -4668,8 +4688,8 @@ Audio is synchronized with the video extension.
             "checkpoint_path", "distilled_checkpoint", "stage2_checkpoint", "gemma_root",
             "spatial_upsampler_path", "vae_path", "distilled_lora_path", "distilled_lora_strength",
             # Generation parameters
-            "mode", "pipeline", "sampler", "width", "height", "num_frames", "frame_rate",
-            "cfg_guidance_scale", "num_inference_steps", "stage2_steps", "seed",
+            "mode", "pipeline", "sampler", "stage2_sampler", "width", "height", "num_frames", "frame_rate",
+            "cfg_guidance_scale", "num_inference_steps", "stage2_steps", "stage2_strength", "stage3_strength", "seed",
             "stg_scale", "stg_blocks", "stg_mode",
             # Image conditioning
             "image_frame_idx", "image_strength", "image_crf",
@@ -4677,7 +4697,7 @@ Audio is synchronized with the video extension.
             # Anchor conditioning
             "anchor_interval", "anchor_strength", "anchor_decay", "anchor_crf",
             # Refine settings
-            "refine_strength", "refine_steps", "v2v_chunk_frames", "v2v_overlap_frames", "refine_latent_stride",
+            "refine_strength", "refine_steps", "refine_latent_stride",
             # Audio and prompt
             "disable_audio", "audio_strength", "enhance_prompt",
             # Memory optimization
