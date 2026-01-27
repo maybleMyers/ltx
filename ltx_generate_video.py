@@ -3083,8 +3083,10 @@ class LTXVideoGeneratorWithOffloading:
         self.text_encoder_blocks_in_memory = text_encoder_blocks_in_memory
         self.enable_refiner_block_swap = enable_refiner_block_swap
         self.refiner_blocks_in_memory = refiner_blocks_in_memory
-        self.enable_stage3_block_swap = enable_stage3_block_swap
-        self.stage3_blocks_in_memory = stage3_blocks_in_memory
+        # Stage 3 inherits refiner block swap settings by default (same refinement role)
+        self.enable_stage3_block_swap = enable_stage3_block_swap or enable_refiner_block_swap
+        # Use stage3 blocks if explicitly different, otherwise inherit from refiner
+        self.stage3_blocks_in_memory = stage3_blocks_in_memory if enable_stage3_block_swap else refiner_blocks_in_memory
         self.enable_activation_offload = enable_activation_offload
         self.temporal_chunk_size = temporal_chunk_size
         self.one_stage = one_stage
