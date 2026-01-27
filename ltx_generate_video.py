@@ -4563,8 +4563,14 @@ class LTXVideoGeneratorWithOffloading:
             # This preserves (1 - refine_strength) of the input content
             distilled_sigmas = base_sigmas * refine_strength
             print(f">>> Using {refine_steps} refinement steps with strength {refine_strength}")
+        elif self.pipeline_mode == "linear":
+            # Linear mode: Stage 2 uses SAME schedule as Stage 1 (full denoising)
+            distilled_sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(
+                dtype=torch.float32, device=self.device
+            )
+            print(f">>> Linear mode Stage 2: using {num_inference_steps} steps (same as Stage 1)")
         else:
-            # Use pre-tuned sigma values for stage 2 refinement with distilled LoRA
+            # Exponential mode: use pre-tuned sigma values for refinement with distilled LoRA
             # These values are specifically calibrated for the distilled model
             if stage2_steps == 3:
                 # Use exact tuned values for default 3 steps
@@ -5096,8 +5102,15 @@ class LTXVideoGeneratorWithOffloading:
                 )
                 transformer = stage_3_ledger.transformer()
 
-            # Generate sigma schedule for stage 3 (same pattern as stage 2)
-            if stage3_steps == 3:
+            # Generate sigma schedule for stage 3
+            if self.pipeline_mode == "linear":
+                # Linear mode: Stage 3 uses SAME schedule as Stage 1 (full denoising)
+                stage3_sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(
+                    dtype=torch.float32, device=self.device
+                )
+                print(f">>> Linear mode Stage 3: using {num_inference_steps} steps (same as Stage 1)")
+            elif stage3_steps == 3:
+                # Exponential mode: use refinement schedule
                 stage3_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
             elif stage3_steps == 8:
                 stage3_sigmas = torch.Tensor(DISTILLED_SIGMA_VALUES).to(self.device)
@@ -5190,8 +5203,9 @@ class LTXVideoGeneratorWithOffloading:
 
             # OOM retry for stage 3
             stage3_retry_state = OOMRetryState(
-                initial_blocks=self.stage3_blocks_in_memory,
-                min_blocks=1,
+                stage="stage3",
+                original_blocks=self.stage3_blocks_in_memory if self.enable_stage3_block_swap else 0,
+                current_blocks=self.stage3_blocks_in_memory if self.enable_stage3_block_swap else 0,
             )
 
             denoising_kwargs = {
