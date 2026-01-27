@@ -4414,9 +4414,12 @@ class LTXVideoGeneratorWithOffloading:
                     synchronize_and_cleanup()
                     phase_barrier("video_decoding_one_stage")
 
-                # Skip audio VAE decode when audio_strength == 1.0 (frozen audio)
-                # to avoid corruption - original audio will be concatenated via ffmpeg
-                if not disable_audio and not (audio is not None and audio_strength == 1.0):
+                # Skip audio VAE decode when:
+                # - audio_strength == 1.0 (frozen external audio)
+                # - v2v_audio_mode == "preserve" (copy audio from input video)
+                skip_for_external_audio = audio is not None and audio_strength == 1.0
+                skip_for_v2v_preserve = input_video and v2v_audio_mode == "preserve"
+                if not disable_audio and not skip_for_external_audio and not skip_for_v2v_preserve:
                     print(">>> Decoding audio...")
                     audio_decoder = self.stage_1_model_ledger.audio_decoder()
                     vocoder = self.stage_1_model_ledger.vocoder()
@@ -4429,8 +4432,11 @@ class LTXVideoGeneratorWithOffloading:
                     vocoder.to("cpu")
                     del audio_decoder, vocoder
                     synchronize_and_cleanup()
-                elif audio is not None and audio_strength == 1.0:
+                elif skip_for_external_audio:
                     print(">>> Skipping audio VAE decode (audio_strength=1.0, will use original audio)")
+                    decoded_audio = None
+                elif skip_for_v2v_preserve:
+                    print(">>> Skipping audio VAE decode (v2v_audio_mode=preserve, will copy from input video)")
                     decoded_audio = None
                 else:
                     decoded_audio = None
@@ -5371,9 +5377,12 @@ class LTXVideoGeneratorWithOffloading:
             synchronize_and_cleanup()
             phase_barrier("video_decoding_two_stage")
 
-        # Skip audio VAE decode when audio_strength == 1.0 (frozen audio)
-        # to avoid corruption - original audio will be concatenated via ffmpeg
-        if not disable_audio and not (audio is not None and audio_strength == 1.0):
+        # Skip audio VAE decode when:
+        # - audio_strength == 1.0 (frozen external audio)
+        # - v2v_audio_mode == "preserve" (copy audio from input video)
+        skip_for_external_audio = audio is not None and audio_strength == 1.0
+        skip_for_v2v_preserve = input_video and v2v_audio_mode == "preserve"
+        if not disable_audio and not skip_for_external_audio and not skip_for_v2v_preserve:
             print(">>> Decoding audio...")
             audio_decoder = self.stage_2_model_ledger.audio_decoder()
             vocoder = self.stage_2_model_ledger.vocoder()
@@ -5386,8 +5395,11 @@ class LTXVideoGeneratorWithOffloading:
             vocoder.to("cpu")
             del audio_decoder, vocoder
             synchronize_and_cleanup()
-        elif audio is not None and audio_strength == 1.0:
+        elif skip_for_external_audio:
             print(">>> Skipping audio VAE decode (audio_strength=1.0, will use original audio)")
+            decoded_audio = None
+        elif skip_for_v2v_preserve:
+            print(">>> Skipping audio VAE decode (v2v_audio_mode=preserve, will copy from input video)")
             decoded_audio = None
         else:
             decoded_audio = None
@@ -9852,6 +9864,42 @@ def main():
             '-c:a', 'aac',
             '-map', '0:v:0',
             '-map', '1:a:0',
+            '-shortest',
+            args.output_path
+        ], check=True)
+
+        os.unlink(temp_video_path)
+    elif args.input_video and args.v2v_audio_mode == "preserve":
+        # V2V preserve mode: copy audio from input video
+        import subprocess
+        import tempfile
+        import os
+
+        print(">>> V2V Preserve: Encoding video and copying audio from input video...")
+
+        # First encode video without audio to a temp file
+        temp_video = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
+        temp_video_path = temp_video.name
+        temp_video.close()
+
+        encode_video(
+            video=video,
+            fps=args.frame_rate,
+            audio=None,
+            audio_sample_rate=None,
+            output_path=temp_video_path,
+            video_chunks_number=video_chunks_number,
+        )
+
+        # Copy audio from input video
+        subprocess.run([
+            'ffmpeg', '-y',
+            '-i', temp_video_path,
+            '-i', args.input_video,
+            '-c:v', 'copy',
+            '-c:a', 'aac',
+            '-map', '0:v:0',
+            '-map', '1:a:0?',  # ? makes audio optional (handles videos without audio)
             '-shortest',
             args.output_path
         ], check=True)
