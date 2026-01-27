@@ -1469,6 +1469,7 @@ def generate_ltx_video(
     mode: str,
     pipeline: str,
     sampler: str,
+    stage2_sampler: str,
     enable_sliding_window: bool,
     width: int,
     height: int,
@@ -1675,6 +1676,7 @@ def generate_ltx_video(
             "--seed", str(current_seed),
             "--output-path", output_filename,
             "--sampler", str(sampler),
+            "--stage2-sampler", str(stage2_sampler),
         ]
 
         # STG parameters (only include when stg_scale > 0)
@@ -2853,10 +2855,16 @@ def create_interface():
                                 info="two-stage = higher quality, three-stage-exp = 3 stages with upsampling, three-stage-linear = 3 stages same res"
                             )
                             sampler = gr.Dropdown(
-                                label="Sampler",
+                                label="Sampler (Stage 1)",
                                 choices=["euler", "unipc", "lcm"],
                                 value="euler",
-                                info="euler = default, unipc = higher-order (10-25 steps), lcm = fast (4-8 steps) with SGM Uniform"
+                                info="euler = default, unipc = higher-order (10-25 steps), lcm = fast (4-8 steps)"
+                            )
+                            stage2_sampler = gr.Dropdown(
+                                label="Sampler (Stage 2/3)",
+                                choices=["euler", "unipc", "lcm"],
+                                value="euler",
+                                info="euler recommended for distilled models with few steps"
                             )
                         scale_slider = gr.Slider(
                             minimum=1, maximum=200, value=100, step=1,
@@ -4284,7 +4292,7 @@ Audio is synchronized with the video extension.
                 prompt, negative_prompt,
                 checkpoint_path, distilled_checkpoint, stage2_checkpoint, gemma_root, spatial_upsampler_path,
                 vae_path, distilled_lora_path, distilled_lora_strength,
-                mode, pipeline, sampler, enable_sliding_window, width, height, num_frames, frame_rate,
+                mode, pipeline, sampler, stage2_sampler, enable_sliding_window, width, height, num_frames, frame_rate,
                 cfg_guidance_scale, num_inference_steps, stage2_steps, seed,
                 stg_scale, stg_blocks, stg_mode,
                 input_image, image_frame_idx, image_strength, image_crf,
@@ -4345,7 +4353,7 @@ Audio is synchronized with the video extension.
         def send_to_generation_handler(metadata, first_frame):
             """Send loaded metadata to generation tab parameters and switch to Generation tab."""
             if not metadata:
-                return [gr.update()] * 45 + ["No metadata loaded - upload a video first"]
+                return [gr.update()] * 46 + ["No metadata loaded - upload a video first"]
 
             # Handle legacy metadata that used single enable_block_swap
             legacy_block_swap = metadata.get("enable_block_swap", True)
@@ -4387,6 +4395,7 @@ Audio is synchronized with the video extension.
                 gr.update(value=mode),  # mode
                 gr.update(value=metadata.get("pipeline", "two-stage")),  # pipeline
                 gr.update(value=metadata.get("sampler", "euler")),  # sampler
+                gr.update(value=metadata.get("stage2_sampler", "euler")),  # stage2_sampler
                 gr.update(value=metadata.get("width", 1024)),  # width
                 gr.update(value=metadata.get("height", 1024)),  # height
                 gr.update(value=metadata.get("num_frames", 121)),  # num_frames
@@ -4457,7 +4466,7 @@ Audio is synchronized with the video extension.
             inputs=[info_metadata_output, info_first_frame],
             outputs=[
                 tabs,  # Switch tab
-                prompt, negative_prompt, mode, pipeline, sampler,
+                prompt, negative_prompt, mode, pipeline, sampler, stage2_sampler,
                 width, height, num_frames, frame_rate,
                 cfg_guidance_scale, num_inference_steps, stage2_steps, seed,
                 # STG parameters
@@ -4635,7 +4644,7 @@ Audio is synchronized with the video extension.
             checkpoint_path, distilled_checkpoint, stage2_checkpoint, gemma_root,
             spatial_upsampler_path, vae_path, distilled_lora_path, distilled_lora_strength,
             # Generation parameters
-            mode, pipeline, sampler, width, height, num_frames, frame_rate,
+            mode, pipeline, sampler, stage2_sampler, width, height, num_frames, frame_rate,
             cfg_guidance_scale, num_inference_steps, stage2_steps, seed,
             stg_scale, stg_blocks, stg_mode,
             # Image conditioning (not input_image itself - that's a file upload)
@@ -4679,7 +4688,7 @@ Audio is synchronized with the video extension.
             "checkpoint_path", "distilled_checkpoint", "stage2_checkpoint", "gemma_root",
             "spatial_upsampler_path", "vae_path", "distilled_lora_path", "distilled_lora_strength",
             # Generation parameters
-            "mode", "pipeline", "sampler", "width", "height", "num_frames", "frame_rate",
+            "mode", "pipeline", "sampler", "stage2_sampler", "width", "height", "num_frames", "frame_rate",
             "cfg_guidance_scale", "num_inference_steps", "stage2_steps", "seed",
             "stg_scale", "stg_blocks", "stg_mode",
             # Image conditioning

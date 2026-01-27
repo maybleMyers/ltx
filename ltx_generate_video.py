@@ -1928,9 +1928,18 @@ Examples:
         type=str,
         default="euler",
         choices=["euler", "unipc", "lcm"],
-        help="Sampler to use for denoising. 'euler' is the default first-order method. "
+        help="Sampler to use for stage 1 denoising. 'euler' is the default first-order method. "
              "'unipc' is a higher-order predictor-corrector (good with 10-25 steps). "
              "'lcm' is optimized for few steps (4-8) with distilled models using SGM Uniform schedule. "
+             "(default: euler)",
+    )
+    gen_group.add_argument(
+        "--stage2-sampler",
+        type=str,
+        default="euler",
+        choices=["euler", "unipc", "lcm"],
+        help="Sampler to use for stage 2/3 denoising. 'euler' is recommended for distilled models "
+             "with few steps. If not specified, defaults to 'euler'. Stage 3 inherits this choice. "
              "(default: euler)",
     )
     gen_group.add_argument(
@@ -3225,6 +3234,7 @@ class LTXVideoGeneratorWithOffloading:
         refine_latent_stride: int = 8,
         # Sampler selection
         sampler: str = "euler",
+        stage2_sampler: str = "euler",
         # Stage 3 parameters
         stage3_steps: int = 3,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor | None, str | None]:
@@ -3241,7 +3251,8 @@ class LTXVideoGeneratorWithOffloading:
         generator = torch.Generator(device=self.device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
         stepper = get_sampler(sampler)
-        print(f">>> Using {sampler} sampler")
+        stage2_stepper = get_sampler(stage2_sampler)
+        print(f">>> Using {sampler} sampler (stage 1), {stage2_sampler} sampler (stage 2/3)")
         cfg_guider = CFGGuider(cfg_guidance_scale)
         # Initialize STG (Spatio-Temporal Guidance) components
         effective_stg_blocks = stg_blocks if stg_blocks is not None else [29]
@@ -4609,9 +4620,9 @@ class LTXVideoGeneratorWithOffloading:
         v_context_p = v_context_p.to(self.device)
         a_context_p = a_context_p.to(self.device)
 
-        # Reset stepper history for stage 2 (important for UniPC which stores model outputs)
-        if hasattr(stepper, 'reset'):
-            stepper.reset()
+        # Reset stage2 stepper history (important for UniPC which stores model outputs)
+        if hasattr(stage2_stepper, 'reset'):
+            stage2_stepper.reset()
 
         # Define denoising function for stage 2 (no CFG, just positive)
         # Convert anchor_decay "none" to None for the denoising loop (if not already done in stage 1)
@@ -4879,7 +4890,7 @@ class LTXVideoGeneratorWithOffloading:
             'conditionings': stage_2_conditionings,
             'noiser': noiser,
             'sigmas': distilled_sigmas,
-            'stepper': stepper,
+            'stepper': stage2_stepper,
             'denoising_loop_fn': second_stage_denoising_loop,
             'components': self.pipeline_components,
             'dtype': dtype,
@@ -5137,9 +5148,9 @@ class LTXVideoGeneratorWithOffloading:
             v_context_p = v_context_p.to(self.device)
             a_context_p = a_context_p.to(self.device)
 
-            # Reset stepper history for stage 3 (important for UniPC which stores model outputs)
-            if hasattr(stepper, 'reset'):
-                stepper.reset()
+            # Reset stage2 stepper history for stage 3 (stage 3 inherits stage2_sampler choice)
+            if hasattr(stage2_stepper, 'reset'):
+                stage2_stepper.reset()
 
             # Define denoising function for stage 3
             effective_anchor_decay = anchor_decay if anchor_decay and anchor_decay != "none" else None
@@ -5213,7 +5224,7 @@ class LTXVideoGeneratorWithOffloading:
                 'conditionings': stage_3_conditionings,
                 'noiser': noiser,
                 'sigmas': stage3_sigmas,
-                'stepper': stepper,
+                'stepper': stage2_stepper,
                 'denoising_loop_fn': third_stage_denoising_loop,
                 'components': self.pipeline_components,
                 'dtype': dtype,
@@ -5482,6 +5493,7 @@ def generate_svi_multi_clip(
                 latent_norm_fn=latent_norm_fn,
                 # Sampler
                 sampler=args.sampler,
+                stage2_sampler=args.stage2_sampler,
                 # Stage 3 parameters
                 stage3_steps=args.stage3_steps,
             )
@@ -9185,6 +9197,7 @@ def sliding_window_generate(
             latent_norm_fn=latent_norm_fn,
             # Sampler
             sampler=args.sampler,
+            stage2_sampler=args.stage2_sampler,
             # Stage 3 parameters
             stage3_steps=args.stage3_steps,
         )
@@ -9702,6 +9715,7 @@ def main():
             v2v_overlap_frames=args.v2v_overlap_frames,
             refine_latent_stride=args.refine_latent_stride,
             sampler=args.sampler,
+            stage2_sampler=args.stage2_sampler,
             stage3_steps=args.stage3_steps,
         )
 
