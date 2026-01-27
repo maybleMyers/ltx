@@ -311,6 +311,223 @@ class VideoEncoder(nn.Module):
         means, _ = torch.chunk(sample, 2, dim=1)
         return self.per_channel_statistics.normalize(means)
 
+    def tiled_encode(
+        self,
+        video: torch.Tensor,
+        tiling_config: "TilingConfig | None" = None,
+        target_device: Optional[torch.device] = None,
+    ) -> torch.Tensor:
+        """
+        Encode a video tensor into latents using tiled processing.
+        Mirrors tiled_decode but in reverse direction (video -> latent).
+
+        This method processes the video in overlapping tiles to manage memory usage,
+        then blends the encoded latents using trapezoidal masks for smooth transitions.
+
+        Memory-efficient: keeps video on its original device (can be CPU) and only
+        moves individual tiles to GPU for encoding.
+
+        Args:
+            video: Input video tensor (B, C, F, H, W) where F should be 1 + 8*k
+                   for clean latent boundaries. Can be on CPU to save GPU memory.
+            tiling_config: Tiling configuration for temporal/spatial chunking.
+                          If None, encodes the entire video at once.
+            target_device: Device for encoding each tile. If None, uses the device
+                          of the encoder's parameters.
+
+        Returns:
+            Encoded latent tensor (B, latent_channels, F', H', W') where:
+            - F' = (F-1)//8 + 1
+            - H' = H//32
+            - W' = W//32
+        """
+        # Determine target device for encoding
+        if target_device is None:
+            target_device = next(self.parameters()).device
+
+        # If no tiling config or video is small enough, encode directly
+        if tiling_config is None:
+            video_on_device = video.to(device=target_device)
+            return self.forward(video_on_device)
+
+        # Validate input frame count
+        frames_count = video.shape[2]
+        if ((frames_count - 1) % 8) != 0:
+            raise ValueError(
+                f"Invalid number of frames {frames_count}: Encode input must have 1 + 8*k frames "
+                "(e.g., 1, 9, 17, ...). Please check your input."
+            )
+
+        # Spatiotemporal downscaling factors for this encoder
+        # Standard LTX: time=8, height=32, width=32
+        video_downscale_factors = SpatioTemporalScaleFactors(
+            time=8,
+            width=32,
+            height=32,
+        )
+
+        # Create tiles for encoding (video space -> latent space mapping)
+        tiles = self._prepare_encode_tiles(video.shape, tiling_config, video_downscale_factors)
+
+        # Calculate output latent shape
+        b, c, f, h, w = video.shape
+        latent_f = (f - 1) // video_downscale_factors.time + 1
+        latent_h = h // video_downscale_factors.height
+        latent_w = w // video_downscale_factors.width
+        latent_shape = (b, self.latent_channels, latent_f, latent_h, latent_w)
+
+        # Allocate output buffer and weight accumulator on CPU to save memory
+        # We'll move the final result to target_device at the end
+        buffer = torch.zeros(latent_shape, device='cpu', dtype=video.dtype)
+        weights = torch.zeros(latent_shape, device='cpu', dtype=video.dtype)
+
+        # Process each tile
+        for tile in tiles:
+            # Extract video tile (stays on video's device, could be CPU)
+            video_tile = video[tile.in_coords].clone()
+
+            # Move tile to target device for encoding
+            video_tile = video_tile.to(device=target_device, dtype=video.dtype)
+
+            # Encode tile (may need padding to satisfy 8k+1 constraint)
+            latent_tile = self._encode_tile(video_tile)
+
+            # Move latent back to CPU for accumulation
+            latent_tile = latent_tile.cpu()
+
+            # Free GPU memory
+            del video_tile
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            # Get blend mask in latent space (on CPU)
+            mask = tile.blend_mask
+
+            # Handle potential shape mismatches due to padding/trimming
+            out_slice = tile.out_coords
+            latent_shape_tile = latent_tile.shape
+
+            # Ensure we don't exceed buffer bounds
+            actual_out_coords = list(out_slice)
+            for dim in range(2, 5):  # F', H', W' dimensions
+                out_start = out_slice[dim].start or 0
+                out_stop = out_slice[dim].stop or latent_shape[dim]
+                actual_len = min(out_stop - out_start, latent_shape_tile[dim], latent_shape[dim] - out_start)
+                actual_out_coords[dim] = slice(out_start, out_start + actual_len)
+
+            actual_out_coords = tuple(actual_out_coords)
+
+            # Slice latent_tile and mask to match actual output size
+            tile_slices = [slice(None), slice(None)]
+            for dim in range(2, 5):
+                tile_slices.append(slice(0, actual_out_coords[dim].stop - actual_out_coords[dim].start))
+            tile_slices = tuple(tile_slices)
+
+            latent_slice = latent_tile[tile_slices]
+
+            # Handle mask dimensions
+            mask_slices = []
+            for dim in range(5):
+                if dim < 2:
+                    mask_slices.append(slice(None))
+                else:
+                    mask_len = actual_out_coords[dim].stop - actual_out_coords[dim].start
+                    if mask.shape[dim] > 1:
+                        mask_slices.append(slice(0, mask_len))
+                    else:
+                        mask_slices.append(slice(None))
+            mask_slice = mask[tuple(mask_slices)]
+
+            # Accumulate into buffer with mask (all on CPU)
+            buffer[actual_out_coords] += latent_slice * mask_slice
+            weights[actual_out_coords] += mask_slice
+
+            del latent_tile, latent_slice
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        # Normalize by weights
+        weights = weights.clamp(min=1e-8)
+        result = buffer / weights
+
+        # Move final result to target device
+        return result.to(device=target_device)
+
+    def _prepare_encode_tiles(
+        self,
+        video_shape: torch.Size,
+        tiling_config: "TilingConfig",
+        video_downscale_factors: "SpatioTemporalScaleFactors",
+    ) -> List[Tile]:
+        """
+        Prepare tiles for encoding from video space to latent space.
+        """
+        splitters = [DEFAULT_SPLIT_OPERATION] * len(video_shape)
+        mappers = [DEFAULT_MAPPING_OPERATION] * len(video_shape)
+
+        # Temporal tiling
+        if tiling_config.temporal_config is not None:
+            cfg = tiling_config.temporal_config
+            tile_size = cfg.tile_size_in_frames
+            overlap = cfg.tile_overlap_in_frames
+
+            # Ensure tile_size satisfies 8k+1 constraint
+            if (tile_size - 1) % 8 != 0:
+                # Round up to next valid size
+                tile_size = ((tile_size - 1) // 8 + 1) * 8 + 1
+
+            # Ensure overlap is divisible by 8
+            if overlap % 8 != 0:
+                overlap = (overlap // 8) * 8
+
+            splitters[2] = split_video_temporal_for_encode(tile_size, overlap)
+            mappers[2] = to_mapping_operation(map_latent_from_video_slice, video_downscale_factors.time)
+
+        # Spatial tiling
+        if tiling_config.spatial_config is not None:
+            cfg = tiling_config.spatial_config
+            tile_size = cfg.tile_size_in_pixels
+            overlap = cfg.tile_overlap_in_pixels
+
+            def enable_spatial_on_axis(axis_idx: int, factor: int) -> None:
+                splitters[axis_idx] = split_video_spatial_for_encode(tile_size, overlap)
+                mappers[axis_idx] = to_mapping_operation(map_latent_from_spatial_slice, factor)
+
+            enable_spatial_on_axis(3, video_downscale_factors.height)
+            enable_spatial_on_axis(4, video_downscale_factors.width)
+
+        return create_tiles(video_shape, splitters, mappers)
+
+    def _encode_tile(self, video_tile: torch.Tensor) -> torch.Tensor:
+        """
+        Encode a single video tile, handling the 8k+1 frame constraint.
+        Pads if necessary and trims the result.
+        """
+        frames_count = video_tile.shape[2]
+
+        # Check if we need padding
+        if (frames_count - 1) % 8 != 0:
+            # Calculate target frame count (next valid 8k+1)
+            target_frames = ((frames_count - 1) // 8 + 1) * 8 + 1
+            pad_frames = target_frames - frames_count
+
+            # Pad with last frame
+            last_frame = video_tile[:, :, -1:, :, :]
+            padding = last_frame.expand(-1, -1, pad_frames, -1, -1)
+            video_tile = torch.cat([video_tile, padding], dim=2)
+
+            # Encode
+            latent = self.forward(video_tile)
+
+            # Calculate expected latent frames without padding
+            expected_latent_frames = (frames_count - 1) // 8 + 1
+
+            # Trim to expected size
+            latent = latent[:, :, :expected_latent_frames, :, :]
+            return latent
+        else:
+            return self.forward(video_tile)
+
 
 def _make_decoder_block(
     block_name: str,
@@ -923,3 +1140,140 @@ def map_spatial_slice(begin: int, end: int, left_ramp: int, right_ramp: int, sca
     right_ramp = right_ramp * scale
 
     return slice(start, stop), compute_trapezoidal_mask_1d(stop - start, left_ramp, right_ramp, False)
+
+
+# =============================================================================
+# Encoding tile functions (video space -> latent space)
+# =============================================================================
+
+
+def split_video_temporal_for_encode(size: int, overlap: int) -> SplitOperation:
+    """
+    Split video frames into tiles for encoding.
+    Similar to split_in_temporal but operates on video frame indices.
+
+    Args:
+        size: Tile size in video frames (should be 8k+1 for clean latent boundaries)
+        overlap: Overlap in video frames (should be 8k for clean latent boundaries)
+    """
+
+    def split(dimension_size: int) -> DimensionIntervals:
+        if dimension_size <= size:
+            return DEFAULT_SPLIT_OPERATION(dimension_size)
+
+        # Calculate number of tiles needed
+        stride = size - overlap
+        amount = (dimension_size - overlap - 1) // stride + 1
+
+        starts = [i * stride for i in range(amount)]
+        ends = [min(start + size, dimension_size) for start in starts]
+
+        # Ensure last tile covers the end
+        if ends[-1] < dimension_size:
+            starts.append(dimension_size - size)
+            ends.append(dimension_size)
+            amount += 1
+
+        # Ramps for blending (in video frame units)
+        # First tile has no left ramp, last tile has no right ramp
+        left_ramps = [0] + [overlap] * (amount - 1)
+        right_ramps = [overlap] * (amount - 1) + [0]
+
+        return DimensionIntervals(starts=starts, ends=ends, left_ramps=left_ramps, right_ramps=right_ramps)
+
+    return split
+
+
+def map_latent_from_video_slice(
+    begin: int, end: int, left_ramp: int, right_ramp: int, scale: int
+) -> Tuple[slice, torch.Tensor]:
+    """
+    Map video frame tile coordinates to latent space coordinates with blend mask.
+    This is the inverse of map_temporal_slice.
+
+    Args:
+        begin: Start frame in video space
+        end: End frame in video space (exclusive)
+        left_ramp: Left overlap in video frames
+        right_ramp: Right overlap in video frames
+        scale: Temporal scale factor (8 for LTX)
+
+    Returns:
+        (slice for latent tensor, 1D blend mask in latent space)
+    """
+    # Video frame F maps to latent index (F) // scale
+    # But we need to account for the +1 offset in video->latent mapping
+    # F frames -> (F-1)//8 + 1 latents
+
+    # Calculate latent coordinates
+    latent_start = begin // scale
+    # For end, we need the latent that contains frame (end-1)
+    latent_end = (end - 1) // scale + 1
+
+    latent_length = latent_end - latent_start
+
+    # Convert ramps from video space to latent space
+    latent_left_ramp = (left_ramp + scale - 1) // scale if left_ramp > 0 else 0
+    latent_right_ramp = (right_ramp + scale - 1) // scale if right_ramp > 0 else 0
+
+    # Clamp ramps to not exceed length
+    latent_left_ramp = min(latent_left_ramp, latent_length // 2)
+    latent_right_ramp = min(latent_right_ramp, latent_length // 2)
+
+    # Create blend mask in latent space
+    # Use left_starts_from_0=True for first tile (begin==0)
+    mask = compute_trapezoidal_mask_1d(
+        latent_length,
+        latent_left_ramp,
+        latent_right_ramp,
+        left_starts_from_0=(begin == 0),
+    )
+
+    return slice(latent_start, latent_end), mask
+
+
+def split_video_spatial_for_encode(size: int, overlap: int) -> SplitOperation:
+    """
+    Split video spatial dimensions into tiles for encoding.
+    Similar to split_in_spatial but for video pixels.
+    """
+
+    def split(dimension_size: int) -> DimensionIntervals:
+        if dimension_size <= size:
+            return DEFAULT_SPLIT_OPERATION(dimension_size)
+
+        stride = size - overlap
+        amount = (dimension_size - overlap - 1) // stride + 1
+
+        starts = [i * stride for i in range(amount)]
+        ends = [min(start + size, dimension_size) for start in starts]
+
+        if ends[-1] < dimension_size:
+            starts.append(dimension_size - size)
+            ends.append(dimension_size)
+            amount += 1
+
+        left_ramps = [0] + [overlap] * (amount - 1)
+        right_ramps = [overlap] * (amount - 1) + [0]
+
+        return DimensionIntervals(starts=starts, ends=ends, left_ramps=left_ramps, right_ramps=right_ramps)
+
+    return split
+
+
+def map_latent_from_spatial_slice(
+    begin: int, end: int, left_ramp: int, right_ramp: int, scale: int
+) -> Tuple[slice, torch.Tensor]:
+    """
+    Map video spatial tile coordinates to latent space coordinates with blend mask.
+    """
+    latent_start = begin // scale
+    latent_end = end // scale
+    latent_length = latent_end - latent_start
+
+    latent_left_ramp = left_ramp // scale
+    latent_right_ramp = right_ramp // scale
+
+    mask = compute_trapezoidal_mask_1d(latent_length, latent_left_ramp, latent_right_ramp, False)
+
+    return slice(latent_start, latent_end), mask

@@ -1502,8 +1502,6 @@ def generate_ltx_video(
     input_video: str,
     refine_strength: float,
     refine_steps: int,
-    v2v_chunk_frames: int,
-    v2v_overlap_frames: int,
     refine_latent_stride: int,
     # Audio & prompt
     disable_audio: bool,
@@ -1727,8 +1725,6 @@ def generate_ltx_video(
             command.extend(["--input-video", str(input_video)])
             command.extend(["--refine-strength", str(float(refine_strength))])
             command.extend(["--refine-steps", str(int(refine_steps))])
-            command.extend(["--v2v-chunk-frames", str(int(v2v_chunk_frames))])
-            command.extend(["--v2v-overlap-frames", str(int(v2v_overlap_frames))])
             command.extend(["--refine-latent-stride", str(int(refine_latent_stride))])
 
         # Image conditioning (I2V) - with per-image CRF
@@ -2907,17 +2903,6 @@ def create_interface():
                                     minimum=1, maximum=30, value=10, step=1,
                                     label="Refine Steps",
                                     info="Number of refinement denoising steps"
-                                )
-                            with gr.Row():
-                                v2v_chunk_frames = gr.Slider(
-                                    minimum=25, maximum=257, value=121, step=8,
-                                    label="V2V Chunk Frames",
-                                    info="Frames per chunk for sequential V2V (8k+1)"
-                                )
-                                v2v_overlap_frames = gr.Slider(
-                                    minimum=8, maximum=64, value=24, step=8,
-                                    label="V2V Overlap Frames",
-                                    info="Overlap frames between chunks (divisible by 8)"
                                 )
                             with gr.Row():
                                 refine_latent_stride = gr.Slider(
@@ -4298,7 +4283,7 @@ Audio is synchronized with the video extension.
                 input_image, image_frame_idx, image_strength, image_crf,
                 end_image, end_image_strength, end_image_crf,
                 anchor_image, anchor_interval, anchor_strength, anchor_decay, anchor_crf,
-                input_video, refine_strength, refine_steps, v2v_chunk_frames, v2v_overlap_frames, refine_latent_stride,
+                input_video, refine_strength, refine_steps, refine_latent_stride,
                 disable_audio, audio_input, audio_strength, enhance_prompt,
                 offload, enable_fp8,
                 enable_dit_block_swap, dit_blocks_in_memory,
@@ -4423,8 +4408,6 @@ Audio is synchronized with the video extension.
                 # Refine settings
                 gr.update(value=metadata.get("refine_strength", 0.3)),  # refine_strength
                 gr.update(value=metadata.get("refine_steps", 10)),  # refine_steps
-                gr.update(value=metadata.get("v2v_chunk_frames", 121)),  # v2v_chunk_frames
-                gr.update(value=metadata.get("v2v_overlap_frames", 24)),  # v2v_overlap_frames
                 gr.update(value=metadata.get("refine_latent_stride", 8)),  # refine_latent_stride
                 # Audio and prompt
                 gr.update(value=metadata.get("disable_audio", False)),  # disable_audio
@@ -4476,7 +4459,7 @@ Audio is synchronized with the video extension.
                 # Anchor conditioning
                 anchor_interval, anchor_strength, anchor_decay, anchor_crf,
                 # Refine settings
-                refine_strength, refine_steps, v2v_chunk_frames, v2v_overlap_frames, refine_latent_stride,
+                refine_strength, refine_steps, refine_latent_stride,
                 # Audio and prompt
                 disable_audio, audio_strength, enhance_prompt,
                 # Memory optimization
@@ -4653,7 +4636,7 @@ Audio is synchronized with the video extension.
             # Anchor conditioning
             anchor_interval, anchor_strength, anchor_decay, anchor_crf,
             # Refine settings
-            refine_strength, refine_steps, v2v_chunk_frames, v2v_overlap_frames, refine_latent_stride,
+            refine_strength, refine_steps, refine_latent_stride,
             # Audio and prompt
             disable_audio, audio_strength, enhance_prompt,
             # Memory optimization
@@ -4697,7 +4680,7 @@ Audio is synchronized with the video extension.
             # Anchor conditioning
             "anchor_interval", "anchor_strength", "anchor_decay", "anchor_crf",
             # Refine settings
-            "refine_strength", "refine_steps", "v2v_chunk_frames", "v2v_overlap_frames", "refine_latent_stride",
+            "refine_strength", "refine_steps", "refine_latent_stride",
             # Audio and prompt
             "disable_audio", "audio_strength", "enhance_prompt",
             # Memory optimization

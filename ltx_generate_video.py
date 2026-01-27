@@ -2889,30 +2889,29 @@ def encode_video_chunked(
     video_tensor: torch.Tensor,
     video_encoder,
     chunk_frames: int = 65,  # 8*8 + 1
-    overlap_frames: int = 8,  # kept for API compatibility, but we use context_frames internally
+    overlap_frames: int = 24,  # overlap for blending between chunks
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """
     Encode video in temporal chunks to reduce memory usage.
 
-    Uses autoregressive chunking to handle the causal VAE encoder properly:
-    - The VAE encoder uses causal convolutions where each frame depends on previous frames
-    - For chunks after the first, we include context frames and discard the corresponding
-      latent tokens (the "warm-up" region where the encoder lacks sufficient context)
-    - This avoids blending artifacts from mismatched latents at chunk boundaries
+    Uses tiled encoding with proper trapezoidal blending masks to handle chunk
+    boundaries smoothly. This approach mirrors tiled_decode for consistency.
 
     Args:
         video_tensor: Shape (1, C, F, H, W) normalized video (can be on CPU)
-        video_encoder: VideoEncoder model
-        chunk_frames: Frames per chunk (must be 8*k+1)
-        overlap_frames: Legacy parameter, context_frames is used internally
+        video_encoder: VideoEncoder model (must have tiled_encode method)
+        chunk_frames: Frames per chunk (will be adjusted to 8*k+1 if needed)
+        overlap_frames: Overlap between chunks for blending (will be adjusted to 8*k)
         device: Device to use for encoding (if None, uses video_tensor's device)
         dtype: Dtype to use for encoding (if None, uses video_tensor's dtype)
 
     Returns:
         Encoded latent tensor (1, latent_channels, F', H', W') on the specified device
     """
+    from ltx_core.model.video_vae.tiling import TilingConfig, TemporalTilingConfig
+
     # Determine device and dtype
     if device is None:
         device = video_tensor.device
@@ -2921,121 +2920,75 @@ def encode_video_chunked(
 
     _, c, total_frames, h, w = video_tensor.shape
 
+    # Ensure total_frames satisfies 8k+1 constraint
+    if (total_frames - 1) % 8 != 0:
+        target_frames = ((total_frames - 1) // 8 + 1) * 8 + 1
+        pad_frames = target_frames - total_frames
+        print(f">>> Padding video from {total_frames} to {target_frames} frames for encoding...")
+        last_frame = video_tensor[:, :, -1:, :, :]
+        padding = last_frame.expand(-1, -1, pad_frames, -1, -1)
+        video_tensor = torch.cat([video_tensor, padding], dim=2)
+        total_frames = target_frames
+
     # If video fits in one chunk, encode directly
     if total_frames <= chunk_frames:
-        chunk = video_tensor.to(device=device, dtype=dtype)
+        video_tensor = video_tensor.to(device=device, dtype=dtype)
         with torch.no_grad():
-            result = video_encoder(chunk)
-        del chunk
+            result = video_encoder(video_tensor)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         return result
 
-    # Validate
-    assert (chunk_frames - 1) % 8 == 0, "chunk_frames must be 8*k+1"
+    # Adjust chunk_frames to be divisible by 8 for TilingConfig validation
+    # The actual encoding will handle the 8k+1 constraint internally
+    if chunk_frames % 8 != 0:
+        chunk_frames = (chunk_frames // 8) * 8
+    chunk_frames = max(chunk_frames, 64)  # Minimum 64 frames per chunk
 
-    # Context frames for causal encoder warm-up (must be 8*k for clean latent boundaries)
-    # Using 24 frames (3 latent tokens) provides enough context for the encoder's receptive field
-    context_frames = 24
-    context_latents = context_frames // 8  # 3 latent tokens to discard
+    # Adjust overlap_frames to be divisible by 8
+    if overlap_frames % 8 != 0:
+        overlap_frames = (overlap_frames // 8) * 8
 
-    # Calculate how many new frames each chunk contributes (excluding context)
-    new_frames_per_chunk = chunk_frames - context_frames  # e.g., 65 - 24 = 41 frames
-    new_latents_per_chunk = new_frames_per_chunk // 8  # e.g., 41 // 8 = 5 latent tokens
+    # Ensure minimum overlap for good blending (at least 3 latent tokens = 24 frames)
+    overlap_frames = max(overlap_frames, 24)
 
-    # Build chunk list: (start_frame, end_frame, is_first)
-    chunks_info = []
+    # Ensure overlap is less than tile size
+    if overlap_frames >= chunk_frames:
+        overlap_frames = chunk_frames - 8
 
-    # First chunk: starts at 0, uses all latent tokens
-    first_end = min(chunk_frames, total_frames)
-    chunks_info.append((0, first_end, True))
+    # Create tiling config for temporal chunking
+    # Note: TilingConfig expects values divisible by 8, our custom encode functions
+    # handle the 8k+1 constraint for actual encoding
+    tiling_config = TilingConfig(
+        temporal_config=TemporalTilingConfig(
+            tile_size_in_frames=chunk_frames,
+            tile_overlap_in_frames=overlap_frames,
+        ),
+        spatial_config=None,  # No spatial tiling - process full resolution
+    )
 
-    # Subsequent chunks: start with context overlap, discard context latents
-    current_frame = first_end - context_frames  # Where the next chunk's "new" content starts
-    while current_frame + context_frames < total_frames:
-        chunk_start = current_frame  # Include context frames
-        chunk_end = min(chunk_start + chunk_frames, total_frames)
-        chunks_info.append((chunk_start, chunk_end, False))
-        current_frame = chunk_end - context_frames
+    # Keep video on CPU, convert dtype only (memory efficient)
+    # tiled_encode will move individual tiles to GPU
+    video_tensor = video_tensor.to(dtype=dtype)
 
-    print(f">>> Encoding {len(chunks_info)} chunk(s) with {context_frames}-frame context...")
+    # Calculate number of tiles for progress reporting
+    stride = chunk_frames - overlap_frames
+    num_tiles = max(1, (total_frames - overlap_frames - 1) // stride + 1)
+    print(f">>> Encoding {total_frames} frames using tiled encoding ({num_tiles} tile(s), {overlap_frames}-frame overlap)...")
 
-    # Encode chunks and collect latent segments
-    latent_segments = []
+    # Use tiled_encode for proper blending
+    # Pass target_device so tiles are encoded on GPU but video stays on CPU
+    with torch.no_grad():
+        result = video_encoder.tiled_encode(
+            video_tensor,
+            tiling_config,
+            target_device=device,
+        )
 
-    for i, (start, end, is_first) in enumerate(chunks_info):
-        actual_frames = end - start
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-        # Pad if needed to satisfy 8*k+1
-        if (actual_frames - 1) % 8 != 0:
-            target = 8 * ((actual_frames - 1) // 8 + 1) + 1
-            pad_frames = target - actual_frames
-        else:
-            pad_frames = 0
-
-        print(f">>> Encoding chunk {i+1}/{len(chunks_info)} (frames {start}-{end})...")
-        # Extract chunk from CPU tensor
-        chunk = video_tensor[:, :, start:end, :, :]
-
-        # Pad if necessary (on CPU)
-        if pad_frames > 0:
-            last_frame = chunk[:, :, -1:, :, :]
-            padding = last_frame.expand(-1, -1, pad_frames, -1, -1)
-            chunk = torch.cat([chunk, padding], dim=2)
-
-        # Move chunk to GPU for encoding
-        chunk = chunk.to(device=device, dtype=dtype)
-
-        # Encode
-        with torch.no_grad():
-            latent = video_encoder(chunk)
-
-        # Free GPU memory immediately
-        del chunk
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        # Remove padded latent tokens if we padded
-        if pad_frames > 0:
-            valid_tokens = (actual_frames - 1) // 8 + 1
-            latent = latent[:, :, :valid_tokens, :, :]
-
-        # Move latent to CPU to save GPU memory
-        latent = latent.cpu()
-
-        # For first chunk: use all latent tokens
-        # For subsequent chunks: discard context latents (warm-up region)
-        if is_first:
-            latent_segments.append(latent)
-        else:
-            # Discard the first context_latents tokens (the warm-up region)
-            if latent.shape[2] > context_latents:
-                latent_segments.append(latent[:, :, context_latents:, :, :])
-            # If chunk is very short, it might be entirely context - skip it
-
-        del latent
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    # Concatenate all segments directly (no blending needed with this approach)
-    if len(latent_segments) == 1:
-        result = latent_segments[0]
-    else:
-        result = torch.cat(latent_segments, dim=2)
-
-    # Trim to exact expected length
-    total_latent_frames = (total_frames - 1) // 8 + 1
-    if result.shape[2] > total_latent_frames:
-        result = result[:, :, :total_latent_frames, :, :]
-    elif result.shape[2] < total_latent_frames:
-        # Pad with last token if we're short (shouldn't happen with correct chunking)
-        pad_latents = total_latent_frames - result.shape[2]
-        last_latent = result[:, :, -1:, :, :]
-        padding = last_latent.expand(-1, -1, pad_latents, -1, -1)
-        result = torch.cat([result, padding], dim=2)
-
-    # Move final result to target device
-    return result.to(device=device)
+    return result
 
 
 # =============================================================================
