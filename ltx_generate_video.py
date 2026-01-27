@@ -2892,7 +2892,7 @@ def encode_video_chunked(
     overlap_frames: int = 24,  # Ignored - kept for API compatibility
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
-    spatial_tile_size: int = 512,  # Spatial tile size in pixels
+    spatial_tile_size: int = 256,  # Spatial tile size in pixels (smaller = less memory)
     spatial_overlap: int = 64,     # Overlap between spatial tiles
 ) -> torch.Tensor:
     """
