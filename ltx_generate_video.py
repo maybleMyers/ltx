@@ -2892,28 +2892,30 @@ def encode_video_chunked(
     overlap_frames: int = 24,  # Ignored - kept for API compatibility
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
+    spatial_tile_size: int = 512,  # Spatial tile size in pixels
+    spatial_overlap: int = 64,     # Overlap between spatial tiles
 ) -> torch.Tensor:
     """
-    Encode video using layer-by-layer offloading to avoid temporal chunking.
-    Processes full video to preserve temporal consistency.
+    Encode video using spatial tiling with full temporal extent.
 
-    This function uses encode_with_offload() which moves each encoder layer
-    to GPU one at a time, processes the full video through that layer, then
-    offloads the layer back to CPU. This preserves temporal consistency
-    (no chunking artifacts) while managing GPU memory.
+    Uses spatial tiles to reduce memory while keeping all frames together
+    to preserve temporal consistency (no chunking artifacts from temporal splits).
 
     Args:
         video_tensor: Shape (1, C, F, H, W) normalized video (can be on CPU)
-        video_encoder: VideoEncoder model (must have encode_with_offload method)
+        video_encoder: VideoEncoder model (must have tiled_encode method)
         chunk_frames: Ignored - kept for API compatibility
         overlap_frames: Ignored - kept for API compatibility
         device: Device to use for encoding (if None, uses encoder's device)
         dtype: Dtype to use for encoding (if None, uses video_tensor's dtype)
+        spatial_tile_size: Size of spatial tiles in pixels (default 512)
+        spatial_overlap: Overlap between spatial tiles in pixels (default 64)
 
     Returns:
         Encoded latent tensor (1, latent_channels, F', H', W') on the specified device
     """
-    # Determine device and dtype
+    from ltx_core.model.video_vae.tiling import TilingConfig, SpatialTilingConfig
+
     if device is None:
         device = next(video_encoder.parameters()).device
     if dtype is None:
@@ -2931,15 +2933,44 @@ def encode_video_chunked(
         video_tensor = torch.cat([video_tensor, padding], dim=2)
         total_frames = target_frames
 
-    print(f">>> Encoding {total_frames} frames with layer offloading...")
+    # Determine if spatial tiling is needed
+    needs_spatial_tiling = h > spatial_tile_size or w > spatial_tile_size
 
-    # Convert dtype (keep on CPU to save memory, encode_with_offload will move to GPU)
+    if not needs_spatial_tiling:
+        # Small enough to encode directly
+        print(f">>> Encoding {total_frames} frames at {w}x{h} directly...")
+        video_tensor = video_tensor.to(device=device, dtype=dtype)
+        with torch.no_grad():
+            result = video_encoder(video_tensor)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return result
+
+    # Calculate tile grid for progress message
+    stride = spatial_tile_size - spatial_overlap
+    h_tiles = max(1, (h - spatial_overlap + stride - 1) // stride)
+    w_tiles = max(1, (w - spatial_overlap + stride - 1) // stride)
+    total_tiles = h_tiles * w_tiles
+
+    print(f">>> Encoding {total_frames} frames at {w}x{h} using {total_tiles} spatial tiles ({w_tiles}x{h_tiles})...")
+
+    # Create spatial-only tiling config (NO temporal tiling to preserve causality)
+    tiling_config = TilingConfig(
+        temporal_config=None,  # Keep full temporal extent
+        spatial_config=SpatialTilingConfig(
+            tile_size_in_pixels=spatial_tile_size,
+            tile_overlap_in_pixels=spatial_overlap,
+        ),
+    )
+
     video_tensor = video_tensor.to(dtype=dtype)
 
-    # Use layer-by-layer offloading for memory-efficient encoding
-    # This processes the full video without temporal chunking
     with torch.no_grad():
-        result = video_encoder.encode_with_offload(video_tensor, target_device=device)
+        result = video_encoder.tiled_encode(
+            video_tensor,
+            tiling_config,
+            target_device=device,
+        )
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
