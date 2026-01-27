@@ -1841,6 +1841,18 @@ Examples:
              "Only used when --num-stages is 3.",
     )
     model_group.add_argument(
+        "--stage2-strength",
+        type=float,
+        default=1.0,
+        help="Sigma scaling for stage 2 (0.0-1.0). Lower = less noise = more preservation. Default: 1.0",
+    )
+    model_group.add_argument(
+        "--stage3-strength",
+        type=float,
+        default=1.0,
+        help="Sigma scaling for stage 3 (0.0-1.0). Lower = less noise = more preservation. Default: 1.0",
+    )
+    model_group.add_argument(
         "--num-stages",
         type=int,
         choices=[1, 2, 3],
@@ -2894,12 +2906,15 @@ def encode_video_chunked(
     dtype: torch.dtype | None = None,
     spatial_tile_size: int = 256,  # Spatial tile size in pixels (smaller = less memory)
     spatial_overlap: int = 64,     # Overlap between spatial tiles
+    min_tile_size: int = 64,       # Minimum tile size before giving up on OOM
 ) -> torch.Tensor:
     """
     Encode video using spatial tiling with full temporal extent.
 
     Uses spatial tiles to reduce memory while keeping all frames together
     to preserve temporal consistency (no chunking artifacts from temporal splits).
+
+    Automatically handles CUDA OOM by reducing tile size and retrying.
 
     Args:
         video_tensor: Shape (1, C, F, H, W) normalized video (can be on CPU)
@@ -2908,8 +2923,9 @@ def encode_video_chunked(
         overlap_frames: Ignored - kept for API compatibility
         device: Device to use for encoding (if None, uses encoder's device)
         dtype: Dtype to use for encoding (if None, uses video_tensor's dtype)
-        spatial_tile_size: Size of spatial tiles in pixels (default 512)
+        spatial_tile_size: Size of spatial tiles in pixels (default 256)
         spatial_overlap: Overlap between spatial tiles in pixels (default 64)
+        min_tile_size: Minimum tile size to try before raising OOM error (default 64)
 
     Returns:
         Encoded latent tensor (1, latent_channels, F', H', W') on the specified device
@@ -2933,49 +2949,95 @@ def encode_video_chunked(
         video_tensor = torch.cat([video_tensor, padding], dim=2)
         total_frames = target_frames
 
-    # Determine if spatial tiling is needed
-    needs_spatial_tiling = h > spatial_tile_size or w > spatial_tile_size
-
-    if not needs_spatial_tiling:
-        # Small enough to encode directly
-        print(f">>> Encoding {total_frames} frames at {w}x{h} directly...")
-        video_tensor = video_tensor.to(device=device, dtype=dtype)
-        with torch.no_grad():
-            result = video_encoder(video_tensor)
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        return result
-
-    # Calculate tile grid for progress message
-    stride = spatial_tile_size - spatial_overlap
-    h_tiles = max(1, (h - spatial_overlap + stride - 1) // stride)
-    w_tiles = max(1, (w - spatial_overlap + stride - 1) // stride)
-    total_tiles = h_tiles * w_tiles
-
-    print(f">>> Encoding {total_frames} frames at {w}x{h} using {total_tiles} spatial tiles ({w_tiles}x{h_tiles})...")
-
-    # Create spatial-only tiling config (NO temporal tiling to preserve causality)
-    tiling_config = TilingConfig(
-        temporal_config=None,  # Keep full temporal extent
-        spatial_config=SpatialTilingConfig(
-            tile_size_in_pixels=spatial_tile_size,
-            tile_overlap_in_pixels=spatial_overlap,
-        ),
-    )
-
     video_tensor = video_tensor.to(dtype=dtype)
 
-    with torch.no_grad():
-        result = video_encoder.tiled_encode(
-            video_tensor,
-            tiling_config,
-            target_device=device,
+    # Track current tile size for OOM retry loop
+    current_tile_size = spatial_tile_size
+    original_overlap = spatial_overlap
+
+    while current_tile_size >= min_tile_size:
+        # Scale overlap proportionally with tile size, minimum 32 (must be divisible by 32)
+        current_overlap = max(32, (original_overlap * current_tile_size) // spatial_tile_size)
+        current_overlap = (current_overlap // 32) * 32
+
+        # Determine if spatial tiling is needed
+        needs_spatial_tiling = h > current_tile_size or w > current_tile_size
+
+        if not needs_spatial_tiling:
+            # Small enough to encode directly
+            print(f">>> Encoding {total_frames} frames at {w}x{h} directly...")
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                video_on_device = video_tensor.to(device=device)
+                with torch.no_grad():
+                    result = video_encoder(video_on_device)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                return result
+            except torch.cuda.OutOfMemoryError:
+                # Can't reduce further for direct encoding, re-raise
+                raise RuntimeError(
+                    f"CUDA OOM during direct video encoding at {w}x{h}. "
+                    f"Video is too large to encode even without tiling."
+                )
+
+        # Calculate tile grid for progress message
+        stride = current_tile_size - current_overlap
+        h_tiles = max(1, (h - current_overlap + stride - 1) // stride)
+        w_tiles = max(1, (w - current_overlap + stride - 1) // stride)
+        total_tiles = h_tiles * w_tiles
+
+        print(f">>> Encoding {total_frames} frames at {w}x{h} using {total_tiles} spatial tiles ({w_tiles}x{h_tiles}, tile_size={current_tile_size})...")
+
+        # Create spatial-only tiling config (NO temporal tiling to preserve causality)
+        tiling_config = TilingConfig(
+            temporal_config=None,  # Keep full temporal extent
+            spatial_config=SpatialTilingConfig(
+                tile_size_in_pixels=current_tile_size,
+                tile_overlap_in_pixels=current_overlap,
+            ),
         )
 
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-    return result
+            with torch.no_grad():
+                result = video_encoder.tiled_encode(
+                    video_tensor,
+                    tiling_config,
+                    target_device=device,
+                )
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            return result
+
+        except torch.cuda.OutOfMemoryError:
+            # Clear CUDA cache and try with smaller tiles
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+
+            old_size = current_tile_size
+            current_tile_size = current_tile_size // 2
+
+            # Ensure tile size meets constraints (divisible by 32, >= min_tile_size)
+            current_tile_size = (current_tile_size // 32) * 32
+            current_tile_size = max(current_tile_size, min_tile_size)
+
+            if current_tile_size < min_tile_size or current_tile_size == old_size:
+                raise RuntimeError(
+                    f"CUDA OOM during video encoding. Failed even with minimum tile size {min_tile_size}. "
+                    f"Try reducing video resolution or frame count."
+                )
+
+            print(f">>> OOM at tile size {old_size}, retrying with tile size {current_tile_size}...")
+
+    # Should not reach here, but just in case
+    raise RuntimeError(f"CUDA OOM during video encoding with minimum tile size {min_tile_size}")
 
 
 # =============================================================================
@@ -3136,6 +3198,8 @@ class LTXVideoGeneratorWithOffloading:
         refine_strength: float = 0.3,
         refine_steps: int = 10,
         stage2_steps: int = 3,
+        stage2_strength: float = 1.0,
+        stage3_strength: float = 1.0,
         anchor_image: str | None = None,
         anchor_interval: int | None = None,
         anchor_strength: float = 0.8,
@@ -4556,6 +4620,11 @@ class LTXVideoGeneratorWithOffloading:
                 distilled_sigmas = distilled_sigmas.to(self.device)
                 print(f">>> Stage 2 using {stage2_steps} steps (interpolated from tuned schedule)")
 
+        # Apply stage2_strength scaling
+        if stage2_strength < 1.0:
+            distilled_sigmas = distilled_sigmas * stage2_strength
+            print(f">>> Stage 2: Scaling sigmas by {stage2_strength} (noise_scale={distilled_sigmas[0]:.4f})")
+
         # Move text embeddings to GPU for stage 2 denoising
         v_context_p = v_context_p.to(self.device)
         a_context_p = a_context_p.to(self.device)
@@ -5083,6 +5152,11 @@ class LTXVideoGeneratorWithOffloading:
                         stage3_sigmas[i] = tuned[idx-1] * (1 - t) + tuned[idx] * t
                 stage3_sigmas = stage3_sigmas.to(self.device)
                 print(f">>> Stage 3 using {stage3_steps} steps (interpolated from tuned schedule)")
+
+            # Apply stage3_strength scaling
+            if stage3_strength < 1.0:
+                stage3_sigmas = stage3_sigmas * stage3_strength
+                print(f">>> Stage 3: Scaling sigmas by {stage3_strength} (noise_scale={stage3_sigmas[0]:.4f})")
 
             # Move text embeddings to GPU for stage 3 denoising
             v_context_p = v_context_p.to(self.device)
@@ -9631,6 +9705,8 @@ def main():
             refine_strength=args.refine_strength,
             refine_steps=args.refine_steps,
             stage2_steps=args.stage2_steps,
+            stage2_strength=args.stage2_strength,
+            stage3_strength=args.stage3_strength,
             anchor_image=args.anchor_image,
             anchor_interval=args.anchor_interval,
             anchor_strength=args.anchor_strength,
