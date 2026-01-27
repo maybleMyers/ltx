@@ -4601,6 +4601,10 @@ class LTXVideoGeneratorWithOffloading:
         v_context_p = v_context_p.to(self.device)
         a_context_p = a_context_p.to(self.device)
 
+        # Reset stepper history for stage 2 (important for UniPC which stores model outputs)
+        if hasattr(stepper, 'reset'):
+            stepper.reset()
+
         # Define denoising function for stage 2 (no CFG, just positive)
         # Convert anchor_decay "none" to None for the denoising loop (if not already done in stage 1)
         effective_anchor_decay = anchor_decay if anchor_decay and anchor_decay != "none" else None
@@ -5117,6 +5121,10 @@ class LTXVideoGeneratorWithOffloading:
             # Move text embeddings to GPU for stage 3 denoising
             v_context_p = v_context_p.to(self.device)
             a_context_p = a_context_p.to(self.device)
+
+            # Reset stepper history for stage 3 (important for UniPC which stores model outputs)
+            if hasattr(stepper, 'reset'):
+                stepper.reset()
 
             # Define denoising function for stage 3
             effective_anchor_decay = anchor_decay if anchor_decay and anchor_decay != "none" else None
