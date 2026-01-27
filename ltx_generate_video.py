@@ -2272,6 +2272,22 @@ Examples:
         default=8,
         help="Condition every Nth frame in refine-only mode. Lower values (1-4) produce smoother video but use more VRAM. Default: 8",
     )
+    v2v_group.add_argument(
+        "--v2v-audio-mode",
+        type=str,
+        choices=["preserve", "condition", "regenerate", "external"],
+        default="preserve",
+        help="How to handle audio from input video in V2V mode. "
+             "'preserve'=keep original audio exactly, 'condition'=use as conditioning with strength, "
+             "'regenerate'=generate new audio, 'external'=use --audio file instead. Default: preserve",
+    )
+    v2v_group.add_argument(
+        "--v2v-audio-strength",
+        type=float,
+        default=1.0,
+        help="Audio conditioning strength when v2v-audio-mode is 'condition'. "
+             "1.0=frozen/exact, 0.0=regenerate with guidance. Default: 1.0",
+    )
 
     # ==========================================================================
     # V2A Mode (Video-to-Audio)
@@ -3236,6 +3252,9 @@ class LTXVideoGeneratorWithOffloading:
         v2v_chunk_frames: int = 121,
         v2v_overlap_frames: int = 24,
         refine_latent_stride: int = 8,
+        # V2V Audio control
+        v2v_audio_mode: str = "preserve",
+        v2v_audio_strength: float = 1.0,
         # Sampler selection
         sampler: str = "euler",
         stage2_sampler: str = "euler",
@@ -3953,56 +3972,72 @@ class LTXVideoGeneratorWithOffloading:
 
                     print(f">>> V2V: Video encoded to latent shape {v2v_initial_latent.shape} in {time.time() - v2v_start:.1f}s")
 
-                # Extract and encode audio from input video to preserve it
+                # Extract and encode audio from input video based on v2v_audio_mode
                 # Skip if V2A mode is active (V2A will handle audio extraction)
+                v2v_audio_as_conditioning = False
                 if not disable_audio and not v2a_mode:
-                    print(">>> V2V: Extracting audio from input video...")
-                    waveform, sample_rate = decode_audio_from_file(input_video, self.device)
+                    if v2v_audio_mode in ("preserve", "condition"):
+                        mode_label = "preserve" if v2v_audio_mode == "preserve" else f"condition (strength={v2v_audio_strength})"
+                        print(f">>> V2V: Extracting audio from input video ({mode_label})...")
+                        waveform, sample_rate = decode_audio_from_file(input_video, self.device)
 
-                    if waveform is not None:
-                        # Calculate expected audio duration and trim/pad waveform to match
-                        expected_duration = float(num_frames) / float(frame_rate)
-                        expected_samples = int(expected_duration * sample_rate)
+                        if waveform is not None:
+                            # Calculate expected audio duration and trim/pad waveform to match
+                            expected_duration = float(num_frames) / float(frame_rate)
+                            expected_samples = int(expected_duration * sample_rate)
 
-                        # Trim waveform if longer than expected
-                        if waveform.shape[-1] > expected_samples:
-                            waveform = waveform[..., :expected_samples]
-                            print(f">>> V2V: Trimmed audio to {expected_samples} samples ({expected_duration:.3f}s)")
-                        elif waveform.shape[-1] < expected_samples:
-                            # Pad waveform if shorter than expected
-                            padding = expected_samples - waveform.shape[-1]
-                            waveform = torch.nn.functional.pad(waveform, (0, padding))
-                            print(f">>> V2V: Padded audio by {padding} samples to {expected_samples} total ({expected_duration:.3f}s)")
+                            # Trim waveform if longer than expected
+                            if waveform.shape[-1] > expected_samples:
+                                waveform = waveform[..., :expected_samples]
+                                print(f">>> V2V: Trimmed audio to {expected_samples} samples ({expected_duration:.3f}s)")
+                            elif waveform.shape[-1] < expected_samples:
+                                # Pad waveform if shorter than expected
+                                padding = expected_samples - waveform.shape[-1]
+                                waveform = torch.nn.functional.pad(waveform, (0, padding))
+                                print(f">>> V2V: Padded audio by {padding} samples to {expected_samples} total ({expected_duration:.3f}s)")
 
-                        audio_encoder = self.stage_1_model_ledger.audio_encoder()
+                            audio_encoder = self.stage_1_model_ledger.audio_encoder()
 
-                        audio_processor = AudioProcessor(
-                            sample_rate=audio_encoder.sample_rate,
-                            mel_bins=audio_encoder.mel_bins,
-                            mel_hop_length=audio_encoder.mel_hop_length,
-                            n_fft=audio_encoder.n_fft,
-                        ).to(self.device)
+                            audio_processor = AudioProcessor(
+                                sample_rate=audio_encoder.sample_rate,
+                                mel_bins=audio_encoder.mel_bins,
+                                mel_hop_length=audio_encoder.mel_hop_length,
+                                n_fft=audio_encoder.n_fft,
+                            ).to(self.device)
 
-                        if waveform.dim() == 3:
-                            num_frames_audio, channels, samples_per_frame = waveform.shape
-                            waveform = waveform.permute(1, 0, 2).reshape(channels, -1).unsqueeze(0)
-                        elif waveform.dim() == 2:
-                            waveform = waveform.unsqueeze(0)
+                            if waveform.dim() == 3:
+                                num_frames_audio, channels, samples_per_frame = waveform.shape
+                                waveform = waveform.permute(1, 0, 2).reshape(channels, -1).unsqueeze(0)
+                            elif waveform.dim() == 2:
+                                waveform = waveform.unsqueeze(0)
 
-                        mel_spectrogram = audio_processor.waveform_to_mel(
-                            waveform.to(dtype=torch.float32),
-                            waveform_sample_rate=sample_rate
-                        )
+                            mel_spectrogram = audio_processor.waveform_to_mel(
+                                waveform.to(dtype=torch.float32),
+                                waveform_sample_rate=sample_rate
+                            )
 
-                        v2v_audio_latent = audio_encoder(mel_spectrogram.to(dtype=torch.float32))
-                        v2v_audio_latent = v2v_audio_latent.to(dtype=dtype)
+                            v2v_audio_latent = audio_encoder(mel_spectrogram.to(dtype=torch.float32))
+                            v2v_audio_latent = v2v_audio_latent.to(dtype=dtype)
 
-                        del audio_encoder, audio_processor
-                        cleanup_memory()
-                        print(">>> V2V: Audio extracted and encoded successfully")
-                    else:
+                            del audio_encoder, audio_processor
+                            cleanup_memory()
+                            print(">>> V2V: Audio extracted and encoded successfully")
+
+                            # Mark for conditioning mode if applicable
+                            if v2v_audio_mode == "condition":
+                                v2v_audio_as_conditioning = True
+                        else:
+                            v2v_audio_latent = None
+                            print(">>> V2V: Input video has no audio track")
+                    elif v2v_audio_mode == "regenerate":
                         v2v_audio_latent = None
-                        print(">>> V2V: Input video has no audio track")
+                        print(">>> V2V: Audio will be regenerated (not preserving input audio)")
+                    elif v2v_audio_mode == "external":
+                        v2v_audio_latent = None
+                        if audio is not None:
+                            print(">>> V2V: Using external audio file instead of input video audio")
+                        else:
+                            print(">>> V2V: External audio mode but no audio file provided, will regenerate")
                 else:
                     v2v_audio_latent = None
 
@@ -4199,6 +4234,17 @@ class LTXVideoGeneratorWithOffloading:
                     print(f">>> Audio encoded with strength {audio_strength} (sample rate: {sample_rate}Hz)")
                 else:
                     print(">>> Warning: Could not load audio file")
+
+            # Add V2V audio as conditioning when mode is "condition"
+            if v2v_audio_latent is not None and v2v_audio_as_conditioning:
+                from ltx_core.conditioning import AudioConditionByLatent
+                audio_conditionings.append(
+                    AudioConditionByLatent(
+                        latent=v2v_audio_latent,
+                        strength=v2v_audio_strength,
+                    )
+                )
+                print(f">>> V2V: Audio added as conditioning with strength {v2v_audio_strength}")
 
             stage_label = "One-stage" if self.one_stage else "Stage 1"
 
@@ -4846,14 +4892,16 @@ class LTXVideoGeneratorWithOffloading:
                         print(f">>> [Refine Audio] Trimmed audio latent by {actual_frames - expected_frames} frames")
 
             stage_2_initial_audio = audio_latent
-        elif v2v_audio_latent is not None:
+        elif v2v_audio_latent is not None and v2v_audio_mode == "preserve":
+            # Only use v2v_audio_latent directly when mode is "preserve"
+            # For "condition" mode, audio was used as conditioning and denoised result is in audio_state
             # Get expected audio shape for Stage 2
             from ltx_core.types import AudioLatentShape
             expected_audio_shape = AudioLatentShape.from_video_pixel_shape(stage_2_output_shape)
             expected_shape = expected_audio_shape.to_torch_shape()
             actual_shape = v2v_audio_latent.shape
 
-            print(">>> Using audio from input video")
+            print(">>> Using preserved audio from input video (v2v_audio_mode=preserve)")
 
             # Check if shapes match and fix if needed
             if actual_shape != expected_shape:
@@ -9730,6 +9778,8 @@ def main():
             v2v_chunk_frames=args.v2v_chunk_frames,
             v2v_overlap_frames=args.v2v_overlap_frames,
             refine_latent_stride=args.refine_latent_stride,
+            v2v_audio_mode=args.v2v_audio_mode,
+            v2v_audio_strength=args.v2v_audio_strength,
             sampler=args.sampler,
             stage2_sampler=args.stage2_sampler,
             stage3_steps=args.stage3_steps,
@@ -9877,6 +9927,8 @@ def main():
         "v2v_chunk_frames": args.v2v_chunk_frames if args.input_video else None,
         "v2v_overlap_frames": args.v2v_overlap_frames if args.input_video else None,
         "refine_latent_stride": args.refine_latent_stride if args.input_video else None,
+        "v2v_audio_mode": args.v2v_audio_mode if args.input_video else None,
+        "v2v_audio_strength": args.v2v_audio_strength if args.input_video and args.v2v_audio_mode == "condition" else None,
         # Anchor settings
         "anchor_image": args.anchor_image,
         "anchor_interval": args.anchor_interval,

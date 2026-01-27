@@ -1507,6 +1507,8 @@ def generate_ltx_video(
     disable_audio: bool,
     audio_input: str,
     audio_strength: float,
+    v2v_audio_mode: str,
+    v2v_audio_strength: float,
     enhance_prompt: bool,
     # Memory optimization
     offload: bool,
@@ -1817,10 +1819,18 @@ def generate_ltx_video(
                         command.extend(["--stage2-lora", lora_path, str(user_lora_strength)])
                         command.extend(["--stage3-lora", lora_path, str(user_lora_strength)])
 
-        # Audio handling
+        # V2V Audio mode handling
+        if input_video:
+            command.extend(["--v2v-audio-mode", str(v2v_audio_mode)])
+            if v2v_audio_mode == "condition":
+                command.extend(["--v2v-audio-strength", str(float(v2v_audio_strength))])
+
+        # Audio handling (external audio file)
+        # Use external audio when: V2V mode is "external", or when not in V2V mode (T2V/I2V)
         if audio_input and os.path.exists(audio_input):
-            command.extend(["--audio", str(audio_input)])
-            command.extend(["--audio-strength", str(float(audio_strength))])
+            if not input_video or v2v_audio_mode == "external":
+                command.extend(["--audio", str(audio_input)])
+                command.extend(["--audio-strength", str(float(audio_strength))])
         elif disable_audio:
             command.append("--disable-audio")
 
@@ -2951,7 +2961,22 @@ def create_interface():
 
                         # Audio Conditioning
                         with gr.Accordion("Audio Conditioning", open=False):
-                            gr.Markdown("Condition video generation on an audio file. Audio should match or exceed video duration.")
+                            gr.Markdown("Control audio handling for V2V mode and external audio conditioning.")
+                            # V2V Audio Mode (only relevant when input_video is provided)
+                            v2v_audio_mode = gr.Dropdown(
+                                choices=["preserve", "condition", "regenerate", "external"],
+                                value="preserve",
+                                label="V2V Audio Mode",
+                                info="preserve=lock original, condition=use as soft conditioning, regenerate=new audio, external=use file below"
+                            )
+                            v2v_audio_strength = gr.Slider(
+                                minimum=0.0, maximum=1.0, value=1.0, step=0.05,
+                                label="V2V Audio Strength",
+                                info="1.0 = frozen/exact, 0.0 = regenerate with guidance (only for 'condition' mode)",
+                                visible=False
+                            )
+                            gr.Markdown("---")
+                            gr.Markdown("**External Audio File** (used when V2V mode is 'external' or for T2V/I2V)")
                             audio_input = gr.Audio(
                                 label="Audio File",
                                 type="filepath",
@@ -4257,6 +4282,13 @@ Audio is synchronized with the video extension.
             outputs=[i2v_section, v2v_section]
         )
 
+        # V2V Audio Mode change - show/hide V2V Audio Strength slider
+        v2v_audio_mode.change(
+            fn=lambda m: gr.update(visible=(m == "condition")),
+            inputs=[v2v_audio_mode],
+            outputs=[v2v_audio_strength]
+        )
+
         # Video input change - update dimensions and frame count
         input_video.change(
             fn=update_video_dimensions,
@@ -4284,7 +4316,7 @@ Audio is synchronized with the video extension.
                 end_image, end_image_strength, end_image_crf,
                 anchor_image, anchor_interval, anchor_strength, anchor_decay, anchor_crf,
                 input_video, refine_strength,
-                disable_audio, audio_input, audio_strength, enhance_prompt,
+                disable_audio, audio_input, audio_strength, v2v_audio_mode, v2v_audio_strength, enhance_prompt,
                 offload, enable_fp8,
                 enable_dit_block_swap, dit_blocks_in_memory,
                 enable_text_encoder_block_swap, text_encoder_blocks_in_memory,
@@ -4412,6 +4444,8 @@ Audio is synchronized with the video extension.
                 # Audio and prompt
                 gr.update(value=metadata.get("disable_audio", False)),  # disable_audio
                 gr.update(value=metadata.get("audio_strength", 1.0)),  # audio_strength
+                gr.update(value=metadata.get("v2v_audio_mode", "preserve")),  # v2v_audio_mode
+                gr.update(value=metadata.get("v2v_audio_strength", 1.0)),  # v2v_audio_strength
                 gr.update(value=metadata.get("enhance_prompt", False)),  # enhance_prompt
                 # Memory optimization
                 gr.update(value=metadata.get("offload", False)),  # offload
@@ -4461,7 +4495,7 @@ Audio is synchronized with the video extension.
                 # Refine settings
                 refine_strength,
                 # Audio and prompt
-                disable_audio, audio_strength, enhance_prompt,
+                disable_audio, audio_strength, v2v_audio_mode, v2v_audio_strength, enhance_prompt,
                 # Memory optimization
                 offload, enable_fp8,
                 # Block swap settings
@@ -4638,7 +4672,7 @@ Audio is synchronized with the video extension.
             # Refine settings
             refine_strength,
             # Audio and prompt
-            disable_audio, audio_strength, enhance_prompt,
+            disable_audio, audio_strength, v2v_audio_mode, v2v_audio_strength, enhance_prompt,
             # Memory optimization
             offload, enable_fp8,
             enable_dit_block_swap, dit_blocks_in_memory,
@@ -4682,7 +4716,7 @@ Audio is synchronized with the video extension.
             # Refine settings
             "refine_strength",
             # Audio and prompt
-            "disable_audio", "audio_strength", "enhance_prompt",
+            "disable_audio", "audio_strength", "v2v_audio_mode", "v2v_audio_strength", "enhance_prompt",
             # Memory optimization
             "offload", "enable_fp8",
             "enable_dit_block_swap", "dit_blocks_in_memory",
