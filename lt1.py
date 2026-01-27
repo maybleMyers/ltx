@@ -94,6 +94,17 @@ def parse_ltx_progress_line(line: str) -> Optional[str]:
         match = re.search(r'(\d+\.?\d*)s', line)
         if match:
             return f"Stage 2 completed ({match.group(1)}s)"
+    # Stage 3 progress
+    if ">>> Stage 3: Loading" in line:
+        return "Stage 3: Loading transformer..."
+    if ">>> Stage 3: Refining" in line:
+        return "Stage 3: Final refinement..."
+    if ">>> Stage 3 completed" in line:
+        match = re.search(r'(\d+\.?\d*)s', line)
+        if match:
+            return f"Stage 3 completed ({match.group(1)}s)"
+    if ">>> Linear mode: skipping upsampling" in line:
+        return "Linear mode: same resolution..."
     if ">>> Decoding video" in line:
         return "Decoding video from latents..."
     if ">>> Decoding audio" in line:
@@ -534,25 +545,60 @@ class _GIMMInputPadder:
 # Model variant configurations
 GIMM_MODELS = {
     "GIMM-VFI-R (RAFT)": {
+        "type": "gimm",
         "config": "GIMM-VFI/configs/gimmvfi/gimmvfi_r_arb.yaml",
         "checkpoint": "GIMM-VFI/pretrained_ckpt/gimmvfi_r_arb.pt",
     },
     "GIMM-VFI-R-P (RAFT+Perceptual)": {
+        "type": "gimm",
         "config": "GIMM-VFI/configs/gimmvfi/gimmvfi_r_arb.yaml",
         "checkpoint": "GIMM-VFI/pretrained_ckpt/gimmvfi_r_arb_lpips.pt",
     },
     "GIMM-VFI-F (FlowFormer)": {
+        "type": "gimm",
         "config": "GIMM-VFI/configs/gimmvfi/gimmvfi_f_arb.yaml",
         "checkpoint": "GIMM-VFI/pretrained_ckpt/gimmvfi_f_arb.pt",
     },
     "GIMM-VFI-F-P (FlowFormer+Perceptual)": {
+        "type": "gimm",
         "config": "GIMM-VFI/configs/gimmvfi/gimmvfi_f_arb.yaml",
         "checkpoint": "GIMM-VFI/pretrained_ckpt/gimmvfi_f_arb_lpips.pt",
+    },
+    "BiM-VFI (Bidirectional Motion)": {
+        "type": "bim",
+        "checkpoint": "GIMM-VFI/pretrained_ckpt/bim_vfi.pth",
+    },
+}
+
+# Upscaler model configurations
+UPSCALER_MODELS = {
+    "Real-ESRGAN x2": {
+        "type": "esrgan",
+        "scale": 2,
+        "checkpoint": "GIMM-VFI/pretrained_ckpt/RealESRGAN_x2plus.pth",
+    },
+    "Real-ESRGAN x4": {
+        "type": "esrgan",
+        "scale": 4,
+        "checkpoint": "GIMM-VFI/pretrained_ckpt/RealESRGAN_x4plus.pth",
+    },
+    "SwinIR x4": {
+        "type": "swinir",
+        "scale": 4,
+        "checkpoint": "GIMM-VFI/pretrained_ckpt/003_realSR_BSRGAN_DFOWMFC_s64w8_SwinIR-L_x4_GAN.pth",
+    },
+    "BasicVSR++ x4 (Temporal)": {
+        "type": "basicvsr",
+        "scale": 4,
+        "checkpoint": "GIMM-VFI/pretrained_ckpt/basicvsr_plusplus_reds4.pth",
     },
 }
 
 # Global cache for GIMM-VFI model
 _gimm_model_cache = {"model": None, "variant": None}
+
+# Global cache for BiM-VFI model
+_bim_model_cache = {"model": None, "variant": None}
 
 
 def _load_gimm_model(model_variant: str, checkpoint_path: str = "", config_path: str = ""):
@@ -622,6 +668,63 @@ def _load_gimm_model(model_variant: str, checkpoint_path: str = "", config_path:
     # Cache the model
     _gimm_model_cache["model"] = model
     _gimm_model_cache["variant"] = cache_key
+
+    return model
+
+
+def _load_bim_model(checkpoint_path: str = ""):
+    """Load BiM-VFI model with caching."""
+    import torch
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    gimm_dir = os.path.join(script_dir, "GIMM-VFI")
+
+    # Add GIMM-VFI to path so bim_vfi can be imported as a package
+    if gimm_dir not in sys.path:
+        sys.path.insert(0, gimm_dir)
+
+    from bim_vfi import BiMVFI
+
+    # Use default checkpoint if not specified
+    default_ckpt = "GIMM-VFI/pretrained_ckpt/bim_vfi.pth"
+    ckpt_file = checkpoint_path if checkpoint_path else default_ckpt
+
+    # Check if already loaded
+    cache_key = f"bim:{ckpt_file}"
+    if _bim_model_cache["model"] is not None and _bim_model_cache["variant"] == cache_key:
+        return _bim_model_cache["model"]
+
+    # Clear old model from GPU
+    if _bim_model_cache["model"] is not None:
+        del _bim_model_cache["model"]
+        _bim_model_cache["model"] = None
+        torch.cuda.empty_cache()
+
+    # Create model
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = BiMVFI(pyr_level=3, feat_channels=32)
+    model = model.to(device)
+
+    # Load checkpoint (use absolute path)
+    abs_ckpt_file = os.path.join(script_dir, ckpt_file) if not os.path.isabs(ckpt_file) else ckpt_file
+    if os.path.exists(abs_ckpt_file):
+        ckpt = torch.load(abs_ckpt_file, map_location="cpu", weights_only=False)
+        # Support "model", "state_dict" keys or direct state dict
+        if "model" in ckpt:
+            state_dict = ckpt["model"]
+        elif "state_dict" in ckpt:
+            state_dict = ckpt["state_dict"]
+        else:
+            state_dict = ckpt
+        model.load_state_dict(state_dict, strict=True)
+    else:
+        raise FileNotFoundError(f"BiM-VFI checkpoint not found: {abs_ckpt_file}")
+
+    model.eval()
+
+    # Cache the model
+    _bim_model_cache["model"] = model
+    _bim_model_cache["variant"] = cache_key
 
     return model
 
@@ -763,6 +866,7 @@ def interpolate_video_gimm(
     import torch
     import numpy as np
     import cv2
+    import gc
 
     if not input_video:
         yield None, "Error: No input video provided", 0.0
@@ -886,6 +990,16 @@ def interpolate_video_gimm(
 
         _frames_to_video(output_frames_dir, output_path, output_fps, audio_source=input_video)
 
+        # Offload model and clear VRAM before final yield
+        if _gimm_model_cache["model"] is not None:
+            _gimm_model_cache["model"].cpu()
+            del _gimm_model_cache["model"]
+            _gimm_model_cache["model"] = None
+            _gimm_model_cache["variant"] = None
+        gc.collect()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
         yield output_path, f"Done! Output: {output_fps:.1f} FPS ({output_frame_idx} frames)", 1.0
 
     except Exception as e:
@@ -898,21 +1012,440 @@ def interpolate_video_gimm(
             shutil.rmtree(temp_dir)
         except:
             pass
-        # Unload GIMM-VFI model to free VRAM
+        # Ensure model is offloaded even on error
         try:
-            import torch
-            import gc
             if _gimm_model_cache["model"] is not None:
-                # Move to CPU first to release CUDA memory
                 _gimm_model_cache["model"].cpu()
                 del _gimm_model_cache["model"]
                 _gimm_model_cache["model"] = None
                 _gimm_model_cache["variant"] = None
-            # Force garbage collection and clear CUDA cache
             gc.collect()
             torch.cuda.empty_cache()
         except:
             pass
+
+
+def interpolate_video_bim(
+    input_video: str,
+    checkpoint_path: str,
+    interp_factor: int,
+    pyr_level: int,
+    output_fps_override: float,
+    seed: int,
+) -> Generator[Tuple[Optional[str], str, float], None, None]:
+    """
+    Interpolate video frames using BiM-VFI.
+
+    Yields: (output_video_path, status_text, progress_fraction)
+    """
+    import torch
+    import numpy as np
+    import cv2
+    import gc
+
+    if not input_video:
+        yield None, "Error: No input video provided", 0.0
+        return
+
+    _gimm_set_seed(seed)
+
+    # Create temp directories
+    temp_dir = tempfile.mkdtemp(prefix="bim_interp_")
+    input_frames_dir = os.path.join(temp_dir, "input_frames")
+    output_frames_dir = os.path.join(temp_dir, "output_frames")
+    os.makedirs(input_frames_dir, exist_ok=True)
+    os.makedirs(output_frames_dir, exist_ok=True)
+
+    try:
+        # Extract frames
+        yield None, "Extracting video frames...", 0.05
+        frame_paths, original_fps = _extract_video_frames(input_video, input_frames_dir)
+
+        if len(frame_paths) < 2:
+            yield None, "Error: Video must have at least 2 frames", 0.0
+            return
+
+        yield None, f"Extracted {len(frame_paths)} frames at {original_fps:.2f} FPS", 0.1
+
+        # Load model
+        yield None, "Loading BiM-VFI model...", 0.15
+        model = _load_bim_model(checkpoint_path)
+        device = next(model.parameters()).device
+
+        yield None, "Model loaded, starting interpolation...", 0.2
+
+        # Auto-detect pyr_level based on resolution if not specified
+        from PIL import Image
+        first_img = Image.open(frame_paths[0])
+        width, height = first_img.size
+        max_dim = max(width, height)
+
+        if pyr_level <= 0:
+            # Auto-detect based on resolution
+            if max_dim >= 3840:  # 4K+
+                auto_pyr_level = 7
+            elif max_dim >= 1920:  # 1080p
+                auto_pyr_level = 6
+            else:  # < 1080p
+                auto_pyr_level = 5
+            yield None, f"Auto-detected pyr_level={auto_pyr_level} for {width}x{height}", 0.22
+        else:
+            auto_pyr_level = pyr_level
+
+        # Process frame pairs
+        N = interp_factor  # Number of output frames per input pair (including endpoints)
+        total_pairs = len(frame_paths) - 1
+        output_frame_idx = 0
+
+        def load_image(img_path):
+            img = Image.open(img_path)
+            raw_img = np.array(img.convert("RGB"))
+            img_tensor = torch.from_numpy(raw_img.copy()).permute(2, 0, 1) / 255.0
+            return img_tensor.to(torch.float).unsqueeze(0)
+
+        for pair_idx in range(total_pairs):
+            progress = 0.2 + (pair_idx / total_pairs) * 0.7
+            yield None, f"Interpolating pair {pair_idx + 1}/{total_pairs}...", progress
+
+            # Load frame pair
+            I0 = load_image(frame_paths[pair_idx]).to(device)
+            I1 = load_image(frame_paths[pair_idx + 1]).to(device)
+
+            # Save first frame (only for first pair)
+            if pair_idx == 0:
+                frame_np = (I0[0].cpu().numpy().transpose(1, 2, 0) * 255.0).astype(np.uint8)
+                frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
+                cv2.imwrite(os.path.join(output_frames_dir, f"{output_frame_idx:05d}.png"), frame_bgr)
+                output_frame_idx += 1
+
+            # Generate intermediate frames
+            with torch.no_grad():
+                for i in range(1, N):
+                    time_step = i / N
+                    results = model(img0=I0, img1=I1, time_step=time_step, pyr_level=auto_pyr_level)
+                    imgt_pred = results["imgt_pred"]
+
+                    # Save interpolated frame
+                    frame_np = (imgt_pred[0].cpu().numpy().transpose(1, 2, 0) * 255.0)
+                    frame_np = np.clip(frame_np, 0, 255).astype(np.uint8)
+                    frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
+                    cv2.imwrite(os.path.join(output_frames_dir, f"{output_frame_idx:05d}.png"), frame_bgr)
+                    output_frame_idx += 1
+
+            # Save second frame of pair
+            frame_np = (I1[0].cpu().numpy().transpose(1, 2, 0) * 255.0).astype(np.uint8)
+            frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(os.path.join(output_frames_dir, f"{output_frame_idx:05d}.png"), frame_bgr)
+            output_frame_idx += 1
+
+            # Clear CUDA cache periodically
+            if pair_idx % 10 == 0:
+                torch.cuda.empty_cache()
+
+        # Reassemble video
+        yield None, "Encoding output video...", 0.92
+
+        # Calculate output FPS
+        output_fps = output_fps_override if output_fps_override > 0 else original_fps * N
+
+        # Create output path
+        output_dir = "outputs"
+        os.makedirs(output_dir, exist_ok=True)
+        output_filename = f"interpolated_bim_{int(time.time())}.mp4"
+        output_path = os.path.join(output_dir, output_filename)
+
+        _frames_to_video(output_frames_dir, output_path, output_fps, audio_source=input_video)
+
+        # Offload model and clear VRAM before final yield
+        if _bim_model_cache["model"] is not None:
+            _bim_model_cache["model"].cpu()
+            del _bim_model_cache["model"]
+            _bim_model_cache["model"] = None
+            _bim_model_cache["variant"] = None
+        gc.collect()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+        yield output_path, f"Done! Output: {output_fps:.1f} FPS ({output_frame_idx} frames)", 1.0
+
+    except Exception as e:
+        yield None, f"Error: {str(e)}", 0.0
+        import traceback
+        traceback.print_exc()
+    finally:
+        # Cleanup temp directory
+        try:
+            shutil.rmtree(temp_dir)
+        except:
+            pass
+        # Ensure model is offloaded even on error
+        try:
+            if _bim_model_cache["model"] is not None:
+                _bim_model_cache["model"].cpu()
+                del _bim_model_cache["model"]
+                _bim_model_cache["model"] = None
+                _bim_model_cache["variant"] = None
+            gc.collect()
+            torch.cuda.empty_cache()
+        except:
+            pass
+
+
+def interpolate_video(
+    input_video: str,
+    model_variant: str,
+    checkpoint_path: str,
+    config_path: str,
+    interp_factor: int,
+    ds_scale: float,
+    output_fps_override: float,
+    raft_iters: int,
+    pyr_level: int,
+    seed: int,
+) -> Generator[Tuple[Optional[str], str, float], None, None]:
+    """
+    Unified dispatcher for video frame interpolation.
+    Runs interpolation in a subprocess for complete VRAM cleanup.
+    """
+    if not input_video:
+        yield None, "Error: No input video provided", 0.0
+        return
+
+    model_info = GIMM_MODELS.get(model_variant, {})
+    model_type = model_info.get("type", "gimm")
+
+    # Create output path
+    output_dir = "outputs"
+    os.makedirs(output_dir, exist_ok=True)
+    output_filename = f"interpolated_{model_type}_{int(time.time())}.mp4"
+    output_path = os.path.join(output_dir, output_filename)
+
+    # Build subprocess command
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    interp_script = os.path.join(script_dir, "interpolate_video.py")
+
+    command = [
+        sys.executable, interp_script,
+        "--input", input_video,
+        "--output", output_path,
+        "--model-type", model_type,
+        "--variant", model_variant,
+        "--factor", str(int(interp_factor)),
+        "--pyr-level", str(int(pyr_level)),
+        "--ds-scale", str(float(ds_scale)),
+        "--output-fps", str(float(output_fps_override)),
+        "--seed", str(int(seed)),
+    ]
+
+    if checkpoint_path:
+        command.extend(["--checkpoint", checkpoint_path])
+    if config_path:
+        command.extend(["--config", config_path])
+
+    print("\n" + "=" * 80)
+    print("LAUNCHING INTERPOLATION SUBPROCESS:")
+    print(" ".join(command))
+    print("=" * 80 + "\n")
+
+    yield None, "Starting interpolation subprocess...", 0.05
+
+    try:
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env=env
+        )
+
+        output_file = None
+        last_status = "Processing..."
+
+        while True:
+            line = process.stdout.readline()
+            if line:
+                line = line.strip()
+                if line:
+                    print(line)
+                    if line.startswith("PROGRESS:"):
+                        last_status = line[9:].strip()
+                        # Try to extract percentage
+                        progress = 0.1
+                        if "%" in last_status:
+                            try:
+                                pct = int(last_status.split("(")[1].split("%")[0])
+                                progress = 0.1 + (pct / 100) * 0.8
+                            except:
+                                pass
+                        yield None, last_status, progress
+                    elif line.startswith("OUTPUT:"):
+                        output_file = line[7:].strip()
+                    elif line.startswith("ERROR:"):
+                        yield None, line[6:].strip(), 0.0
+                        return
+
+            if process.poll() is not None:
+                # Read remaining output
+                for line in process.stdout:
+                    line = line.strip()
+                    if line:
+                        print(line)
+                        if line.startswith("OUTPUT:"):
+                            output_file = line[7:].strip()
+                        elif line.startswith("ERROR:"):
+                            yield None, line[6:].strip(), 0.0
+                            return
+                break
+
+        return_code = process.returncode
+
+        if return_code == 0 and output_file and os.path.exists(output_file):
+            yield output_file, f"Done! Output saved to {output_file}", 1.0
+        else:
+            yield None, f"Interpolation failed (exit code {return_code})", 0.0
+
+    except Exception as e:
+        yield None, f"Error: {str(e)}", 0.0
+        import traceback
+        traceback.print_exc()
+
+
+def upscale_video(
+    input_video: str,
+    model_variant: str,
+    model_path_override: str,
+    tile_size: int,
+    half_precision: bool,
+    motion_blur: bool,
+    blur_strength: float,
+    blur_samples: int,
+    crf: int,
+    seed: int,
+) -> Generator[Tuple[Optional[str], str, float], None, None]:
+    """
+    Unified video upscaling dispatcher.
+    Launches upscale_video.py as subprocess for VRAM cleanup.
+    """
+    # Validate input
+    if not input_video or not os.path.exists(input_video):
+        yield None, "Error: No input video provided", 0.0
+        return
+
+    # Get model config
+    model_config = UPSCALER_MODELS.get(model_variant)
+    if not model_config:
+        yield None, f"Error: Unknown model variant: {model_variant}", 0.0
+        return
+
+    model_type = model_config["type"]
+    scale = model_config["scale"]
+
+    # Determine model path
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if model_path_override and model_path_override.strip():
+        model_path = model_path_override.strip()
+    else:
+        model_path = os.path.join(script_dir, model_config["checkpoint"])
+
+    # Check if model exists
+    if not os.path.exists(model_path):
+        yield None, f"Error: Model not found at {model_path}", 0.0
+        return
+
+    # Create output path
+    output_dir = os.path.join(script_dir, "outputs", "upscaled")
+    os.makedirs(output_dir, exist_ok=True)
+    timestamp = int(time.time())
+    input_name = os.path.splitext(os.path.basename(input_video))[0]
+    output_path = os.path.join(output_dir, f"{input_name}_upscaled_{scale}x_{timestamp}.mp4")
+
+    yield None, f"Starting {model_variant} upscaling...", 0.05
+
+    # Build command
+    cmd = [
+        sys.executable, os.path.join(script_dir, "upscale_video.py"),
+        "--input", input_video,
+        "--output", output_path,
+        "--model-type", model_type,
+        "--model-path", model_path,
+        "--scale", str(scale),
+        "--tile-size", str(tile_size),
+        "--crf", str(crf),
+        "--seed", str(seed),
+    ]
+
+    if half_precision:
+        cmd.append("--half")
+
+    if motion_blur:
+        cmd.extend([
+            "--motion-blur",
+            "--blur-strength", str(blur_strength),
+            "--blur-samples", str(blur_samples),
+        ])
+
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+        output_file = None
+        last_status = "Processing..."
+
+        while True:
+            line = process.stdout.readline()
+            if line:
+                line = line.strip()
+                if line:
+                    print(line)
+                    if line.startswith("PROGRESS:"):
+                        last_status = line[9:].strip()
+                        # Try to extract percentage
+                        progress = 0.1
+                        if "%" in last_status:
+                            try:
+                                pct = int(last_status.split("(")[1].split("%")[0])
+                                progress = 0.1 + (pct / 100) * 0.8
+                            except:
+                                pass
+                        yield None, last_status, progress
+                    elif line.startswith("OUTPUT:"):
+                        output_file = line[7:].strip()
+                    elif line.startswith("ERROR:"):
+                        yield None, line[6:].strip(), 0.0
+                        return
+
+            if process.poll() is not None:
+                # Read remaining output
+                for line in process.stdout:
+                    line = line.strip()
+                    if line:
+                        print(line)
+                        if line.startswith("OUTPUT:"):
+                            output_file = line[7:].strip()
+                        elif line.startswith("ERROR:"):
+                            yield None, line[6:].strip(), 0.0
+                            return
+                break
+
+        return_code = process.returncode
+
+        if return_code == 0 and output_file and os.path.exists(output_file):
+            yield output_file, f"Done! Output saved to {output_file}", 1.0
+        else:
+            yield None, f"Upscaling failed (exit code {return_code})", 0.0
+
+    except Exception as e:
+        yield None, f"Error: {str(e)}", 0.0
+        import traceback
+        traceback.print_exc()
 
 
 # =============================================================================
@@ -935,6 +1468,7 @@ def generate_ltx_video(
     # Generation parameters
     mode: str,
     pipeline: str,
+    sampler: str,
     enable_sliding_window: bool,
     width: int,
     height: int,
@@ -952,18 +1486,24 @@ def generate_ltx_video(
     input_image: str,
     image_frame_idx: int,
     image_strength: float,
+    image_crf: float,
     # End image conditioning
     end_image: str,
     end_image_strength: float,
+    end_image_crf: float,
     # Anchor image conditioning
     anchor_image: str,
     anchor_interval: int,
     anchor_strength: float,
     anchor_decay: str,
+    anchor_crf: float,
     # Video input (for V2V / refine)
     input_video: str,
     refine_strength: float,
     refine_steps: int,
+    v2v_chunk_frames: int,
+    v2v_overlap_frames: int,
+    refine_latent_stride: int,
     # Audio & prompt
     disable_audio: bool,
     audio_input: str,
@@ -1074,9 +1614,11 @@ def generate_ltx_video(
 
     is_one_stage = (pipeline == "one-stage")
     is_refine_only = (pipeline == "refine-only")
+    is_three_stage_exp = (pipeline == "three-stage-exp")
+    is_three_stage_linear = (pipeline == "three-stage-linear")
     error = validate_model_paths(checkpoint_path, spatial_upsampler_path,
                                   distilled_lora_path, gemma_root,
-                                  is_one_stage=is_one_stage,
+                                  is_one_stage=is_one_stage or is_three_stage_linear,
                                   is_refine_only=is_refine_only)
     if error:
         yield [], None, error, ""
@@ -1132,17 +1674,19 @@ def generate_ltx_video(
             "--stage2-steps", str(int(stage2_steps)),
             "--seed", str(current_seed),
             "--output-path", output_filename,
-            # STG parameters (always pass, even when 0)
-            "--stg-scale", str(float(stg_scale)),
-            "--stg-mode", str(stg_mode),
+            "--sampler", str(sampler),
         ]
 
-        # STG blocks (parse comma-separated string to list)
-        if stg_blocks and stg_blocks.strip():
-            for block in stg_blocks.split(","):
-                block = block.strip()
-                if block:
-                    command.extend(["--stg-blocks", block])
+        # STG parameters (only include when stg_scale > 0)
+        if float(stg_scale) > 0:
+            command.extend(["--stg-scale", str(float(stg_scale))])
+            command.extend(["--stg-mode", str(stg_mode)])
+            # STG blocks (parse comma-separated string to list)
+            if stg_blocks and stg_blocks.strip():
+                for block in stg_blocks.split(","):
+                    block = block.strip()
+                    if block:
+                        command.extend(["--stg-blocks", block])
 
         # Pipeline selection
         if is_one_stage:
@@ -1152,6 +1696,15 @@ def generate_ltx_video(
             # Refine-only: distilled LoRA is optional, skip if stage2 checkpoint or distilled checkpoint
             if not distilled_checkpoint and not stage2_checkpoint and distilled_lora_path and distilled_lora_path.strip() and os.path.exists(distilled_lora_path):
                 command.extend(["--distilled-lora", distilled_lora_path, str(distilled_lora_strength)])
+        elif is_three_stage_exp:
+            # Three-stage exponential: stage 1 at half res, stages 2 & 3 at full res
+            command.extend(["--num-stages", "3", "--pipeline-mode", "exponential"])
+            command.extend(["--spatial-upsampler-path", spatial_upsampler_path])
+            if not distilled_checkpoint and not stage2_checkpoint:
+                command.extend(["--distilled-lora", distilled_lora_path, str(distilled_lora_strength)])
+        elif is_three_stage_linear:
+            # Three-stage linear: all stages at full resolution
+            command.extend(["--num-stages", "3", "--pipeline-mode", "linear"])
         else:
             # Two-stage specific: spatial upsampler and distilled LoRA
             command.extend(["--spatial-upsampler-path", spatial_upsampler_path])
@@ -1172,15 +1725,18 @@ def generate_ltx_video(
             command.extend(["--input-video", str(input_video)])
             command.extend(["--refine-strength", str(float(refine_strength))])
             command.extend(["--refine-steps", str(int(refine_steps))])
+            command.extend(["--v2v-chunk-frames", str(int(v2v_chunk_frames))])
+            command.extend(["--v2v-overlap-frames", str(int(v2v_overlap_frames))])
+            command.extend(["--refine-latent-stride", str(int(refine_latent_stride))])
 
-        # Image conditioning (I2V)
+        # Image conditioning (I2V) - with per-image CRF
         if mode == "i2v" and input_image:
-            command.extend(["--image", str(input_image), str(int(image_frame_idx)), str(float(image_strength))])
+            command.extend(["--image", str(input_image), str(int(image_frame_idx)), str(float(image_strength)), str(int(image_crf))])
 
-        # End image conditioning (place at last frame)
+        # End image conditioning (place at last frame) - with per-image CRF
         if end_image:
             last_frame_idx = int(num_frames) - 1
-            command.extend(["--image", str(end_image), str(last_frame_idx), str(float(end_image_strength))])
+            command.extend(["--image", str(end_image), str(last_frame_idx), str(float(end_image_strength)), str(int(end_image_crf))])
 
         # Anchor image conditioning (periodic guidance)
         if anchor_interval and int(anchor_interval) > 0:
@@ -1190,6 +1746,8 @@ def generate_ltx_video(
             command.extend(["--anchor-strength", str(float(anchor_strength))])
             if anchor_decay and anchor_decay != "none":
                 command.extend(["--anchor-decay", str(anchor_decay)])
+            if int(anchor_crf) != 33:  # Only add if non-default
+                command.extend(["--anchor-crf", str(int(anchor_crf))])
 
         # Depth Control (IC-LoRA)
         if depth_control_video and os.path.exists(depth_control_video):
@@ -1254,9 +1812,12 @@ def generate_ltx_video(
                         command.extend(["--lora", lora_path, str(user_lora_strength)])
                     elif user_lora_stage == "Stage 2 (Refine)":
                         command.extend(["--stage2-lora", lora_path, str(user_lora_strength)])
-                    else:  # "Both"
+                    elif user_lora_stage == "Stage 3 (Refine)":
+                        command.extend(["--stage3-lora", lora_path, str(user_lora_strength)])
+                    else:  # "All"
                         command.extend(["--lora", lora_path, str(user_lora_strength)])
                         command.extend(["--stage2-lora", lora_path, str(user_lora_strength)])
+                        command.extend(["--stage3-lora", lora_path, str(user_lora_strength)])
 
         # Audio handling
         if audio_input and os.path.exists(audio_input):
@@ -1429,6 +1990,254 @@ def stop_generation():
     global stop_event
     stop_event.set()
     return "Stopping generation..."
+
+
+# =============================================================================
+# Video Extension (Wan2GP-style)
+# =============================================================================
+
+def generate_extension_video(
+    # Extension-specific parameters
+    ext_input_video: str,
+    ext_prompt: str,
+    ext_negative_prompt: str,
+    ext_extend_seconds: float,
+    ext_preserve_seconds: float,
+    ext_seed: int,
+    ext_steps: int,
+    ext_cfg: float,
+    ext_preserve_strength: float,
+    ext_skip_stage2: bool,
+    # Model paths
+    ext_checkpoint_path: str,
+    ext_distilled_checkpoint: bool,
+    ext_gemma_root: str,
+    ext_spatial_upsampler_path: str,
+    ext_vae_path: str,
+    ext_distilled_lora_path: str,
+    ext_distilled_lora_strength: float,
+    # Memory optimization
+    ext_offload: bool,
+    ext_enable_fp8: bool,
+    ext_enable_dit_block_swap: bool,
+    ext_dit_blocks_in_memory: int,
+    ext_enable_text_encoder_block_swap: bool,
+    ext_text_encoder_blocks_in_memory: int,
+    ext_enable_refiner_block_swap: bool,
+    ext_refiner_blocks_in_memory: int,
+    ext_enable_activation_offload: bool,
+    # LoRA
+    ext_lora_folder: str,
+    ext_user_lora_1: str,
+    ext_user_lora_strength_1: float,
+    ext_user_lora_stage_1: str,
+    ext_user_lora_2: str,
+    ext_user_lora_strength_2: float,
+    ext_user_lora_stage_2: str,
+    ext_user_lora_3: str,
+    ext_user_lora_strength_3: float,
+    ext_user_lora_stage_3: str,
+    ext_user_lora_4: str,
+    ext_user_lora_strength_4: float,
+    ext_user_lora_stage_4: str,
+    # Output
+    ext_save_path: str,
+    # Batching
+    ext_batch_size: int = 1,
+) -> Generator[Tuple[list, str, str], None, None]:
+    """Generate video extension using Wan2GP-style conditioning approach."""
+    global current_process, current_output_filename, stop_event
+
+    stop_event.clear()
+
+    # Validate input video
+    if not ext_input_video:
+        yield [], "Error: No input video provided", ""
+        return
+
+    if not os.path.exists(ext_input_video):
+        yield [], f"Error: Input video not found: {ext_input_video}", ""
+        return
+
+    # Validate prompt
+    if not ext_prompt or not ext_prompt.strip():
+        yield [], "Error: Prompt is required", ""
+        return
+
+    # Generate random base seed if -1
+    base_seed = ext_seed
+    if base_seed == -1:
+        base_seed = random.randint(0, 2147483647)
+
+    # Create output directory
+    os.makedirs(ext_save_path, exist_ok=True)
+
+    batch_count = max(1, int(ext_batch_size))
+    all_outputs = []
+
+    for batch_idx in range(batch_count):
+        if stop_event.is_set():
+            yield all_outputs, "Generation stopped by user", ""
+            return
+
+        # Calculate seed for this batch
+        current_seed = base_seed + batch_idx
+
+        # Generate output filename
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        safe_prompt = re.sub(r'[^\w\s-]', '', ext_prompt[:30]).strip().replace(' ', '_')
+        output_filename = f"ext_{timestamp}_{safe_prompt}_{current_seed}.mp4"
+        output_path = os.path.join(ext_save_path, output_filename)
+        current_output_filename = output_path
+
+        batch_status = f"Batch {batch_idx + 1}/{batch_count}" if batch_count > 1 else ""
+
+        # Build command for ltx_video_extend.py
+        command = [
+            sys.executable, "ltx_video_extend.py",
+            "--input", ext_input_video,
+            "--output", output_path,
+            "--prompt", ext_prompt,
+            "--extend-seconds", str(ext_extend_seconds),
+            "--seed", str(current_seed),
+            "--steps", str(ext_steps),
+            "--cfg", str(ext_cfg),
+            "--preserve-strength", str(ext_preserve_strength),
+        ]
+
+        # Add preserve-seconds if specified (limit input video context)
+        if ext_preserve_seconds and float(ext_preserve_seconds) > 0:
+            command.extend(["--preserve-seconds", str(float(ext_preserve_seconds))])
+
+        # Add negative prompt if provided
+        if ext_negative_prompt and ext_negative_prompt.strip():
+            command.extend(["--negative-prompt", ext_negative_prompt])
+
+        # Model paths
+        if ext_checkpoint_path:
+            command.extend(["--checkpoint", ext_checkpoint_path])
+        if ext_gemma_root:
+            command.extend(["--gemma-root", ext_gemma_root])
+        if ext_spatial_upsampler_path:
+            command.extend(["--spatial-upsampler", ext_spatial_upsampler_path])
+
+        # Distilled LoRA (only if not using distilled checkpoint)
+        if not ext_distilled_checkpoint and ext_distilled_lora_path and ext_distilled_lora_path.strip() and os.path.exists(ext_distilled_lora_path):
+            command.extend(["--distilled-lora", ext_distilled_lora_path])
+
+        # Skip stage 2
+        if ext_skip_stage2:
+            command.append("--skip-stage2")
+
+        # Memory optimization
+        if ext_enable_dit_block_swap:
+            command.append("--dit-block-swap")
+            command.extend(["--dit-blocks", str(ext_dit_blocks_in_memory)])
+
+        if ext_enable_text_encoder_block_swap:
+            command.append("--text-encoder-block-swap")
+            command.extend(["--text-encoder-blocks", str(ext_text_encoder_blocks_in_memory)])
+
+        if ext_enable_refiner_block_swap:
+            command.append("--refiner-block-swap")
+            command.extend(["--refiner-blocks", str(ext_refiner_blocks_in_memory)])
+
+        if ext_enable_activation_offload:
+            command.append("--activation-offload")
+
+        # User LoRAs
+        lora_configs = [
+            (ext_user_lora_1, ext_user_lora_strength_1, ext_user_lora_stage_1),
+            (ext_user_lora_2, ext_user_lora_strength_2, ext_user_lora_stage_2),
+            (ext_user_lora_3, ext_user_lora_strength_3, ext_user_lora_stage_3),
+            (ext_user_lora_4, ext_user_lora_strength_4, ext_user_lora_stage_4),
+        ]
+        for user_lora, user_lora_strength, user_lora_stage in lora_configs:
+            if user_lora and user_lora != "None" and ext_lora_folder:
+                lora_path = os.path.join(ext_lora_folder, user_lora)
+                if os.path.exists(lora_path):
+                    if user_lora_stage == "Stage 1 (Base)":
+                        command.extend(["--lora", lora_path, str(user_lora_strength)])
+                    elif user_lora_stage == "Stage 2 (Refine)":
+                        command.extend(["--stage2-lora", lora_path, str(user_lora_strength)])
+                    else:  # Both
+                        command.extend(["--lora", lora_path, str(user_lora_strength)])
+                        command.extend(["--stage2-lora", lora_path, str(user_lora_strength)])
+
+        # Print command for debugging
+        print("\n" + "=" * 80)
+        print(f"LAUNCHING EXTENSION COMMAND (Batch {batch_idx + 1}/{batch_count}):")
+        print(" ".join(command))
+        print("=" * 80 + "\n")
+
+        yield all_outputs, f"{batch_status} Starting video extension...", f"Command: {' '.join(command[:10])}..."
+
+        try:
+            # Use PYTHONUNBUFFERED to ensure subprocess output isn't block-buffered
+            env = os.environ.copy()
+            env["PYTHONUNBUFFERED"] = "1"
+
+            # Start the subprocess
+            current_process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                env=env
+            )
+
+            last_progress = "Starting..."
+
+            # Stream output
+            while True:
+                if stop_event.is_set():
+                    current_process.terminate()
+                    try:
+                        current_process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        current_process.kill()
+                    yield all_outputs, "Generation stopped by user", last_progress
+                    return
+
+                line = current_process.stdout.readline()
+                if line:
+                    line = line.strip()
+                    if line:
+                        print(line)  # Print to terminal
+                        # Parse progress
+                        progress = parse_ltx_progress_line(line)
+                        if progress:
+                            last_progress = progress
+
+                yield all_outputs, f"{batch_status} Extending video: {last_progress}", last_progress
+
+                if current_process.poll() is not None:
+                    # Read remaining output
+                    for line in current_process.stdout:
+                        line = line.strip()
+                        if line:
+                            print(line)  # Print to terminal
+                            progress = parse_ltx_progress_line(line)
+                            if progress:
+                                last_progress = progress
+                    break
+
+            return_code = current_process.returncode
+            if return_code == 0 and os.path.exists(output_path):
+                all_outputs.append(output_path)
+                if batch_idx == batch_count - 1:
+                    yield all_outputs, f"All {batch_count} extension(s) complete!", "Done!"
+                else:
+                    yield all_outputs, f"{batch_status} Complete. Starting next...", "Done"
+            else:
+                yield all_outputs, f"{batch_status} Extension failed (code {return_code}). Check terminal for details.", "Error"
+
+        except Exception as e:
+            yield all_outputs, f"{batch_status} Extension error: {str(e)}", "Error"
+        finally:
+            current_process = None
+            current_output_filename = None
 
 
 # =============================================================================
@@ -1949,10 +2758,6 @@ def create_interface():
         """,
         title="LTX-2 Video Generator"
     ) as demo:
-
-        gr.Markdown("# LTX-2 Video Generator")
-        gr.Markdown("Two-stage pipeline with joint audio-video generation")
-
         with gr.Tabs() as tabs:
             # =================================================================
             # Generation Tab
@@ -1999,6 +2804,7 @@ def create_interface():
                             with gr.Row():
                                 image_frame_idx = gr.Number(label="Frame Index", value=0, minimum=0, info="Which frame to condition (0 = first)")
                                 image_strength = gr.Slider(minimum=0.0, maximum=1.0, value=0.9, step=0.05, label="Strength")
+                                image_crf = gr.Slider(minimum=0, maximum=51, value=33, step=1, label="CRF", info="H.264 compression (0=lossless, 33=default)")
 
                             with gr.Accordion("Anchor Image (periodic guidance)", open=False):
                                 gr.Markdown("Inject the anchor image at regular intervals to guide the video generation.")
@@ -2022,12 +2828,14 @@ def create_interface():
                                         value="cosine",
                                         info="Decay schedule: strong early, weak later for motion"
                                     )
+                                    anchor_crf = gr.Slider(minimum=0, maximum=51, value=33, step=1, label="CRF", info="H.264 compression (0=lossless, 33=default)")
 
                             with gr.Accordion("End Image (optional)", open=False):
                                 end_image = gr.Image(label="End Image (for start-to-end video)", type="filepath")
                                 gr.Markdown("Set an ending frame to generate video that transitions from start to end image.")
                                 with gr.Row():
                                     end_image_strength = gr.Slider(minimum=0.0, maximum=1.0, value=0.9, step=0.05, label="End Image Strength")
+                                    end_image_crf = gr.Slider(minimum=0, maximum=51, value=33, step=1, label="CRF", info="H.264 compression (0=lossless, 33=default)")
 
                         # Resolution Settings (always visible, outside accordions)
                         gr.Markdown("### Resolution Settings")
@@ -2040,9 +2848,15 @@ def create_interface():
                             )
                             pipeline = gr.Dropdown(
                                 label="Pipeline",
-                                choices=["two-stage", "one-stage", "refine-only"],
+                                choices=["two-stage", "one-stage", "refine-only", "three-stage-exp", "three-stage-linear"],
                                 value="two-stage",
-                                info="two-stage = higher quality, one-stage = faster, refine-only = stage 2 only on input video"
+                                info="two-stage = higher quality, three-stage-exp = 3 stages with upsampling, three-stage-linear = 3 stages same res"
+                            )
+                            sampler = gr.Dropdown(
+                                label="Sampler",
+                                choices=["euler", "unipc", "lcm"],
+                                value="euler",
+                                info="euler = default, unipc = higher-order (10-25 steps), lcm = fast (4-8 steps) with SGM Uniform"
                             )
                         scale_slider = gr.Slider(
                             minimum=1, maximum=200, value=100, step=1,
@@ -2085,6 +2899,23 @@ def create_interface():
                                     minimum=1, maximum=30, value=10, step=1,
                                     label="Refine Steps",
                                     info="Number of refinement denoising steps"
+                                )
+                            with gr.Row():
+                                v2v_chunk_frames = gr.Slider(
+                                    minimum=25, maximum=257, value=121, step=8,
+                                    label="V2V Chunk Frames",
+                                    info="Frames per chunk for sequential V2V (8k+1)"
+                                )
+                                v2v_overlap_frames = gr.Slider(
+                                    minimum=8, maximum=64, value=24, step=8,
+                                    label="V2V Overlap Frames",
+                                    info="Overlap frames between chunks (divisible by 8)"
+                                )
+                            with gr.Row():
+                                refine_latent_stride = gr.Slider(
+                                    minimum=1, maximum=8, value=8, step=1,
+                                    label="Refine Latent Stride",
+                                    info="Condition every Nth frame in refine-only mode. Lower values (1-4) produce smoother video but use more VRAM."
                                 )
 
                         # Depth Control (IC-LoRA)
@@ -2192,12 +3023,7 @@ def create_interface():
 Unlike SVI Pro (which uses motion latents), this method uses noise masking to preserve the original content exactly while generating seamless continuations.
 Audio is synchronized with the video extension.
                             """)
-                            with gr.Row():
-                                av_extend_video = gr.File(
-                                    label="Input Video to Extend",
-                                    file_types=["video"],
-                                    type="filepath"
-                                )
+                            av_extend_video = gr.Video(label="Input Video to Extend", sources=["upload"])
                             with gr.Row():
                                 av_extend_start_time = gr.Number(
                                     label="Start Time (seconds)",
@@ -2280,7 +3106,7 @@ Audio is synchronized with the video extension.
                                 )
                                 user_lora_stage_1 = gr.Dropdown(
                                     label="Stage",
-                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Both"],
+                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Stage 3 (Refine)", "All"],
                                     value="Stage 2 (Refine)",
                                     scale=1
                                 )
@@ -2298,7 +3124,7 @@ Audio is synchronized with the video extension.
                                 )
                                 user_lora_stage_2 = gr.Dropdown(
                                     label="Stage",
-                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Both"],
+                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Stage 3 (Refine)", "All"],
                                     value="Stage 2 (Refine)",
                                     scale=1
                                 )
@@ -2316,7 +3142,7 @@ Audio is synchronized with the video extension.
                                 )
                                 user_lora_stage_3 = gr.Dropdown(
                                     label="Stage",
-                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Both"],
+                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Stage 3 (Refine)", "All"],
                                     value="Stage 2 (Refine)",
                                     scale=1
                                 )
@@ -2334,7 +3160,7 @@ Audio is synchronized with the video extension.
                                 )
                                 user_lora_stage_4 = gr.Dropdown(
                                     label="Stage",
-                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Both"],
+                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Stage 3 (Refine)", "All"],
                                     value="Stage 2 (Refine)",
                                     scale=1
                                 )
@@ -2563,6 +3389,7 @@ Audio is synchronized with the video extension.
 
                 with gr.Row():
                     info_send_btn = gr.Button("Send to Generation", variant="primary")
+                    info_send_to_ext_btn = gr.Button("Send to Extension", variant="secondary")
 
             # =================================================================
             # SVI-LTX Tab
@@ -2945,12 +3772,20 @@ Audio is synchronized with the video extension.
                         # Advanced Settings
                         with gr.Accordion("Advanced", open=False):
                             interp_raft_iters = gr.Slider(
-                                label="RAFT Iterations",
+                                label="RAFT Iterations (GIMM-VFI only)",
                                 minimum=12,
                                 maximum=32,
                                 value=20,
                                 step=1,
-                                info="More iterations = better quality, slower"
+                                info="More iterations = better quality, slower (GIMM-VFI only)"
+                            )
+                            interp_pyr_level = gr.Slider(
+                                label="Pyramid Level (BiM-VFI only)",
+                                minimum=0,
+                                maximum=8,
+                                value=0,
+                                step=1,
+                                info="0=auto (based on resolution), 5=<1080p, 6=1080p, 7=4K+"
                             )
                             interp_seed = gr.Number(
                                 label="Seed",
@@ -2958,9 +3793,74 @@ Audio is synchronized with the video extension.
                                 info="Random seed for reproducibility"
                             )
 
+                        # Upscaling Settings
+                        with gr.Accordion("Upscaling", open=False):
+                            upscale_enable = gr.Checkbox(
+                                label="Enable Upscaling",
+                                value=False,
+                                info="Apply spatial upscaling (standalone or after interpolation)"
+                            )
+                            upscale_model = gr.Dropdown(
+                                label="Upscaler Model",
+                                choices=list(UPSCALER_MODELS.keys()),
+                                value="Real-ESRGAN x2",
+                                info="ESRGAN/SwinIR: frame-by-frame, BasicVSR++: temporal-aware"
+                            )
+                            upscale_tile_size = gr.Slider(
+                                label="Tile Size",
+                                minimum=0,
+                                maximum=1024,
+                                value=512,
+                                step=64,
+                                info="0=no tiling (more VRAM), 512=balanced, lower=less VRAM"
+                            )
+                            upscale_half = gr.Checkbox(
+                                label="Half Precision (FP16)",
+                                value=True,
+                                info="Faster, less VRAM, slight quality loss"
+                            )
+                            upscale_model_path = gr.Textbox(
+                                label="Custom Model Path (optional)",
+                                placeholder="Leave empty for default model",
+                                info="Override the default checkpoint path"
+                            )
+                            upscale_crf = gr.Slider(
+                                label="Output CRF",
+                                minimum=10,
+                                maximum=30,
+                                value=18,
+                                step=1,
+                                info="Video quality: lower=better quality, larger file (18=good default)"
+                            )
+
+                        # Motion Blur Settings (for masking deformation artifacts)
+                        with gr.Accordion("Motion Blur (Artifact Masking)", open=False):
+                            motion_blur_enable = gr.Checkbox(
+                                label="Enable Motion Blur",
+                                value=False,
+                                info="Add blur along motion vectors to mask deformation artifacts"
+                            )
+                            motion_blur_strength = gr.Slider(
+                                label="Blur Strength",
+                                minimum=0.1,
+                                maximum=2.0,
+                                value=1.0,
+                                step=0.1,
+                                info="Higher = more blur along motion direction"
+                            )
+                            motion_blur_samples = gr.Slider(
+                                label="Blur Samples",
+                                minimum=3,
+                                maximum=15,
+                                value=7,
+                                step=2,
+                                info="More samples = smoother blur (use odd numbers)"
+                            )
+
                         # Action Buttons
                         with gr.Row():
                             interp_generate_btn = gr.Button("🎬 Interpolate", variant="primary", elem_classes="green-btn")
+                            upscale_btn = gr.Button("🔍 Upscale", variant="secondary")
 
                     # Output Column
                     with gr.Column(scale=1):
@@ -2977,12 +3877,254 @@ Audio is synchronized with the video extension.
 
                         gr.Markdown("""
                         **Notes:**
-                        - Download checkpoints from [HuggingFace](https://huggingface.co/GSean/GIMM-VFI)
-                        - Place `.pt` files in `GIMM-VFI/pretrained_ckpt/`
-                        - For 2K/4K video, reduce DS Scale to fit in VRAM
-                        - FlowFormer (F) variants need more VRAM but produce better quality
-                        - Recommended: `gimmvfi_r_arb_lpips.pt` (RAFT+Perceptual)
+                        - **GIMM-VFI**: Download from [HuggingFace](https://huggingface.co/GSean/GIMM-VFI). R=RAFT (faster), F=FlowFormer (better), P=Perceptual loss
+                        - **BiM-VFI**: Download from [GitHub](https://github.com/KAIST-VICLab/BiM-VFI). Bidirectional motion field interpolation
+                        - Place checkpoints in `GIMM-VFI/pretrained_ckpt/`
+                        - For 2K/4K video with GIMM-VFI, reduce DS Scale to fit in VRAM
+                        - BiM-VFI auto-detects pyramid level based on resolution (or set manually)
+
+                        **Upscaling:**
+                        - **Real-ESRGAN**: Download from [GitHub](https://github.com/xinntao/Real-ESRGAN/releases)
+                        - **SwinIR**: Download from [GitHub](https://github.com/JingyunLiang/SwinIR/releases)
+                        - Place upscaler checkpoints in `weights/` folder
+                        - Motion blur uses RAFT flow to mask deformation artifacts
                         """)
+
+            # =================================================================
+            # Extension Tab (Wan2GP-style)
+            # =================================================================
+            with gr.Tab("Extension", id="ext_tab"):
+                with gr.Row():
+                    # Left column - Input and settings
+                    with gr.Column(scale=1):
+                        # Extension-specific inputs
+                        with gr.Accordion("Input Video", open=True):
+                            ext_input_video = gr.Video(label="Video to Extend", sources=["upload"])
+                            ext_prompt = gr.Textbox(
+                                label="Prompt",
+                                placeholder="Describe the continuation...",
+                                lines=3
+                            )
+                            ext_negative_prompt = gr.Textbox(
+                                label="Negative Prompt",
+                                placeholder="Things to avoid...",
+                                lines=2
+                            )
+
+                        with gr.Accordion("Extension Settings", open=True):
+                            with gr.Row():
+                                ext_extend_seconds = gr.Slider(
+                                    minimum=1.0, maximum=30.0, value=5.0, step=0.5,
+                                    label="Extend Duration (seconds)"
+                                )
+                                ext_preserve_seconds = gr.Slider(
+                                    minimum=0.0, maximum=30.0, value=0.0, step=0.5,
+                                    label="Max Preserve (seconds)",
+                                    info="0 = keep all, >0 = only use last N seconds as context"
+                                )
+                            with gr.Row():
+                                ext_seed = gr.Number(label="Seed", value=-1, precision=0)
+                                ext_random_seed_btn = gr.Button("🎲", size="sm")
+                            with gr.Row():
+                                ext_steps = gr.Slider(
+                                    minimum=4, maximum=60, value=30, step=1,
+                                    label="Inference Steps"
+                                )
+                                ext_cfg = gr.Slider(
+                                    minimum=1.0, maximum=10.0, value=3.0, step=0.1,
+                                    label="CFG Scale"
+                                )
+                            with gr.Row():
+                                ext_preserve_strength = gr.Slider(
+                                    minimum=0.5, maximum=1.0, value=1.0, step=0.05,
+                                    label="Preserve Strength",
+                                    info="1.0 = fully frozen original frames"
+                                )
+                                ext_skip_stage2 = gr.Checkbox(
+                                    label="Skip Stage 2",
+                                    value=False,
+                                    info="Faster but lower quality"
+                                )
+                            with gr.Row():
+                                ext_batch_size = gr.Number(
+                                    label="Batch Count", value=1, minimum=1, step=1,
+                                    info="Number of videos to generate"
+                                )
+
+                    # Right column - Output, LoRAs and Model Settings
+                    with gr.Column(scale=1):
+                        # Output gallery and controls
+                        ext_output_gallery = gr.Gallery(
+                            label="Extended Videos",
+                            columns=1, rows=1,
+                            object_fit="contain",
+                            height="auto",
+                            allow_preview=True,
+                            preview=True
+                        )
+                        with gr.Row():
+                            ext_generate_btn = gr.Button("Extend Video", variant="primary", size="lg")
+                            ext_stop_btn = gr.Button("Stop", variant="stop", size="lg")
+                        ext_status_text = gr.Textbox(label="Status", value="Ready", interactive=False)
+                        ext_progress_text = gr.Textbox(label="Progress", value="", interactive=False)
+
+                        # User LoRAs (copied from main tab)
+                        with gr.Accordion("User LoRAs (Optional)", open=True):
+                            ext_lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
+                            ext_lora_refresh_btn = gr.Button("🔄 Refresh", size="sm")
+                            # LoRA 1
+                            with gr.Row():
+                                ext_user_lora_1 = gr.Dropdown(
+                                    label="LoRA 1",
+                                    choices=get_ltx_lora_options("lora"),
+                                    value="None",
+                                    scale=3
+                                )
+                                ext_user_lora_strength_1 = gr.Slider(
+                                    minimum=0.0, maximum=2.0, value=1.0, step=0.1,
+                                    label="Strength", scale=1
+                                )
+                                ext_user_lora_stage_1 = gr.Dropdown(
+                                    label="Stage",
+                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Stage 3 (Refine)", "All"],
+                                    value="Stage 2 (Refine)",
+                                    scale=1
+                                )
+                            # LoRA 2
+                            with gr.Row():
+                                ext_user_lora_2 = gr.Dropdown(
+                                    label="LoRA 2",
+                                    choices=get_ltx_lora_options("lora"),
+                                    value="None",
+                                    scale=3
+                                )
+                                ext_user_lora_strength_2 = gr.Slider(
+                                    minimum=0.0, maximum=2.0, value=1.0, step=0.1,
+                                    label="Strength", scale=1
+                                )
+                                ext_user_lora_stage_2 = gr.Dropdown(
+                                    label="Stage",
+                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Stage 3 (Refine)", "All"],
+                                    value="Stage 2 (Refine)",
+                                    scale=1
+                                )
+                            # LoRA 3
+                            with gr.Row():
+                                ext_user_lora_3 = gr.Dropdown(
+                                    label="LoRA 3",
+                                    choices=get_ltx_lora_options("lora"),
+                                    value="None",
+                                    scale=3
+                                )
+                                ext_user_lora_strength_3 = gr.Slider(
+                                    minimum=0.0, maximum=2.0, value=1.0, step=0.1,
+                                    label="Strength", scale=1
+                                )
+                                ext_user_lora_stage_3 = gr.Dropdown(
+                                    label="Stage",
+                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Stage 3 (Refine)", "All"],
+                                    value="Stage 2 (Refine)",
+                                    scale=1
+                                )
+                            # LoRA 4
+                            with gr.Row():
+                                ext_user_lora_4 = gr.Dropdown(
+                                    label="LoRA 4",
+                                    choices=get_ltx_lora_options("lora"),
+                                    value="None",
+                                    scale=3
+                                )
+                                ext_user_lora_strength_4 = gr.Slider(
+                                    minimum=0.0, maximum=2.0, value=1.0, step=0.1,
+                                    label="Strength", scale=1
+                                )
+                                ext_user_lora_stage_4 = gr.Dropdown(
+                                    label="Stage",
+                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Stage 3 (Refine)", "All"],
+                                    value="Stage 2 (Refine)",
+                                    scale=1
+                                )
+
+                        # Model settings (copied from main tab)
+                        with gr.Accordion("Model Settings", open=True):
+                            with gr.Row():
+                                ext_offload = gr.Checkbox(label="CPU Offloading", value=False, info="Offload models to CPU when not in use")
+                                ext_enable_fp8 = gr.Checkbox(label="FP8 Mode", value=False, info="Reduce memory with FP8 transformer")
+                            gr.Markdown("### Block Swapping")
+                            with gr.Row():
+                                ext_enable_dit_block_swap = gr.Checkbox(label="DiT Block Swap", value=True, info="Main transformer (stage 1)")
+                                ext_dit_blocks_in_memory = gr.Slider(minimum=1, maximum=47, value=22, step=1, label="DiT Blocks in GPU", visible=True)
+                            with gr.Row():
+                                ext_enable_text_encoder_block_swap = gr.Checkbox(label="Text Encoder Block Swap", value=True, info="Gemma text encoder")
+                                ext_text_encoder_blocks_in_memory = gr.Slider(minimum=1, maximum=47, value=6, step=1, label="Text Encoder Blocks in GPU", visible=True, info="Gemma-3-12B has 48 layers")
+                            with gr.Row():
+                                ext_enable_refiner_block_swap = gr.Checkbox(label="Refiner Block Swap", value=True, info="Stage 2 refiner transformer")
+                                ext_refiner_blocks_in_memory = gr.Slider(minimum=1, maximum=47, value=22, step=1, label="Refiner Blocks in GPU", visible=True)
+                            with gr.Row():
+                                ext_enable_activation_offload = gr.Checkbox(label="Activation Offload", value=False, info="Offload activations to CPU (slower but lower VRAM)")
+                            with gr.Row():
+                                ext_checkpoint_path = gr.Textbox(
+                                    label="LTX Checkpoint Path",
+                                    value="./weights/ltx-2-19b-dev.safetensors",
+                                    info="Path to LTX-2 model checkpoint",
+                                    scale=4
+                                )
+                                ext_distilled_checkpoint = gr.Checkbox(
+                                    label="Distilled",
+                                    value=False,
+                                    info="Checkpoint is distilled (skips distilled LoRA)",
+                                    scale=1
+                                )
+                            ext_gemma_root = gr.Textbox(
+                                label="Gemma Root Path",
+                                value="./gemma-3-12b-it-qat-q4_0-unquantized",
+                                info="Path to Gemma text encoder"
+                            )
+                            ext_spatial_upsampler_path = gr.Textbox(
+                                label="Spatial Upsampler Path",
+                                value="./weights/ltx-2-spatial-upscaler-x2-1.0.safetensors",
+                                info="Path to 2x spatial upsampler"
+                            )
+                            ext_vae_path = gr.Textbox(
+                                label="VAE Path (Optional)",
+                                value="",
+                                info="Path to dev checkpoint for vae use (leave empty to use VAE from main checkpoint)",
+                                placeholder="e.g., ./weights/ltx-2-19b-dev.safetensors"
+                            )
+                            with gr.Row():
+                                ext_distilled_lora_path = gr.Textbox(
+                                    label="Distilled LoRA Path",
+                                    value="./weights/ltx-2-19b-distilled-lora-384.safetensors",
+                                    info="For stage 2 refinement",
+                                    scale=3
+                                )
+                                ext_distilled_lora_strength = gr.Slider(
+                                    minimum=0.0, maximum=2.0, value=1.0, step=0.1,
+                                    label="Strength", scale=1
+                                )
+                            ext_save_path = gr.Textbox(label="Output Folder", value="outputs")
+                            with gr.Row():
+                                ext_save_defaults_btn = gr.Button("💾 Save Defaults")
+                                ext_load_defaults_btn = gr.Button("📂 Load Defaults")
+                            ext_defaults_status = gr.Textbox(label="Defaults Status", value="", interactive=False, visible=True)
+
+                # Tips at the bottom (outside columns)
+                gr.Markdown("""
+                ---
+                **How it works:**
+                - Uses VideoConditionByLatentIndex to preserve original frames exactly
+                - Generates seamless continuation with synchronized audio
+                - Stage 1: Low-res extension at half resolution
+                - Stage 2: Hi-res refinement with 2x upsampling
+
+                **Tips:**
+                - Use a descriptive prompt for the continuation
+                - Preserve Strength 1.0 keeps original frames frozen
+                - Skip Stage 2 for faster (but lower quality) results
+                - **Max Preserve**: Set to limit VRAM usage by only using the last N seconds as context
+                  - 0 = use entire video as context (may OOM on long videos)
+                  - \>0 = only encode last N seconds, full video still included in output
+                """)
 
             # =================================================================
             # Help Tab
@@ -3142,13 +4284,13 @@ Audio is synchronized with the video extension.
                 prompt, negative_prompt,
                 checkpoint_path, distilled_checkpoint, stage2_checkpoint, gemma_root, spatial_upsampler_path,
                 vae_path, distilled_lora_path, distilled_lora_strength,
-                mode, pipeline, enable_sliding_window, width, height, num_frames, frame_rate,
+                mode, pipeline, sampler, enable_sliding_window, width, height, num_frames, frame_rate,
                 cfg_guidance_scale, num_inference_steps, stage2_steps, seed,
                 stg_scale, stg_blocks, stg_mode,
-                input_image, image_frame_idx, image_strength,
-                end_image, end_image_strength,
-                anchor_image, anchor_interval, anchor_strength, anchor_decay,
-                input_video, refine_strength, refine_steps,
+                input_image, image_frame_idx, image_strength, image_crf,
+                end_image, end_image_strength, end_image_crf,
+                anchor_image, anchor_interval, anchor_strength, anchor_decay, anchor_crf,
+                input_video, refine_strength, refine_steps, v2v_chunk_frames, v2v_overlap_frames, refine_latent_stride,
                 disable_audio, audio_input, audio_strength, enhance_prompt,
                 offload, enable_fp8,
                 enable_dit_block_swap, dit_blocks_in_memory,
@@ -3203,7 +4345,7 @@ Audio is synchronized with the video extension.
         def send_to_generation_handler(metadata, first_frame):
             """Send loaded metadata to generation tab parameters and switch to Generation tab."""
             if not metadata:
-                return [gr.update()] * 41 + ["No metadata loaded - upload a video first"]
+                return [gr.update()] * 45 + ["No metadata loaded - upload a video first"]
 
             # Handle legacy metadata that used single enable_block_swap
             legacy_block_swap = metadata.get("enable_block_swap", True)
@@ -3233,6 +4375,7 @@ Audio is synchronized with the video extension.
                 gr.update(value=metadata.get("negative_prompt", "")),  # negative_prompt
                 gr.update(value=mode),  # mode
                 gr.update(value=metadata.get("pipeline", "two-stage")),  # pipeline
+                gr.update(value=metadata.get("sampler", "euler")),  # sampler
                 gr.update(value=metadata.get("width", 1024)),  # width
                 gr.update(value=metadata.get("height", 1024)),  # height
                 gr.update(value=metadata.get("num_frames", 121)),  # num_frames
@@ -3244,19 +4387,25 @@ Audio is synchronized with the video extension.
                 # STG parameters
                 gr.update(value=metadata.get("stg_scale", 0.0)),  # stg_scale
                 gr.update(value=metadata.get("stg_blocks", "29")),  # stg_blocks
-                gr.update(value=metadata.get("stg_mode", "stg_av")),  # stg_mode
+                gr.update(value=metadata.get("stg_mode", "stg_av") or "stg_av"),  # stg_mode
                 # Image conditioning
                 gr.update(value=first_frame),  # input_image - use extracted first frame
                 gr.update(value=image_frame_idx),  # image_frame_idx
                 gr.update(value=image_strength),  # image_strength
+                gr.update(value=metadata.get("image_crf", 33)),  # image_crf
                 gr.update(value=metadata.get("end_image_strength", 0.9)),  # end_image_strength
+                gr.update(value=metadata.get("end_image_crf", 33)),  # end_image_crf
                 # Anchor conditioning
                 gr.update(value=metadata.get("anchor_interval", 0) or 0),  # anchor_interval
                 gr.update(value=metadata.get("anchor_strength", 0.8)),  # anchor_strength
                 gr.update(value=metadata.get("anchor_decay", "cosine") or "cosine"),  # anchor_decay
+                gr.update(value=metadata.get("anchor_crf", 33)),  # anchor_crf
                 # Refine settings
                 gr.update(value=metadata.get("refine_strength", 0.3)),  # refine_strength
                 gr.update(value=metadata.get("refine_steps", 10)),  # refine_steps
+                gr.update(value=metadata.get("v2v_chunk_frames", 121)),  # v2v_chunk_frames
+                gr.update(value=metadata.get("v2v_overlap_frames", 24)),  # v2v_overlap_frames
+                gr.update(value=metadata.get("refine_latent_stride", 8)),  # refine_latent_stride
                 # Audio and prompt
                 gr.update(value=metadata.get("disable_audio", False)),  # disable_audio
                 gr.update(value=metadata.get("audio_strength", 1.0)),  # audio_strength
@@ -3277,22 +4426,37 @@ Audio is synchronized with the video extension.
                 "Parameters sent to Generation tab (model paths unchanged)"  # status
             ]
 
+        def send_to_extension_handler(metadata, video_path):
+            """Send loaded video to Extension tab and switch to Extension tab."""
+            if not video_path:
+                return [gr.update()] * 5 + ["No video loaded - upload a video first"]
+
+            # Return updates for Extension tab parameters
+            return [
+                gr.Tabs(selected="ext_tab"),  # Switch to Extension tab
+                gr.update(value=video_path),  # ext_input_video
+                gr.update(value=metadata.get("prompt", "") if metadata else ""),  # ext_prompt
+                gr.update(value=metadata.get("negative_prompt", "") if metadata else ""),  # ext_negative_prompt
+                gr.update(value=metadata.get("seed", -1) if metadata else -1),  # ext_seed
+                "Video sent to Extension tab"  # status
+            ]
+
         info_send_btn.click(
             fn=send_to_generation_handler,
             inputs=[info_metadata_output, info_first_frame],
             outputs=[
                 tabs,  # Switch tab
-                prompt, negative_prompt, mode, pipeline,
+                prompt, negative_prompt, mode, pipeline, sampler,
                 width, height, num_frames, frame_rate,
                 cfg_guidance_scale, num_inference_steps, stage2_steps, seed,
                 # STG parameters
                 stg_scale, stg_blocks, stg_mode,
                 # Image conditioning
-                input_image, image_frame_idx, image_strength, end_image_strength,
+                input_image, image_frame_idx, image_strength, image_crf, end_image_strength, end_image_crf,
                 # Anchor conditioning
-                anchor_interval, anchor_strength, anchor_decay,
+                anchor_interval, anchor_strength, anchor_decay, anchor_crf,
                 # Refine settings
-                refine_strength, refine_steps,
+                refine_strength, refine_steps, v2v_chunk_frames, v2v_overlap_frames, refine_latent_stride,
                 # Audio and prompt
                 disable_audio, audio_strength, enhance_prompt,
                 # Memory optimization
@@ -3304,6 +4468,19 @@ Audio is synchronized with the video extension.
                 # Distilled settings
                 distilled_checkpoint,
                 info_status
+            ]
+        )
+
+        info_send_to_ext_btn.click(
+            fn=send_to_extension_handler,
+            inputs=[info_metadata_output, info_video_input],
+            outputs=[
+                tabs,  # Switch tab
+                ext_input_video,  # Video to extend
+                ext_prompt,  # Prompt
+                ext_negative_prompt,  # Negative prompt
+                ext_seed,  # Seed
+                info_status  # Status
             ]
         )
 
@@ -3447,16 +4624,16 @@ Audio is synchronized with the video extension.
             checkpoint_path, distilled_checkpoint, stage2_checkpoint, gemma_root,
             spatial_upsampler_path, vae_path, distilled_lora_path, distilled_lora_strength,
             # Generation parameters
-            mode, pipeline, width, height, num_frames, frame_rate,
+            mode, pipeline, sampler, width, height, num_frames, frame_rate,
             cfg_guidance_scale, num_inference_steps, stage2_steps, seed,
             stg_scale, stg_blocks, stg_mode,
             # Image conditioning (not input_image itself - that's a file upload)
-            image_frame_idx, image_strength,
-            end_image_strength,
+            image_frame_idx, image_strength, image_crf,
+            end_image_strength, end_image_crf,
             # Anchor conditioning
-            anchor_interval, anchor_strength, anchor_decay,
+            anchor_interval, anchor_strength, anchor_decay, anchor_crf,
             # Refine settings
-            refine_strength, refine_steps,
+            refine_strength, refine_steps, v2v_chunk_frames, v2v_overlap_frames, refine_latent_stride,
             # Audio and prompt
             disable_audio, audio_strength, enhance_prompt,
             # Memory optimization
@@ -3491,16 +4668,16 @@ Audio is synchronized with the video extension.
             "checkpoint_path", "distilled_checkpoint", "stage2_checkpoint", "gemma_root",
             "spatial_upsampler_path", "vae_path", "distilled_lora_path", "distilled_lora_strength",
             # Generation parameters
-            "mode", "pipeline", "width", "height", "num_frames", "frame_rate",
+            "mode", "pipeline", "sampler", "width", "height", "num_frames", "frame_rate",
             "cfg_guidance_scale", "num_inference_steps", "stage2_steps", "seed",
             "stg_scale", "stg_blocks", "stg_mode",
             # Image conditioning
-            "image_frame_idx", "image_strength",
-            "end_image_strength",
+            "image_frame_idx", "image_strength", "image_crf",
+            "end_image_strength", "end_image_crf",
             # Anchor conditioning
-            "anchor_interval", "anchor_strength", "anchor_decay",
+            "anchor_interval", "anchor_strength", "anchor_decay", "anchor_crf",
             # Refine settings
-            "refine_strength", "refine_steps",
+            "refine_strength", "refine_steps", "v2v_chunk_frames", "v2v_overlap_frames", "refine_latent_stride",
             # Audio and prompt
             "disable_audio", "audio_strength", "enhance_prompt",
             # Memory optimization
@@ -3742,6 +4919,126 @@ Audio is synchronized with the video extension.
         )
 
         # =================================================================
+        # Extension Tab Save/Load Defaults
+        # =================================================================
+        EXT_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "ext_defaults.json")
+
+        ext_ui_default_components_ORDERED_LIST = [
+            # Extension settings
+            ext_extend_seconds, ext_preserve_seconds, ext_steps, ext_cfg,
+            ext_preserve_strength, ext_skip_stage2, ext_batch_size,
+            # Model paths
+            ext_checkpoint_path, ext_distilled_checkpoint,
+            ext_gemma_root, ext_spatial_upsampler_path, ext_vae_path,
+            ext_distilled_lora_path, ext_distilled_lora_strength,
+            # Memory optimization
+            ext_offload, ext_enable_fp8,
+            ext_enable_dit_block_swap, ext_dit_blocks_in_memory,
+            ext_enable_text_encoder_block_swap, ext_text_encoder_blocks_in_memory,
+            ext_enable_refiner_block_swap, ext_refiner_blocks_in_memory,
+            ext_enable_activation_offload,
+            # LoRA
+            ext_lora_folder,
+            ext_user_lora_1, ext_user_lora_strength_1, ext_user_lora_stage_1,
+            ext_user_lora_2, ext_user_lora_strength_2, ext_user_lora_stage_2,
+            ext_user_lora_3, ext_user_lora_strength_3, ext_user_lora_stage_3,
+            ext_user_lora_4, ext_user_lora_strength_4, ext_user_lora_stage_4,
+            # Output
+            ext_save_path,
+        ]
+
+        ext_ui_default_keys = [
+            "ext_extend_seconds", "ext_preserve_seconds", "ext_steps", "ext_cfg",
+            "ext_preserve_strength", "ext_skip_stage2", "ext_batch_size",
+            "ext_checkpoint_path", "ext_distilled_checkpoint",
+            "ext_gemma_root", "ext_spatial_upsampler_path", "ext_vae_path",
+            "ext_distilled_lora_path", "ext_distilled_lora_strength",
+            "ext_offload", "ext_enable_fp8",
+            "ext_enable_dit_block_swap", "ext_dit_blocks_in_memory",
+            "ext_enable_text_encoder_block_swap", "ext_text_encoder_blocks_in_memory",
+            "ext_enable_refiner_block_swap", "ext_refiner_blocks_in_memory",
+            "ext_enable_activation_offload",
+            "ext_lora_folder",
+            "ext_user_lora_1", "ext_user_lora_strength_1", "ext_user_lora_stage_1",
+            "ext_user_lora_2", "ext_user_lora_strength_2", "ext_user_lora_stage_2",
+            "ext_user_lora_3", "ext_user_lora_strength_3", "ext_user_lora_stage_3",
+            "ext_user_lora_4", "ext_user_lora_strength_4", "ext_user_lora_stage_4",
+            "ext_save_path",
+        ]
+
+        def save_ext_defaults(*values):
+            os.makedirs(UI_CONFIGS_DIR, exist_ok=True)
+            settings_to_save = {}
+            for i, key in enumerate(ext_ui_default_keys):
+                settings_to_save[key] = values[i]
+            try:
+                with open(EXT_DEFAULTS_FILE, 'w') as f:
+                    json.dump(settings_to_save, f, indent=2)
+                return "Extension defaults saved successfully."
+            except Exception as e:
+                return f"Error saving Extension defaults: {e}"
+
+        def load_ext_defaults(request: gr.Request = None):
+            lora_folder_val = "lora"
+            lora_choices = get_ltx_lora_options(lora_folder_val)
+
+            if not os.path.exists(EXT_DEFAULTS_FILE):
+                if request:
+                    return [gr.update()] * len(ext_ui_default_keys) + ["No defaults file found."]
+                else:
+                    return [gr.update()] * len(ext_ui_default_keys) + [""]
+
+            try:
+                with open(EXT_DEFAULTS_FILE, 'r') as f:
+                    loaded_settings = json.load(f)
+            except Exception as e:
+                return [gr.update()] * len(ext_ui_default_keys) + [f"Error loading defaults: {e}"]
+
+            # Update lora folder from settings
+            lora_folder_val = loaded_settings.get("ext_lora_folder", "lora")
+            lora_choices = get_ltx_lora_options(lora_folder_val)
+
+            updates = []
+            for i, key in enumerate(ext_ui_default_keys):
+                component = ext_ui_default_components_ORDERED_LIST[i]
+                default_value_from_component = None
+                if hasattr(component, 'value'):
+                    default_value_from_component = component.value
+
+                value_to_set = loaded_settings.get(key, default_value_from_component)
+
+                # Special handling for LoRA dropdowns
+                if key in ("ext_user_lora_1", "ext_user_lora_2", "ext_user_lora_3", "ext_user_lora_4"):
+                    if value_to_set not in lora_choices:
+                        value_to_set = "None"
+                    updates.append(gr.update(choices=lora_choices, value=value_to_set))
+                else:
+                    updates.append(gr.update(value=value_to_set))
+
+            return updates + ["Extension defaults loaded successfully."]
+
+        ext_save_defaults_btn.click(
+            fn=save_ext_defaults,
+            inputs=ext_ui_default_components_ORDERED_LIST,
+            outputs=[ext_defaults_status]
+        )
+        ext_load_defaults_btn.click(
+            fn=load_ext_defaults,
+            inputs=None,
+            outputs=ext_ui_default_components_ORDERED_LIST + [ext_defaults_status]
+        )
+
+        def initial_load_ext_defaults():
+            results_and_status = load_ext_defaults(None)
+            return results_and_status[:-1]
+
+        demo.load(
+            fn=initial_load_ext_defaults,
+            inputs=None,
+            outputs=ext_ui_default_components_ORDERED_LIST
+        )
+
+        # =================================================================
         # Depth Map Tab Event Handlers
         # =================================================================
 
@@ -3875,7 +5172,7 @@ Audio is synchronized with the video extension.
         # Frame Interpolation Event Handlers
         # =================================================================
         interp_generate_btn.click(
-            fn=interpolate_video_gimm,
+            fn=interpolate_video,
             inputs=[
                 interp_input_video,
                 interp_model_variant,
@@ -3885,9 +5182,104 @@ Audio is synchronized with the video extension.
                 interp_ds_scale,
                 interp_output_fps,
                 interp_raft_iters,
+                interp_pyr_level,
                 interp_seed,
             ],
             outputs=[interp_output_video, interp_status, interp_progress]
+        )
+
+        # Upscaling event handler
+        upscale_btn.click(
+            fn=upscale_video,
+            inputs=[
+                interp_input_video,  # Use same input video
+                upscale_model,
+                upscale_model_path,
+                upscale_tile_size,
+                upscale_half,
+                motion_blur_enable,
+                motion_blur_strength,
+                motion_blur_samples,
+                upscale_crf,
+                interp_seed,  # Reuse same seed
+            ],
+            outputs=[interp_output_video, interp_status, interp_progress]
+        )
+
+        # =================================================================
+        # Extension Tab Event Handlers
+        # =================================================================
+
+        # Random seed button
+        ext_random_seed_btn.click(
+            fn=lambda: -1,
+            outputs=[ext_seed]
+        )
+
+        # LoRA refresh (updates all 4 dropdowns)
+        def ext_refresh_all_lora_dropdowns(folder):
+            choices = get_ltx_lora_options(folder)
+            return [gr.update(choices=choices) for _ in range(4)]
+
+        ext_lora_refresh_btn.click(
+            fn=ext_refresh_all_lora_dropdowns,
+            inputs=[ext_lora_folder],
+            outputs=[ext_user_lora_1, ext_user_lora_2, ext_user_lora_3, ext_user_lora_4]
+        )
+
+        # Block swap visibility toggles
+        ext_enable_dit_block_swap.change(
+            fn=lambda x: gr.update(visible=x),
+            inputs=[ext_enable_dit_block_swap],
+            outputs=[ext_dit_blocks_in_memory]
+        )
+        ext_enable_text_encoder_block_swap.change(
+            fn=lambda x: gr.update(visible=x),
+            inputs=[ext_enable_text_encoder_block_swap],
+            outputs=[ext_text_encoder_blocks_in_memory]
+        )
+        ext_enable_refiner_block_swap.change(
+            fn=lambda x: gr.update(visible=x),
+            inputs=[ext_enable_refiner_block_swap],
+            outputs=[ext_refiner_blocks_in_memory]
+        )
+
+        # Stop button
+        ext_stop_btn.click(
+            fn=stop_generation,
+            outputs=[ext_status_text]
+        )
+
+        # Generate extension button
+        ext_generate_btn.click(
+            fn=generate_extension_video,
+            inputs=[
+                # Extension-specific parameters
+                ext_input_video, ext_prompt, ext_negative_prompt,
+                ext_extend_seconds, ext_preserve_seconds, ext_seed, ext_steps, ext_cfg,
+                ext_preserve_strength, ext_skip_stage2,
+                # Model paths
+                ext_checkpoint_path, ext_distilled_checkpoint,
+                ext_gemma_root, ext_spatial_upsampler_path, ext_vae_path,
+                ext_distilled_lora_path, ext_distilled_lora_strength,
+                # Memory optimization
+                ext_offload, ext_enable_fp8,
+                ext_enable_dit_block_swap, ext_dit_blocks_in_memory,
+                ext_enable_text_encoder_block_swap, ext_text_encoder_blocks_in_memory,
+                ext_enable_refiner_block_swap, ext_refiner_blocks_in_memory,
+                ext_enable_activation_offload,
+                # LoRA
+                ext_lora_folder,
+                ext_user_lora_1, ext_user_lora_strength_1, ext_user_lora_stage_1,
+                ext_user_lora_2, ext_user_lora_strength_2, ext_user_lora_stage_2,
+                ext_user_lora_3, ext_user_lora_strength_3, ext_user_lora_stage_3,
+                ext_user_lora_4, ext_user_lora_strength_4, ext_user_lora_stage_4,
+                # Output
+                ext_save_path,
+                # Batching
+                ext_batch_size,
+            ],
+            outputs=[ext_output_gallery, ext_status_text, ext_progress_text]
         )
 
         return demo
