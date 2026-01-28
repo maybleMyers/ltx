@@ -1982,6 +1982,25 @@ Examples:
         help="STG mode: 'stg_av' perturbs both audio and video self-attention, "
              "'stg_v' perturbs video only. (default: stg_av)",
     )
+    gen_group.add_argument(
+        "--kandinsky-scheduler",
+        action="store_true",
+        default=False,
+        help="Use Kandinsky-style front-loaded scheduler instead of LTX2Scheduler. "
+             "Better for fast motion but may reduce fine detail quality. "
+             "Recommended with 50+ steps and --kandinsky-scheduler-scale 5.0. "
+             "(default: False, uses LTX2Scheduler)",
+    )
+    gen_group.add_argument(
+        "--kandinsky-scheduler-scale",
+        type=float,
+        default=5.0,
+        help="Scheduler scale for Kandinsky-style front-loading. Higher values concentrate "
+             "more steps in the high-noise region (better structure/motion), lower values "
+             "concentrate steps in low-noise region (better details). "
+             "Recommended: 3.0-7.0. Only used when --kandinsky-scheduler is enabled. "
+             "(default: 5.0)",
+    )
 
     # ==========================================================================
     # Image Conditioning (I2V)
@@ -3260,6 +3279,9 @@ class LTXVideoGeneratorWithOffloading:
         stage2_sampler: str = "euler",
         # Stage 3 parameters
         stage3_steps: int = 3,
+        # Kandinsky scheduler parameters
+        kandinsky_scheduler: bool = False,
+        kandinsky_scheduler_scale: float = 5.0,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor | None, str | None]:
         """
         Generate video with optional audio.
@@ -3621,11 +3643,17 @@ class LTXVideoGeneratorWithOffloading:
 
             # Create diffusion schedule
             # Both distilled and standard checkpoints use configurable LTX2Scheduler
-            sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(
-                dtype=torch.float32, device=self.device
-            )
-
-            print(f">>> Using {num_inference_steps} inference steps")
+            if kandinsky_scheduler:
+                # Kandinsky-style front-loaded scheduler for better fast motion
+                timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=self.device, dtype=torch.float32)
+                scale = kandinsky_scheduler_scale
+                sigmas = scale * timesteps / (1.0 + (scale - 1.0) * timesteps)
+                print(f">>> Using {num_inference_steps} inference steps with Kandinsky scheduler (scale={scale})")
+            else:
+                sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(
+                    dtype=torch.float32, device=self.device
+                )
+                print(f">>> Using {num_inference_steps} inference steps")
 
             # Move text embeddings to GPU for stage 1 denoising
             v_context_p = v_context_p.to(self.device)
@@ -4445,18 +4473,28 @@ class LTXVideoGeneratorWithOffloading:
         # For normal two-stage, use stage2_steps (default 3)
         if self.refine_only and input_video:
             # Generate base sigma schedule (1.0 to 0.0)
-            base_sigmas = LTX2Scheduler().execute(steps=refine_steps).to(
-                dtype=torch.float32, device=self.device
-            )
+            if kandinsky_scheduler:
+                timesteps = torch.linspace(1.0, 0.0, refine_steps + 1, device=self.device, dtype=torch.float32)
+                scale = kandinsky_scheduler_scale
+                base_sigmas = scale * timesteps / (1.0 + (scale - 1.0) * timesteps)
+            else:
+                base_sigmas = LTX2Scheduler().execute(steps=refine_steps).to(
+                    dtype=torch.float32, device=self.device
+                )
             # Scale sigmas by refine_strength so they start from refine_strength instead of 1.0
             # This preserves (1 - refine_strength) of the input content
             distilled_sigmas = base_sigmas * refine_strength
             print(f">>> Using {refine_steps} refinement steps with strength {refine_strength}")
         elif self.pipeline_mode == "linear":
             # Linear mode: Stage 2 uses SAME schedule as Stage 1 (full denoising)
-            distilled_sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(
-                dtype=torch.float32, device=self.device
-            )
+            if kandinsky_scheduler:
+                timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=self.device, dtype=torch.float32)
+                scale = kandinsky_scheduler_scale
+                distilled_sigmas = scale * timesteps / (1.0 + (scale - 1.0) * timesteps)
+            else:
+                distilled_sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(
+                    dtype=torch.float32, device=self.device
+                )
             print(f">>> Linear mode Stage 2: using {num_inference_steps} steps (same as Stage 1)")
         else:
             # Exponential mode: use pre-tuned sigma values for refinement with distilled LoRA
@@ -5007,9 +5045,14 @@ class LTXVideoGeneratorWithOffloading:
             # Generate sigma schedule for stage 3
             if self.pipeline_mode == "linear":
                 # Linear mode: Stage 3 uses SAME schedule as Stage 1 (full denoising)
-                stage3_sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(
-                    dtype=torch.float32, device=self.device
-                )
+                if kandinsky_scheduler:
+                    timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=self.device, dtype=torch.float32)
+                    scale = kandinsky_scheduler_scale
+                    stage3_sigmas = scale * timesteps / (1.0 + (scale - 1.0) * timesteps)
+                else:
+                    stage3_sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(
+                        dtype=torch.float32, device=self.device
+                    )
                 print(f">>> Linear mode Stage 3: using {num_inference_steps} steps (same as Stage 1)")
             elif stage3_steps == 3:
                 # Exponential mode: use refinement schedule
@@ -5398,6 +5441,9 @@ def generate_svi_multi_clip(
                 stage2_sampler=args.stage2_sampler,
                 # Stage 3 parameters
                 stage3_steps=args.stage3_steps,
+                # Kandinsky scheduler parameters
+                kandinsky_scheduler=args.kandinsky_scheduler,
+                kandinsky_scheduler_scale=args.kandinsky_scheduler_scale,
             )
 
             # Collect video frames from iterator - move to CPU immediately to save GPU memory
@@ -6244,12 +6290,18 @@ def generate_av_extension(
     else:
         transformer = generator.stage_1_model_ledger.transformer()
 
-    sigmas = LTX2Scheduler().execute(
-        steps=extend_steps,
-        latent=extended_video_latent,
-        terminal=terminal,
-        stretch=True,
-    ).to(dtype=torch.float32, device=device)
+    if args.kandinsky_scheduler:
+        # Kandinsky-style front-loaded scheduler for better fast motion
+        timesteps = torch.linspace(1.0, 0.0, extend_steps + 1, device=device, dtype=torch.float32)
+        scale = args.kandinsky_scheduler_scale
+        sigmas = scale * timesteps / (1.0 + (scale - 1.0) * timesteps)
+    else:
+        sigmas = LTX2Scheduler().execute(
+            steps=extend_steps,
+            latent=extended_video_latent,
+            terminal=terminal,
+            stretch=True,
+        ).to(dtype=torch.float32, device=device)
 
     # Initialize diffusion components
     generator_torch = torch.Generator(device=device).manual_seed(args.seed)
@@ -7661,12 +7713,18 @@ def generate_v2v_join(
         transformer = generator.stage_1_model_ledger.transformer()
 
     # Create sigmas schedule
-    sigmas = LTX2Scheduler().execute(
-        steps=extend_steps,
-        latent=video_latent,
-        terminal=terminal,
-        stretch=True,
-    ).to(dtype=torch.float32, device=device)
+    if args.kandinsky_scheduler:
+        # Kandinsky-style front-loaded scheduler for better fast motion
+        timesteps = torch.linspace(1.0, 0.0, extend_steps + 1, device=device, dtype=torch.float32)
+        scale = args.kandinsky_scheduler_scale
+        sigmas = scale * timesteps / (1.0 + (scale - 1.0) * timesteps)
+    else:
+        sigmas = LTX2Scheduler().execute(
+            steps=extend_steps,
+            latent=video_latent,
+            terminal=terminal,
+            stretch=True,
+        ).to(dtype=torch.float32, device=device)
 
     # Initialize diffusion components
     generator_torch = torch.Generator(device=device).manual_seed(args.seed)
@@ -9102,6 +9160,9 @@ def sliding_window_generate(
             stage2_sampler=args.stage2_sampler,
             # Stage 3 parameters
             stage3_steps=args.stage3_steps,
+            # Kandinsky scheduler parameters
+            kandinsky_scheduler=args.kandinsky_scheduler,
+            kandinsky_scheduler_scale=args.kandinsky_scheduler_scale,
         )
 
         # Collect video frames from iterator - move to CPU immediately to save GPU memory
@@ -9623,6 +9684,8 @@ def main():
             sampler=args.sampler,
             stage2_sampler=args.stage2_sampler,
             stage3_steps=args.stage3_steps,
+            kandinsky_scheduler=args.kandinsky_scheduler,
+            kandinsky_scheduler_scale=args.kandinsky_scheduler_scale,
         )
 
     # Encode and save video

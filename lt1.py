@@ -1485,6 +1485,9 @@ def generate_ltx_video(
     stg_scale: float,
     stg_blocks: str,
     stg_mode: str,
+    # Kandinsky scheduler parameters
+    kandinsky_scheduler: bool,
+    kandinsky_scheduler_scale: float,
     # Image conditioning (for I2V)
     input_image: str,
     image_frame_idx: int,
@@ -1691,6 +1694,11 @@ def generate_ltx_video(
                     block = block.strip()
                     if block:
                         command.extend(["--stg-blocks", block])
+
+        # Kandinsky scheduler parameters
+        if kandinsky_scheduler:
+            command.append("--kandinsky-scheduler")
+            command.extend(["--kandinsky-scheduler-scale", str(float(kandinsky_scheduler_scale))])
 
         # Pipeline selection
         if is_one_stage:
@@ -2904,6 +2912,9 @@ def create_interface():
                             stg_scale = gr.Slider(minimum=0.0, maximum=2.0, value=0.0, step=0.1, label="STG Scale", info="Spatio-temporal guidance scale (0=disabled)")
                             stg_blocks = gr.Textbox(label="STG Blocks", value="29", info="Comma-separated block indices, e.g., 29 or 20,21,22")
                             stg_mode = gr.Dropdown(label="STG Mode", choices=["stg_av", "stg_v"], value="stg_av", info="stg_av=audio+video, stg_v=video only")
+                        with gr.Row():
+                            kandinsky_scheduler = gr.Checkbox(label="Kandinsky Scheduler", value=False, info="Front-loaded scheduler for better fast motion (recommended: 50+ steps)")
+                            kandinsky_scheduler_scale = gr.Slider(minimum=1.0, maximum=10.0, value=5.0, step=0.5, label="Kandinsky Scale", info="Higher = more motion focus (3-7 recommended)")
 
                         # Video Input (V2V / Refine)
                         with gr.Accordion("Video Input (V2V / Refine)", open=False) as v2v_section:
@@ -4313,6 +4324,7 @@ Audio is synchronized with the video extension.
                 mode, pipeline, sampler, stage2_sampler, enable_sliding_window, width, height, num_frames, frame_rate,
                 cfg_guidance_scale, num_inference_steps, stage2_steps, stage2_strength, stage3_strength, seed,
                 stg_scale, stg_blocks, stg_mode,
+                kandinsky_scheduler, kandinsky_scheduler_scale,
                 input_image, image_frame_idx, image_strength, image_crf,
                 end_image, end_image_strength, end_image_crf,
                 anchor_image, anchor_interval, anchor_strength, anchor_decay, anchor_crf,
@@ -4428,6 +4440,9 @@ Audio is synchronized with the video extension.
                 gr.update(value=metadata.get("stg_scale", 0.0)),  # stg_scale
                 gr.update(value=metadata.get("stg_blocks", "29")),  # stg_blocks
                 gr.update(value=metadata.get("stg_mode", "stg_av") or "stg_av"),  # stg_mode
+                # Kandinsky scheduler parameters
+                gr.update(value=metadata.get("kandinsky_scheduler", False)),  # kandinsky_scheduler
+                gr.update(value=metadata.get("kandinsky_scheduler_scale", 5.0)),  # kandinsky_scheduler_scale
                 # Image conditioning (extracted from images tuple)
                 gr.update(value=first_frame),  # input_image - use extracted first frame
                 gr.update(value=image_frame_idx),  # image_frame_idx
@@ -4507,6 +4522,8 @@ Audio is synchronized with the video extension.
                 cfg_guidance_scale, num_inference_steps, stage2_steps, stage2_strength, stage3_strength, seed,
                 # STG parameters
                 stg_scale, stg_blocks, stg_mode,
+                # Kandinsky scheduler parameters
+                kandinsky_scheduler, kandinsky_scheduler_scale,
                 # Image conditioning
                 input_image, image_frame_idx, image_strength, image_crf, end_image_strength, end_image_crf,
                 # Anchor conditioning
@@ -4699,6 +4716,7 @@ Audio is synchronized with the video extension.
             mode, pipeline, sampler, stage2_sampler, width, height, num_frames, frame_rate,
             cfg_guidance_scale, num_inference_steps, stage2_steps, stage2_strength, stage3_strength, seed,
             stg_scale, stg_blocks, stg_mode,
+            kandinsky_scheduler, kandinsky_scheduler_scale,
             # Image conditioning (not input_image itself - that's a file upload)
             image_frame_idx, image_strength, image_crf,
             end_image_strength, end_image_crf,
@@ -4743,6 +4761,7 @@ Audio is synchronized with the video extension.
             "mode", "pipeline", "sampler", "stage2_sampler", "width", "height", "num_frames", "frame_rate",
             "cfg_guidance_scale", "num_inference_steps", "stage2_steps", "stage2_strength", "stage3_strength", "seed",
             "stg_scale", "stg_blocks", "stg_mode",
+            "kandinsky_scheduler", "kandinsky_scheduler_scale",
             # Image conditioning
             "image_frame_idx", "image_strength", "image_crf",
             "end_image_strength", "end_image_crf",
