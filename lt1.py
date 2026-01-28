@@ -3406,7 +3406,8 @@ Audio is synchronized with the video extension.
                     info_status = gr.Textbox(label="Status", interactive=False)
 
                 with gr.Row():
-                    info_send_btn = gr.Button("Send to Generation", variant="primary")
+                    info_send_to_v2v_btn = gr.Button("Send to V2V", variant="primary")
+                    info_send_btn = gr.Button("Send to Generation", variant="secondary")
                     info_send_to_ext_btn = gr.Button("Send to Extension", variant="secondary")
 
             # =================================================================
@@ -4463,6 +4464,24 @@ Audio is synchronized with the video extension.
                 "Parameters sent to Generation tab (model paths unchanged)"  # status
             ]
 
+        def send_to_v2v_handler(metadata, video_path):
+            """Send loaded video to V2V input in generation tab and switch to Generation tab."""
+            if not video_path:
+                return [gr.update()] * 8 + ["No video loaded - upload a video first"]
+
+            # Return updates for V2V mode
+            return [
+                gr.Tabs(selected="gen_tab"),  # Switch to Generation tab
+                gr.update(value=video_path),  # input_video - send to V2V input
+                gr.update(value="v2v"),  # mode - set to v2v
+                gr.update(value=metadata.get("prompt", "") if metadata else ""),  # prompt
+                gr.update(value=metadata.get("negative_prompt", "") if metadata else ""),  # negative_prompt
+                gr.update(value=metadata.get("seed", -1) if metadata else -1),  # seed
+                gr.update(value=metadata.get("refine_strength", 0.3) if metadata else 0.3),  # refine_strength
+                gr.update(value="preserve"),  # v2v_audio_mode - default to preserve
+                "Video sent to V2V input in Generation tab"  # status
+            ]
+
         def send_to_extension_handler(metadata, video_path):
             """Send loaded video to Extension tab and switch to Extension tab."""
             if not video_path:
@@ -4505,6 +4524,22 @@ Audio is synchronized with the video extension.
                 # Distilled settings
                 distilled_checkpoint,
                 info_status
+            ]
+        )
+
+        info_send_to_v2v_btn.click(
+            fn=send_to_v2v_handler,
+            inputs=[info_metadata_output, info_video_input],
+            outputs=[
+                tabs,  # Switch tab
+                input_video,  # V2V input video
+                mode,  # Set mode to v2v
+                prompt,  # Prompt
+                negative_prompt,  # Negative prompt
+                seed,  # Seed
+                refine_strength,  # Refine strength
+                v2v_audio_mode,  # Audio mode (preserve)
+                info_status  # Status
             ]
         )
 

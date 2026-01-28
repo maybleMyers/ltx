@@ -3403,9 +3403,11 @@ class LTXVideoGeneratorWithOffloading:
             print(f">>> Video encoded to latent shape {upscaled_video_latent.shape}")
 
             # Extract and encode audio from input video (like stage 1 would)
+            # Only extract if v2v_audio_mode is "preserve" - for other modes, audio will be
+            # regenerated or handled differently
             audio_latent = None
-            if not disable_audio:
-                print(">>> Encoding audio from input video...")
+            if not disable_audio and v2v_audio_mode == "preserve":
+                print(">>> Encoding audio from input video (v2v_audio_mode=preserve)...")
 
                 # Extract audio waveform from input video
                 waveform, sample_rate = decode_audio_from_file(input_video, self.device)
@@ -3774,203 +3776,23 @@ class LTXVideoGeneratorWithOffloading:
 
                 actual_frames = video_tensor.shape[2]
 
-                if self.one_stage:
-                    chunk_size = v2v_chunk_frames
-                    overlap_pixels = v2v_overlap_frames
-                    overlap_latent = overlap_pixels // 8
-                    stride = chunk_size - overlap_pixels
+                # V2V: Encode full video as initial latent for stage 1
+                # This allows refine_strength to control preservation of input
+                # Note: video_tensor is kept on CPU, chunks are moved to GPU one at a time
+                print(f">>> V2V: Encoding {actual_frames} frames to latent space...")
 
-                    enc_tile_size = 17
-                    enc_tile_overlap = 8
-                    enc_tile_stride = enc_tile_size - enc_tile_overlap
+                v2v_initial_latent = encode_video_chunked(
+                    video_tensor,
+                    video_encoder,
+                    chunk_frames=v2v_chunk_frames,
+                    device=self.device,
+                    dtype=dtype,
+                )
 
-                    print(f">>> V2V Sequential: {actual_frames} frames, chunk={chunk_size}, overlap={overlap_pixels}")
+                del video_tensor
+                torch.cuda.empty_cache()
 
-                    accumulated_latent = None
-                    frame_start = 0
-                    chunk_idx = 0
-
-                    while frame_start < actual_frames:
-                        frame_end = min(frame_start + chunk_size, actual_frames)
-                        valid_frames = ((frame_end - frame_start - 1) // 8) * 8 + 1
-                        if valid_frames < 9:
-                            break
-                        frame_end = frame_start + valid_frames
-
-                        chunk_latent_frames = (valid_frames - 1) // 8 + 1
-                        min_chunk_latent = overlap_latent + 1
-                        if chunk_idx > 0 and chunk_latent_frames < min_chunk_latent:
-                            needed_frames = (min_chunk_latent - 1) * 8 + 1
-                            frame_start = frame_end - needed_frames
-                            if frame_start < 0:
-                                break
-                            valid_frames = needed_frames
-                            chunk_latent_frames = min_chunk_latent
-
-                        chunk_conditionings = list(stage_1_conditionings)
-
-                        if chunk_idx > 0:
-                            # CropGuides pattern: append guide latents as surplus tokens
-                            # These influence attention but are cropped by clear_conditioning() after denoising
-                            guide_latent = accumulated_latent[:, :, -overlap_latent:, :, :].to(self.device)
-                            chunk_conditionings.append(
-                                VideoConditionByGuideLatent(
-                                    latent=guide_latent,
-                                    frame_idx=0,  # Position at start of chunk for continuity
-                                    strength=0.98,  # High preservation (2% denoising freedom)
-                                )
-                            )
-
-                        # Middle frame guide for longer chunks (improves temporal coherence)
-                        if chunk_latent_frames > 8:  # More than 64 pixel frames
-                            mid_pixel = valid_frames // 2
-                            # Encode 9 frames around the middle (produces 1 latent frame)
-                            mid_start = max(0, mid_pixel - 4)
-                            mid_end = min(valid_frames, mid_start + 9)
-                            mid_start = max(0, mid_end - 9)  # Adjust if near end
-
-                            if mid_end - mid_start >= 9:
-                                mid_tile = video_tensor[:, :, frame_start + mid_start:frame_start + mid_end, :, :].to(device=self.device, dtype=dtype)
-                                with torch.no_grad():
-                                    mid_encoded = video_encoder(mid_tile)
-                                del mid_tile
-                                torch.cuda.empty_cache()
-
-                                chunk_conditionings.append(
-                                    VideoConditionByGuideLatent(
-                                        latent=mid_encoded.cpu(),
-                                        frame_idx=mid_start,  # Position at middle of chunk
-                                        strength=0.95,  # Slightly lower than overlap guide
-                                    )
-                                )
-                                del mid_encoded
-                                torch.cuda.empty_cache()
-
-                        enc_frame_idx = 0
-                        while enc_frame_idx < valid_frames:
-                            enc_end = min(enc_frame_idx + enc_tile_size, valid_frames)
-                            enc_tile_frames = enc_end - enc_frame_idx
-                            enc_valid = ((enc_tile_frames - 1) // 8) * 8 + 1
-                            if enc_valid < 9:
-                                break
-                            enc_end = enc_frame_idx + enc_valid
-
-                            tile = video_tensor[:, :, frame_start + enc_frame_idx:frame_start + enc_end, :, :].to(device=self.device, dtype=dtype)
-                            with torch.no_grad():
-                                encoded_tile = video_encoder(tile)
-                            del tile
-                            torch.cuda.empty_cache()
-
-                            cond_frame_idx = enc_frame_idx
-                            if chunk_idx > 0 and enc_frame_idx < overlap_pixels:
-                                cond_frame_idx = overlap_pixels
-                                skip_latent = overlap_latent
-                                encoded_tile = encoded_tile[:, :, skip_latent:, :, :]
-                                if encoded_tile.shape[2] == 0:
-                                    del encoded_tile
-                                    enc_frame_idx += enc_tile_stride
-                                    continue
-
-                            chunk_conditionings.append(
-                                VideoConditionByKeyframeIndex(
-                                    keyframes=encoded_tile.cpu(),
-                                    frame_idx=0,
-                                    strength=refine_strength,
-                                )
-                            )
-                            del encoded_tile
-                            torch.cuda.empty_cache()
-
-                            enc_frame_idx += enc_tile_stride
-                            if enc_frame_idx >= valid_frames - 8:
-                                break
-
-                        chunk_shape = VideoPixelShape(
-                            batch=1,
-                            frames=valid_frames,
-                            width=stage_1_output_shape.width,
-                            height=stage_1_output_shape.height,
-                            fps=frame_rate,
-                        )
-
-                        # Create retry state for V2V sequential chunk denoising (fast defaults)
-                        chunk_retry_state = OOMRetryState(
-                            stage=f"stage1_v2v_seq_chunk{chunk_idx}",
-                            original_blocks=self.dit_blocks_in_memory if self.enable_dit_block_swap else 0,
-                            current_blocks=self.dit_blocks_in_memory if self.enable_dit_block_swap else 0,
-                            min_blocks=2,  # DiT minimum
-                            original_ffn_chunk_size=None,
-                            original_activation_offload=False,
-                            original_temporal_chunk_size=0,
-                        )
-
-                        chunk_denoising_kwargs = {
-                            'output_shape': chunk_shape,
-                            'conditionings': chunk_conditionings,
-                            'noiser': noiser,
-                            'sigmas': sigmas,
-                            'stepper': stepper,
-                            'denoising_loop_fn': first_stage_denoising_loop,
-                            'components': self.pipeline_components,
-                            'dtype': dtype,
-                            'device': self.device,
-                            'initial_audio_latent': None,
-                            'audio_conditionings': None,
-                            'audio_noise_scale': 1.0,
-                        }
-
-                        # Execute with OOM retry
-                        (chunk_video_state, chunk_audio_state), block_swap_manager = oom_retry_wrapper(
-                            retry_state=chunk_retry_state,
-                            denoising_fn=denoise_audio_video,
-                            transformer=transformer,
-                            generator_instance=self,
-                            block_swap_manager=block_swap_manager,
-                            seed=seed,
-                            **chunk_denoising_kwargs
-                        )
-
-                        chunk_latent = chunk_video_state.latent.cpu()
-
-                        if accumulated_latent is None:
-                            accumulated_latent = chunk_latent
-                        else:
-                            # CropGuides: clean concatenation - overlap handled by guide attention
-                            # Skip first overlap_latent frames of this chunk (already covered by previous)
-                            accumulated_latent = torch.cat([
-                                accumulated_latent,
-                                chunk_latent[:, :, overlap_latent:, :, :]
-                            ], dim=2)
-
-                        print(f">>> V2V Sequential: Chunk {chunk_idx+1} done (frames {frame_start}-{frame_end})")
-
-                        frame_start += stride
-                        chunk_idx += 1
-
-                    del video_tensor
-
-                    v2v_sequential_latent = accumulated_latent
-                    v2v_sequential_audio_state = chunk_audio_state if chunk_idx > 0 else None
-                    print(f">>> V2V Sequential: {chunk_idx} chunks processed in {time.time() - v2v_start:.1f}s")
-
-                else:
-                    # Two-stage V2V: Encode full video as initial latent for stage 1
-                    # This allows refine_strength to actually control preservation of input
-                    # Note: video_tensor is kept on CPU, chunks are moved to GPU one at a time
-                    print(f">>> V2V: Encoding {actual_frames} frames to latent space...")
-
-                    v2v_initial_latent = encode_video_chunked(
-                        video_tensor,
-                        video_encoder,
-                        chunk_frames=v2v_chunk_frames,
-                        device=self.device,
-                        dtype=dtype,
-                    )
-
-                    del video_tensor
-                    torch.cuda.empty_cache()
-
-                    print(f">>> V2V: Video encoded to latent shape {v2v_initial_latent.shape} in {time.time() - v2v_start:.1f}s")
+                print(f">>> V2V: Video encoded to latent shape {v2v_initial_latent.shape} in {time.time() - v2v_start:.1f}s")
 
                 # Extract and encode audio from input video based on v2v_audio_mode
                 # Skip if V2A mode is active (V2A will handle audio extraction)
@@ -4873,31 +4695,31 @@ class LTXVideoGeneratorWithOffloading:
         # Stage 1 conditioning is sufficient for establishing coherence.
 
         print(f">>> Stage 2: Refining at {stage_2_output_shape.width}x{stage_2_output_shape.height}...")
-        # For refine-only mode, use audio_latent from input video encoding
-        # For v2v mode, use v2v_audio_latent if available
-        # For normal generation, use audio_state.latent from stage 1
-        if self.refine_only and input_video:
+        # For refine-only mode with preserve: use audio_latent from input video encoding
+        # For v2v mode with preserve: use v2v_audio_latent
+        # For other modes (regenerate, condition, external): use audio_state.latent from denoising
+        if self.refine_only and input_video and v2v_audio_mode == "preserve" and audio_latent is not None:
             # Get expected audio shape for Stage 2
             from ltx_core.types import AudioLatentShape
             expected_audio_shape = AudioLatentShape.from_video_pixel_shape(stage_2_output_shape)
             expected_shape = expected_audio_shape.to_torch_shape()
 
-            if audio_latent is not None:
-                actual_shape = audio_latent.shape
-                if actual_shape != expected_shape:
-                    print(f">>> [Refine Audio] Shape mismatch: actual {actual_shape} vs expected {expected_shape}")
-                    # Pad or trim frames dimension (dim 2) to match expected
-                    actual_frames = actual_shape[2]
-                    expected_frames = expected_shape[2]
-                    if actual_frames < expected_frames:
-                        pad_frames = expected_frames - actual_frames
-                        audio_latent = torch.nn.functional.pad(audio_latent, (0, 0, 0, pad_frames))
-                        print(f">>> [Refine Audio] Padded audio latent by {pad_frames} frames")
-                    elif actual_frames > expected_frames:
-                        audio_latent = audio_latent[:, :, :expected_frames, :]
-                        print(f">>> [Refine Audio] Trimmed audio latent by {actual_frames - expected_frames} frames")
+            actual_shape = audio_latent.shape
+            if actual_shape != expected_shape:
+                print(f">>> [Refine Audio] Shape mismatch: actual {actual_shape} vs expected {expected_shape}")
+                # Pad or trim frames dimension (dim 2) to match expected
+                actual_frames = actual_shape[2]
+                expected_frames = expected_shape[2]
+                if actual_frames < expected_frames:
+                    pad_frames = expected_frames - actual_frames
+                    audio_latent = torch.nn.functional.pad(audio_latent, (0, 0, 0, pad_frames))
+                    print(f">>> [Refine Audio] Padded audio latent by {pad_frames} frames")
+                elif actual_frames > expected_frames:
+                    audio_latent = audio_latent[:, :, :expected_frames, :]
+                    print(f">>> [Refine Audio] Trimmed audio latent by {actual_frames - expected_frames} frames")
 
             stage_2_initial_audio = audio_latent
+            print(">>> Using preserved audio from input video (refine-only, v2v_audio_mode=preserve)")
         elif v2v_audio_latent is not None and v2v_audio_mode == "preserve":
             # Only use v2v_audio_latent directly when mode is "preserve"
             # For "condition" mode, audio was used as conditioning and denoised result is in audio_state
@@ -4934,6 +4756,12 @@ class LTXVideoGeneratorWithOffloading:
                     raise ValueError(f"Audio latent mel_bins mismatch: got {actual_mel}, expected {expected_mel}")
 
             stage_2_initial_audio = v2v_audio_latent
+        elif self.refine_only and input_video:
+            # Refine-only mode with non-preserve audio mode (regenerate/condition/external)
+            # Stage 1 was skipped, so audio_state doesn't exist
+            # Pass None to generate fresh audio in stage 2
+            stage_2_initial_audio = None
+            print(f">>> Refine-only mode: Audio will be generated fresh (v2v_audio_mode={v2v_audio_mode})")
         else:
             stage_2_initial_audio = audio_state.latent
 
