@@ -1485,6 +1485,9 @@ def generate_ltx_video(
     stg_scale: float,
     stg_blocks: str,
     stg_mode: str,
+    # Kandinsky scheduler parameters
+    kandinsky_scheduler: bool,
+    kandinsky_scheduler_scale: float,
     # Image conditioning (for I2V)
     input_image: str,
     image_frame_idx: int,
@@ -1503,12 +1506,12 @@ def generate_ltx_video(
     # Video input (for V2V / refine)
     input_video: str,
     refine_strength: float,
-    refine_steps: int,
-    refine_latent_stride: int,
     # Audio & prompt
     disable_audio: bool,
     audio_input: str,
     audio_strength: float,
+    v2v_audio_mode: str,
+    v2v_audio_strength: float,
     enhance_prompt: bool,
     # Memory optimization
     offload: bool,
@@ -1692,6 +1695,11 @@ def generate_ltx_video(
                     if block:
                         command.extend(["--stg-blocks", block])
 
+        # Kandinsky scheduler parameters
+        if kandinsky_scheduler:
+            command.append("--kandinsky-scheduler")
+            command.extend(["--kandinsky-scheduler-scale", str(float(kandinsky_scheduler_scale))])
+
         # Pipeline selection
         if is_one_stage:
             command.append("--one-stage")
@@ -1728,8 +1736,6 @@ def generate_ltx_video(
         if input_video:
             command.extend(["--input-video", str(input_video)])
             command.extend(["--refine-strength", str(float(refine_strength))])
-            command.extend(["--refine-steps", str(int(refine_steps))])
-            command.extend(["--refine-latent-stride", str(int(refine_latent_stride))])
 
         # Image conditioning (I2V) - with per-image CRF
         if mode == "i2v" and input_image:
@@ -1821,10 +1827,18 @@ def generate_ltx_video(
                         command.extend(["--stage2-lora", lora_path, str(user_lora_strength)])
                         command.extend(["--stage3-lora", lora_path, str(user_lora_strength)])
 
-        # Audio handling
+        # V2V Audio mode handling
+        if input_video:
+            command.extend(["--v2v-audio-mode", str(v2v_audio_mode)])
+            if v2v_audio_mode == "condition":
+                command.extend(["--v2v-audio-strength", str(float(v2v_audio_strength))])
+
+        # Audio handling (external audio file)
+        # Use external audio when: V2V mode is "external", or when not in V2V mode (T2V/I2V)
         if audio_input and os.path.exists(audio_input):
-            command.extend(["--audio", str(audio_input)])
-            command.extend(["--audio-strength", str(float(audio_strength))])
+            if not input_video or v2v_audio_mode == "external":
+                command.extend(["--audio", str(audio_input)])
+                command.extend(["--audio-strength", str(float(audio_strength))])
         elif disable_audio:
             command.append("--disable-audio")
 
@@ -2898,6 +2912,9 @@ def create_interface():
                             stg_scale = gr.Slider(minimum=0.0, maximum=2.0, value=0.0, step=0.1, label="STG Scale", info="Spatio-temporal guidance scale (0=disabled)")
                             stg_blocks = gr.Textbox(label="STG Blocks", value="29", info="Comma-separated block indices, e.g., 29 or 20,21,22")
                             stg_mode = gr.Dropdown(label="STG Mode", choices=["stg_av", "stg_v"], value="stg_av", info="stg_av=audio+video, stg_v=video only")
+                        with gr.Row():
+                            kandinsky_scheduler = gr.Checkbox(label="Kandinsky Scheduler", value=False, info="Front-loaded scheduler for better fast motion (recommended: 50+ steps)")
+                            kandinsky_scheduler_scale = gr.Slider(minimum=1.0, maximum=10.0, value=5.0, step=0.5, label="Kandinsky Scale", info="Higher = more motion focus (3-7 recommended)")
 
                         # Video Input (V2V / Refine)
                         with gr.Accordion("Video Input (V2V / Refine)", open=False) as v2v_section:
@@ -2913,17 +2930,6 @@ def create_interface():
                                     minimum=0.0, maximum=1.0, value=0.3, step=0.05,
                                     label="Refine Strength",
                                     info="Amount of noise to add before refinement (0=none, 1=full denoise)"
-                                )
-                                refine_steps = gr.Slider(
-                                    minimum=1, maximum=30, value=10, step=1,
-                                    label="Refine Steps",
-                                    info="Number of refinement denoising steps"
-                                )
-                            with gr.Row():
-                                refine_latent_stride = gr.Slider(
-                                    minimum=1, maximum=8, value=8, step=1,
-                                    label="Refine Latent Stride",
-                                    info="Condition every Nth frame in refine-only mode. Lower values (1-4) produce smoother video but use more VRAM."
                                 )
 
                         # Depth Control (IC-LoRA)
@@ -2966,7 +2972,22 @@ def create_interface():
 
                         # Audio Conditioning
                         with gr.Accordion("Audio Conditioning", open=False):
-                            gr.Markdown("Condition video generation on an audio file. Audio should match or exceed video duration.")
+                            gr.Markdown("Control audio handling for V2V mode and external audio conditioning.")
+                            # V2V Audio Mode (only relevant when input_video is provided)
+                            v2v_audio_mode = gr.Dropdown(
+                                choices=["preserve", "condition", "regenerate", "external"],
+                                value="preserve",
+                                label="V2V Audio Mode",
+                                info="preserve=lock original, condition=use as soft conditioning, regenerate=new audio, external=use file below"
+                            )
+                            v2v_audio_strength = gr.Slider(
+                                minimum=0.0, maximum=1.0, value=1.0, step=0.05,
+                                label="V2V Audio Strength",
+                                info="1.0 = frozen/exact, 0.0 = regenerate with guidance (only for 'condition' mode)",
+                                visible=False
+                            )
+                            gr.Markdown("---")
+                            gr.Markdown("**External Audio File** (used when V2V mode is 'external' or for T2V/I2V)")
                             audio_input = gr.Audio(
                                 label="Audio File",
                                 type="filepath",
@@ -3396,7 +3417,8 @@ Audio is synchronized with the video extension.
                     info_status = gr.Textbox(label="Status", interactive=False)
 
                 with gr.Row():
-                    info_send_btn = gr.Button("Send to Generation", variant="primary")
+                    info_send_to_v2v_btn = gr.Button("Send to V2V", variant="primary")
+                    info_send_btn = gr.Button("Send to Generation", variant="secondary")
                     info_send_to_ext_btn = gr.Button("Send to Extension", variant="secondary")
 
             # =================================================================
@@ -4272,6 +4294,13 @@ Audio is synchronized with the video extension.
             outputs=[i2v_section, v2v_section]
         )
 
+        # V2V Audio Mode change - show/hide V2V Audio Strength slider
+        v2v_audio_mode.change(
+            fn=lambda m: gr.update(visible=(m == "condition")),
+            inputs=[v2v_audio_mode],
+            outputs=[v2v_audio_strength]
+        )
+
         # Video input change - update dimensions and frame count
         input_video.change(
             fn=update_video_dimensions,
@@ -4295,11 +4324,12 @@ Audio is synchronized with the video extension.
                 mode, pipeline, sampler, stage2_sampler, enable_sliding_window, width, height, num_frames, frame_rate,
                 cfg_guidance_scale, num_inference_steps, stage2_steps, stage2_strength, stage3_strength, seed,
                 stg_scale, stg_blocks, stg_mode,
+                kandinsky_scheduler, kandinsky_scheduler_scale,
                 input_image, image_frame_idx, image_strength, image_crf,
                 end_image, end_image_strength, end_image_crf,
                 anchor_image, anchor_interval, anchor_strength, anchor_decay, anchor_crf,
-                input_video, refine_strength, refine_steps, refine_latent_stride,
-                disable_audio, audio_input, audio_strength, enhance_prompt,
+                input_video, refine_strength,
+                disable_audio, audio_input, audio_strength, v2v_audio_mode, v2v_audio_strength, enhance_prompt,
                 offload, enable_fp8,
                 enable_dit_block_swap, dit_blocks_in_memory,
                 enable_text_encoder_block_swap, text_encoder_blocks_in_memory,
@@ -4353,7 +4383,7 @@ Audio is synchronized with the video extension.
         def send_to_generation_handler(metadata, first_frame):
             """Send loaded metadata to generation tab parameters and switch to Generation tab."""
             if not metadata:
-                return [gr.update()] * 48 + ["No metadata loaded - upload a video first"]
+                return [gr.update()] * 46 + ["No metadata loaded - upload a video first"]
 
             # Handle legacy metadata that used single enable_block_swap
             legacy_block_swap = metadata.get("enable_block_swap", True)
@@ -4410,6 +4440,9 @@ Audio is synchronized with the video extension.
                 gr.update(value=metadata.get("stg_scale", 0.0)),  # stg_scale
                 gr.update(value=metadata.get("stg_blocks", "29")),  # stg_blocks
                 gr.update(value=metadata.get("stg_mode", "stg_av") or "stg_av"),  # stg_mode
+                # Kandinsky scheduler parameters
+                gr.update(value=metadata.get("kandinsky_scheduler", False)),  # kandinsky_scheduler
+                gr.update(value=metadata.get("kandinsky_scheduler_scale", 5.0)),  # kandinsky_scheduler_scale
                 # Image conditioning (extracted from images tuple)
                 gr.update(value=first_frame),  # input_image - use extracted first frame
                 gr.update(value=image_frame_idx),  # image_frame_idx
@@ -4424,11 +4457,11 @@ Audio is synchronized with the video extension.
                 gr.update(value=metadata.get("anchor_crf", 33)),  # anchor_crf
                 # Refine settings
                 gr.update(value=metadata.get("refine_strength", 0.3)),  # refine_strength
-                gr.update(value=metadata.get("refine_steps", 10)),  # refine_steps
-                gr.update(value=metadata.get("refine_latent_stride", 8)),  # refine_latent_stride
                 # Audio and prompt
                 gr.update(value=metadata.get("disable_audio", False)),  # disable_audio
                 gr.update(value=metadata.get("audio_strength", 1.0)),  # audio_strength
+                gr.update(value=metadata.get("v2v_audio_mode", "preserve")),  # v2v_audio_mode
+                gr.update(value=metadata.get("v2v_audio_strength", 1.0)),  # v2v_audio_strength
                 gr.update(value=metadata.get("enhance_prompt", False)),  # enhance_prompt
                 # Memory optimization
                 gr.update(value=metadata.get("offload", False)),  # offload
@@ -4444,6 +4477,24 @@ Audio is synchronized with the video extension.
                 gr.update(value=metadata.get("distilled_checkpoint", False)),  # distilled_checkpoint
                 # NOTE: stage2_checkpoint path is NOT restored - keep user's current setting
                 "Parameters sent to Generation tab (model paths unchanged)"  # status
+            ]
+
+        def send_to_v2v_handler(metadata, video_path):
+            """Send loaded video to V2V input in generation tab and switch to Generation tab."""
+            if not video_path:
+                return [gr.update()] * 8 + ["No video loaded - upload a video first"]
+
+            # Return updates for V2V mode
+            return [
+                gr.Tabs(selected="gen_tab"),  # Switch to Generation tab
+                gr.update(value=video_path),  # input_video - send to V2V input
+                gr.update(value="v2v"),  # mode - set to v2v
+                gr.update(value=metadata.get("prompt", "") if metadata else ""),  # prompt
+                gr.update(value=metadata.get("negative_prompt", "") if metadata else ""),  # negative_prompt
+                gr.update(value=metadata.get("seed", -1) if metadata else -1),  # seed
+                gr.update(value=metadata.get("refine_strength", 0.3) if metadata else 0.3),  # refine_strength
+                gr.update(value="preserve"),  # v2v_audio_mode - default to preserve
+                "Video sent to V2V input in Generation tab"  # status
             ]
 
         def send_to_extension_handler(metadata, video_path):
@@ -4471,14 +4522,16 @@ Audio is synchronized with the video extension.
                 cfg_guidance_scale, num_inference_steps, stage2_steps, stage2_strength, stage3_strength, seed,
                 # STG parameters
                 stg_scale, stg_blocks, stg_mode,
+                # Kandinsky scheduler parameters
+                kandinsky_scheduler, kandinsky_scheduler_scale,
                 # Image conditioning
                 input_image, image_frame_idx, image_strength, image_crf, end_image_strength, end_image_crf,
                 # Anchor conditioning
                 anchor_interval, anchor_strength, anchor_decay, anchor_crf,
                 # Refine settings
-                refine_strength, refine_steps, refine_latent_stride,
+                refine_strength,
                 # Audio and prompt
-                disable_audio, audio_strength, enhance_prompt,
+                disable_audio, audio_strength, v2v_audio_mode, v2v_audio_strength, enhance_prompt,
                 # Memory optimization
                 offload, enable_fp8,
                 # Block swap settings
@@ -4488,6 +4541,22 @@ Audio is synchronized with the video extension.
                 # Distilled settings
                 distilled_checkpoint,
                 info_status
+            ]
+        )
+
+        info_send_to_v2v_btn.click(
+            fn=send_to_v2v_handler,
+            inputs=[info_metadata_output, info_video_input],
+            outputs=[
+                tabs,  # Switch tab
+                input_video,  # V2V input video
+                mode,  # Set mode to v2v
+                prompt,  # Prompt
+                negative_prompt,  # Negative prompt
+                seed,  # Seed
+                refine_strength,  # Refine strength
+                v2v_audio_mode,  # Audio mode (preserve)
+                info_status  # Status
             ]
         )
 
@@ -4647,15 +4716,16 @@ Audio is synchronized with the video extension.
             mode, pipeline, sampler, stage2_sampler, width, height, num_frames, frame_rate,
             cfg_guidance_scale, num_inference_steps, stage2_steps, stage2_strength, stage3_strength, seed,
             stg_scale, stg_blocks, stg_mode,
+            kandinsky_scheduler, kandinsky_scheduler_scale,
             # Image conditioning (not input_image itself - that's a file upload)
             image_frame_idx, image_strength, image_crf,
             end_image_strength, end_image_crf,
             # Anchor conditioning
             anchor_interval, anchor_strength, anchor_decay, anchor_crf,
             # Refine settings
-            refine_strength, refine_steps, refine_latent_stride,
+            refine_strength,
             # Audio and prompt
-            disable_audio, audio_strength, enhance_prompt,
+            disable_audio, audio_strength, v2v_audio_mode, v2v_audio_strength, enhance_prompt,
             # Memory optimization
             offload, enable_fp8,
             enable_dit_block_swap, dit_blocks_in_memory,
@@ -4691,15 +4761,16 @@ Audio is synchronized with the video extension.
             "mode", "pipeline", "sampler", "stage2_sampler", "width", "height", "num_frames", "frame_rate",
             "cfg_guidance_scale", "num_inference_steps", "stage2_steps", "stage2_strength", "stage3_strength", "seed",
             "stg_scale", "stg_blocks", "stg_mode",
+            "kandinsky_scheduler", "kandinsky_scheduler_scale",
             # Image conditioning
             "image_frame_idx", "image_strength", "image_crf",
             "end_image_strength", "end_image_crf",
             # Anchor conditioning
             "anchor_interval", "anchor_strength", "anchor_decay", "anchor_crf",
             # Refine settings
-            "refine_strength", "refine_steps", "refine_latent_stride",
+            "refine_strength",
             # Audio and prompt
-            "disable_audio", "audio_strength", "enhance_prompt",
+            "disable_audio", "audio_strength", "v2v_audio_mode", "v2v_audio_strength", "enhance_prompt",
             # Memory optimization
             "offload", "enable_fp8",
             "enable_dit_block_swap", "dit_blocks_in_memory",

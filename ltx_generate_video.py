@@ -1982,6 +1982,25 @@ Examples:
         help="STG mode: 'stg_av' perturbs both audio and video self-attention, "
              "'stg_v' perturbs video only. (default: stg_av)",
     )
+    gen_group.add_argument(
+        "--kandinsky-scheduler",
+        action="store_true",
+        default=False,
+        help="Use Kandinsky-style front-loaded scheduler instead of LTX2Scheduler. "
+             "Better for fast motion but may reduce fine detail quality. "
+             "Recommended with 50+ steps and --kandinsky-scheduler-scale 5.0. "
+             "(default: False, uses LTX2Scheduler)",
+    )
+    gen_group.add_argument(
+        "--kandinsky-scheduler-scale",
+        type=float,
+        default=5.0,
+        help="Scheduler scale for Kandinsky-style front-loading. Higher values concentrate "
+             "more steps in the high-noise region (better structure/motion), lower values "
+             "concentrate steps in low-noise region (better details). "
+             "Recommended: 3.0-7.0. Only used when --kandinsky-scheduler is enabled. "
+             "(default: 5.0)",
+    )
 
     # ==========================================================================
     # Image Conditioning (I2V)
@@ -2271,6 +2290,22 @@ Examples:
         type=int,
         default=8,
         help="Condition every Nth frame in refine-only mode. Lower values (1-4) produce smoother video but use more VRAM. Default: 8",
+    )
+    v2v_group.add_argument(
+        "--v2v-audio-mode",
+        type=str,
+        choices=["preserve", "condition", "regenerate", "external"],
+        default="preserve",
+        help="How to handle audio from input video in V2V mode. "
+             "'preserve'=keep original audio exactly, 'condition'=use as conditioning with strength, "
+             "'regenerate'=generate new audio, 'external'=use --audio file instead. Default: preserve",
+    )
+    v2v_group.add_argument(
+        "--v2v-audio-strength",
+        type=float,
+        default=1.0,
+        help="Audio conditioning strength when v2v-audio-mode is 'condition'. "
+             "1.0=frozen/exact, 0.0=regenerate with guidance. Default: 1.0",
     )
 
     # ==========================================================================
@@ -3236,11 +3271,17 @@ class LTXVideoGeneratorWithOffloading:
         v2v_chunk_frames: int = 121,
         v2v_overlap_frames: int = 24,
         refine_latent_stride: int = 8,
+        # V2V Audio control
+        v2v_audio_mode: str = "preserve",
+        v2v_audio_strength: float = 1.0,
         # Sampler selection
         sampler: str = "euler",
         stage2_sampler: str = "euler",
         # Stage 3 parameters
         stage3_steps: int = 3,
+        # Kandinsky scheduler parameters
+        kandinsky_scheduler: bool = False,
+        kandinsky_scheduler_scale: float = 5.0,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor | None, str | None]:
         """
         Generate video with optional audio.
@@ -3384,9 +3425,11 @@ class LTXVideoGeneratorWithOffloading:
             print(f">>> Video encoded to latent shape {upscaled_video_latent.shape}")
 
             # Extract and encode audio from input video (like stage 1 would)
+            # Only extract if v2v_audio_mode is "preserve" - for other modes, audio will be
+            # regenerated or handled differently
             audio_latent = None
-            if not disable_audio:
-                print(">>> Encoding audio from input video...")
+            if not disable_audio and v2v_audio_mode == "preserve":
+                print(">>> Encoding audio from input video (v2v_audio_mode=preserve)...")
 
                 # Extract audio waveform from input video
                 waveform, sample_rate = decode_audio_from_file(input_video, self.device)
@@ -3600,11 +3643,17 @@ class LTXVideoGeneratorWithOffloading:
 
             # Create diffusion schedule
             # Both distilled and standard checkpoints use configurable LTX2Scheduler
-            sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(
-                dtype=torch.float32, device=self.device
-            )
-
-            print(f">>> Using {num_inference_steps} inference steps")
+            if kandinsky_scheduler:
+                # Kandinsky-style front-loaded scheduler for better fast motion
+                timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=self.device, dtype=torch.float32)
+                scale = kandinsky_scheduler_scale
+                sigmas = scale * timesteps / (1.0 + (scale - 1.0) * timesteps)
+                print(f">>> Using {num_inference_steps} inference steps with Kandinsky scheduler (scale={scale})")
+            else:
+                sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(
+                    dtype=torch.float32, device=self.device
+                )
+                print(f">>> Using {num_inference_steps} inference steps")
 
             # Move text embeddings to GPU for stage 1 denoising
             v_context_p = v_context_p.to(self.device)
@@ -3755,254 +3804,90 @@ class LTXVideoGeneratorWithOffloading:
 
                 actual_frames = video_tensor.shape[2]
 
-                if self.one_stage:
-                    chunk_size = v2v_chunk_frames
-                    overlap_pixels = v2v_overlap_frames
-                    overlap_latent = overlap_pixels // 8
-                    stride = chunk_size - overlap_pixels
+                # V2V: Encode full video as initial latent for stage 1
+                # This allows refine_strength to control preservation of input
+                # Note: video_tensor is kept on CPU, chunks are moved to GPU one at a time
+                print(f">>> V2V: Encoding {actual_frames} frames to latent space...")
 
-                    enc_tile_size = 17
-                    enc_tile_overlap = 8
-                    enc_tile_stride = enc_tile_size - enc_tile_overlap
+                v2v_initial_latent = encode_video_chunked(
+                    video_tensor,
+                    video_encoder,
+                    chunk_frames=v2v_chunk_frames,
+                    device=self.device,
+                    dtype=dtype,
+                )
 
-                    print(f">>> V2V Sequential: {actual_frames} frames, chunk={chunk_size}, overlap={overlap_pixels}")
+                del video_tensor
+                torch.cuda.empty_cache()
 
-                    accumulated_latent = None
-                    frame_start = 0
-                    chunk_idx = 0
+                print(f">>> V2V: Video encoded to latent shape {v2v_initial_latent.shape} in {time.time() - v2v_start:.1f}s")
 
-                    while frame_start < actual_frames:
-                        frame_end = min(frame_start + chunk_size, actual_frames)
-                        valid_frames = ((frame_end - frame_start - 1) // 8) * 8 + 1
-                        if valid_frames < 9:
-                            break
-                        frame_end = frame_start + valid_frames
-
-                        chunk_latent_frames = (valid_frames - 1) // 8 + 1
-                        min_chunk_latent = overlap_latent + 1
-                        if chunk_idx > 0 and chunk_latent_frames < min_chunk_latent:
-                            needed_frames = (min_chunk_latent - 1) * 8 + 1
-                            frame_start = frame_end - needed_frames
-                            if frame_start < 0:
-                                break
-                            valid_frames = needed_frames
-                            chunk_latent_frames = min_chunk_latent
-
-                        chunk_conditionings = list(stage_1_conditionings)
-
-                        if chunk_idx > 0:
-                            # CropGuides pattern: append guide latents as surplus tokens
-                            # These influence attention but are cropped by clear_conditioning() after denoising
-                            guide_latent = accumulated_latent[:, :, -overlap_latent:, :, :].to(self.device)
-                            chunk_conditionings.append(
-                                VideoConditionByGuideLatent(
-                                    latent=guide_latent,
-                                    frame_idx=0,  # Position at start of chunk for continuity
-                                    strength=0.98,  # High preservation (2% denoising freedom)
-                                )
-                            )
-
-                        # Middle frame guide for longer chunks (improves temporal coherence)
-                        if chunk_latent_frames > 8:  # More than 64 pixel frames
-                            mid_pixel = valid_frames // 2
-                            # Encode 9 frames around the middle (produces 1 latent frame)
-                            mid_start = max(0, mid_pixel - 4)
-                            mid_end = min(valid_frames, mid_start + 9)
-                            mid_start = max(0, mid_end - 9)  # Adjust if near end
-
-                            if mid_end - mid_start >= 9:
-                                mid_tile = video_tensor[:, :, frame_start + mid_start:frame_start + mid_end, :, :].to(device=self.device, dtype=dtype)
-                                with torch.no_grad():
-                                    mid_encoded = video_encoder(mid_tile)
-                                del mid_tile
-                                torch.cuda.empty_cache()
-
-                                chunk_conditionings.append(
-                                    VideoConditionByGuideLatent(
-                                        latent=mid_encoded.cpu(),
-                                        frame_idx=mid_start,  # Position at middle of chunk
-                                        strength=0.95,  # Slightly lower than overlap guide
-                                    )
-                                )
-                                del mid_encoded
-                                torch.cuda.empty_cache()
-
-                        enc_frame_idx = 0
-                        while enc_frame_idx < valid_frames:
-                            enc_end = min(enc_frame_idx + enc_tile_size, valid_frames)
-                            enc_tile_frames = enc_end - enc_frame_idx
-                            enc_valid = ((enc_tile_frames - 1) // 8) * 8 + 1
-                            if enc_valid < 9:
-                                break
-                            enc_end = enc_frame_idx + enc_valid
-
-                            tile = video_tensor[:, :, frame_start + enc_frame_idx:frame_start + enc_end, :, :].to(device=self.device, dtype=dtype)
-                            with torch.no_grad():
-                                encoded_tile = video_encoder(tile)
-                            del tile
-                            torch.cuda.empty_cache()
-
-                            cond_frame_idx = enc_frame_idx
-                            if chunk_idx > 0 and enc_frame_idx < overlap_pixels:
-                                cond_frame_idx = overlap_pixels
-                                skip_latent = overlap_latent
-                                encoded_tile = encoded_tile[:, :, skip_latent:, :, :]
-                                if encoded_tile.shape[2] == 0:
-                                    del encoded_tile
-                                    enc_frame_idx += enc_tile_stride
-                                    continue
-
-                            chunk_conditionings.append(
-                                VideoConditionByKeyframeIndex(
-                                    keyframes=encoded_tile.cpu(),
-                                    frame_idx=0,
-                                    strength=refine_strength,
-                                )
-                            )
-                            del encoded_tile
-                            torch.cuda.empty_cache()
-
-                            enc_frame_idx += enc_tile_stride
-                            if enc_frame_idx >= valid_frames - 8:
-                                break
-
-                        chunk_shape = VideoPixelShape(
-                            batch=1,
-                            frames=valid_frames,
-                            width=stage_1_output_shape.width,
-                            height=stage_1_output_shape.height,
-                            fps=frame_rate,
-                        )
-
-                        # Create retry state for V2V sequential chunk denoising (fast defaults)
-                        chunk_retry_state = OOMRetryState(
-                            stage=f"stage1_v2v_seq_chunk{chunk_idx}",
-                            original_blocks=self.dit_blocks_in_memory if self.enable_dit_block_swap else 0,
-                            current_blocks=self.dit_blocks_in_memory if self.enable_dit_block_swap else 0,
-                            min_blocks=2,  # DiT minimum
-                            original_ffn_chunk_size=None,
-                            original_activation_offload=False,
-                            original_temporal_chunk_size=0,
-                        )
-
-                        chunk_denoising_kwargs = {
-                            'output_shape': chunk_shape,
-                            'conditionings': chunk_conditionings,
-                            'noiser': noiser,
-                            'sigmas': sigmas,
-                            'stepper': stepper,
-                            'denoising_loop_fn': first_stage_denoising_loop,
-                            'components': self.pipeline_components,
-                            'dtype': dtype,
-                            'device': self.device,
-                            'initial_audio_latent': None,
-                            'audio_conditionings': None,
-                            'audio_noise_scale': 1.0,
-                        }
-
-                        # Execute with OOM retry
-                        (chunk_video_state, chunk_audio_state), block_swap_manager = oom_retry_wrapper(
-                            retry_state=chunk_retry_state,
-                            denoising_fn=denoise_audio_video,
-                            transformer=transformer,
-                            generator_instance=self,
-                            block_swap_manager=block_swap_manager,
-                            seed=seed,
-                            **chunk_denoising_kwargs
-                        )
-
-                        chunk_latent = chunk_video_state.latent.cpu()
-
-                        if accumulated_latent is None:
-                            accumulated_latent = chunk_latent
-                        else:
-                            # CropGuides: clean concatenation - overlap handled by guide attention
-                            # Skip first overlap_latent frames of this chunk (already covered by previous)
-                            accumulated_latent = torch.cat([
-                                accumulated_latent,
-                                chunk_latent[:, :, overlap_latent:, :, :]
-                            ], dim=2)
-
-                        print(f">>> V2V Sequential: Chunk {chunk_idx+1} done (frames {frame_start}-{frame_end})")
-
-                        frame_start += stride
-                        chunk_idx += 1
-
-                    del video_tensor
-
-                    v2v_sequential_latent = accumulated_latent
-                    v2v_sequential_audio_state = chunk_audio_state if chunk_idx > 0 else None
-                    print(f">>> V2V Sequential: {chunk_idx} chunks processed in {time.time() - v2v_start:.1f}s")
-
-                else:
-                    # Two-stage V2V: Encode full video as initial latent for stage 1
-                    # This allows refine_strength to actually control preservation of input
-                    # Note: video_tensor is kept on CPU, chunks are moved to GPU one at a time
-                    print(f">>> V2V: Encoding {actual_frames} frames to latent space...")
-
-                    v2v_initial_latent = encode_video_chunked(
-                        video_tensor,
-                        video_encoder,
-                        chunk_frames=v2v_chunk_frames,
-                        device=self.device,
-                        dtype=dtype,
-                    )
-
-                    del video_tensor
-                    torch.cuda.empty_cache()
-
-                    print(f">>> V2V: Video encoded to latent shape {v2v_initial_latent.shape} in {time.time() - v2v_start:.1f}s")
-
-                # Extract and encode audio from input video to preserve it
+                # Extract and encode audio from input video based on v2v_audio_mode
                 # Skip if V2A mode is active (V2A will handle audio extraction)
+                v2v_audio_as_conditioning = False
                 if not disable_audio and not v2a_mode:
-                    print(">>> V2V: Extracting audio from input video...")
-                    waveform, sample_rate = decode_audio_from_file(input_video, self.device)
+                    if v2v_audio_mode in ("preserve", "condition"):
+                        mode_label = "preserve" if v2v_audio_mode == "preserve" else f"condition (strength={v2v_audio_strength})"
+                        print(f">>> V2V: Extracting audio from input video ({mode_label})...")
+                        waveform, sample_rate = decode_audio_from_file(input_video, self.device)
 
-                    if waveform is not None:
-                        # Calculate expected audio duration and trim/pad waveform to match
-                        expected_duration = float(num_frames) / float(frame_rate)
-                        expected_samples = int(expected_duration * sample_rate)
+                        if waveform is not None:
+                            # Calculate expected audio duration and trim/pad waveform to match
+                            expected_duration = float(num_frames) / float(frame_rate)
+                            expected_samples = int(expected_duration * sample_rate)
 
-                        # Trim waveform if longer than expected
-                        if waveform.shape[-1] > expected_samples:
-                            waveform = waveform[..., :expected_samples]
-                            print(f">>> V2V: Trimmed audio to {expected_samples} samples ({expected_duration:.3f}s)")
-                        elif waveform.shape[-1] < expected_samples:
-                            # Pad waveform if shorter than expected
-                            padding = expected_samples - waveform.shape[-1]
-                            waveform = torch.nn.functional.pad(waveform, (0, padding))
-                            print(f">>> V2V: Padded audio by {padding} samples to {expected_samples} total ({expected_duration:.3f}s)")
+                            # Trim waveform if longer than expected
+                            if waveform.shape[-1] > expected_samples:
+                                waveform = waveform[..., :expected_samples]
+                                print(f">>> V2V: Trimmed audio to {expected_samples} samples ({expected_duration:.3f}s)")
+                            elif waveform.shape[-1] < expected_samples:
+                                # Pad waveform if shorter than expected
+                                padding = expected_samples - waveform.shape[-1]
+                                waveform = torch.nn.functional.pad(waveform, (0, padding))
+                                print(f">>> V2V: Padded audio by {padding} samples to {expected_samples} total ({expected_duration:.3f}s)")
 
-                        audio_encoder = self.stage_1_model_ledger.audio_encoder()
+                            audio_encoder = self.stage_1_model_ledger.audio_encoder()
 
-                        audio_processor = AudioProcessor(
-                            sample_rate=audio_encoder.sample_rate,
-                            mel_bins=audio_encoder.mel_bins,
-                            mel_hop_length=audio_encoder.mel_hop_length,
-                            n_fft=audio_encoder.n_fft,
-                        ).to(self.device)
+                            audio_processor = AudioProcessor(
+                                sample_rate=audio_encoder.sample_rate,
+                                mel_bins=audio_encoder.mel_bins,
+                                mel_hop_length=audio_encoder.mel_hop_length,
+                                n_fft=audio_encoder.n_fft,
+                            ).to(self.device)
 
-                        if waveform.dim() == 3:
-                            num_frames_audio, channels, samples_per_frame = waveform.shape
-                            waveform = waveform.permute(1, 0, 2).reshape(channels, -1).unsqueeze(0)
-                        elif waveform.dim() == 2:
-                            waveform = waveform.unsqueeze(0)
+                            if waveform.dim() == 3:
+                                num_frames_audio, channels, samples_per_frame = waveform.shape
+                                waveform = waveform.permute(1, 0, 2).reshape(channels, -1).unsqueeze(0)
+                            elif waveform.dim() == 2:
+                                waveform = waveform.unsqueeze(0)
 
-                        mel_spectrogram = audio_processor.waveform_to_mel(
-                            waveform.to(dtype=torch.float32),
-                            waveform_sample_rate=sample_rate
-                        )
+                            mel_spectrogram = audio_processor.waveform_to_mel(
+                                waveform.to(dtype=torch.float32),
+                                waveform_sample_rate=sample_rate
+                            )
 
-                        v2v_audio_latent = audio_encoder(mel_spectrogram.to(dtype=torch.float32))
-                        v2v_audio_latent = v2v_audio_latent.to(dtype=dtype)
+                            v2v_audio_latent = audio_encoder(mel_spectrogram.to(dtype=torch.float32))
+                            v2v_audio_latent = v2v_audio_latent.to(dtype=dtype)
 
-                        del audio_encoder, audio_processor
-                        cleanup_memory()
-                        print(">>> V2V: Audio extracted and encoded successfully")
-                    else:
+                            del audio_encoder, audio_processor
+                            cleanup_memory()
+                            print(">>> V2V: Audio extracted and encoded successfully")
+
+                            # Mark for conditioning mode if applicable
+                            if v2v_audio_mode == "condition":
+                                v2v_audio_as_conditioning = True
+                        else:
+                            v2v_audio_latent = None
+                            print(">>> V2V: Input video has no audio track")
+                    elif v2v_audio_mode == "regenerate":
                         v2v_audio_latent = None
-                        print(">>> V2V: Input video has no audio track")
+                        print(">>> V2V: Audio will be regenerated (not preserving input audio)")
+                    elif v2v_audio_mode == "external":
+                        v2v_audio_latent = None
+                        if audio is not None:
+                            print(">>> V2V: Using external audio file instead of input video audio")
+                        else:
+                            print(">>> V2V: External audio mode but no audio file provided, will regenerate")
                 else:
                     v2v_audio_latent = None
 
@@ -4200,6 +4085,17 @@ class LTXVideoGeneratorWithOffloading:
                 else:
                     print(">>> Warning: Could not load audio file")
 
+            # Add V2V audio as conditioning when mode is "condition"
+            if v2v_audio_latent is not None and v2v_audio_as_conditioning:
+                from ltx_core.conditioning import AudioConditionByLatent
+                audio_conditionings.append(
+                    AudioConditionByLatent(
+                        latent=v2v_audio_latent,
+                        strength=v2v_audio_strength,
+                    )
+                )
+                print(f">>> V2V: Audio added as conditioning with strength {v2v_audio_strength}")
+
             stage_label = "One-stage" if self.one_stage else "Stage 1"
 
             if v2v_sequential_latent is not None:
@@ -4368,9 +4264,12 @@ class LTXVideoGeneratorWithOffloading:
                     synchronize_and_cleanup()
                     phase_barrier("video_decoding_one_stage")
 
-                # Skip audio VAE decode when audio_strength == 1.0 (frozen audio)
-                # to avoid corruption - original audio will be concatenated via ffmpeg
-                if not disable_audio and not (audio is not None and audio_strength == 1.0):
+                # Skip audio VAE decode when:
+                # - audio_strength == 1.0 (frozen external audio)
+                # - v2v_audio_mode == "preserve" (copy audio from input video)
+                skip_for_external_audio = audio is not None and audio_strength == 1.0
+                skip_for_v2v_preserve = input_video and v2v_audio_mode == "preserve"
+                if not disable_audio and not skip_for_external_audio and not skip_for_v2v_preserve:
                     print(">>> Decoding audio...")
                     audio_decoder = self.stage_1_model_ledger.audio_decoder()
                     vocoder = self.stage_1_model_ledger.vocoder()
@@ -4383,8 +4282,11 @@ class LTXVideoGeneratorWithOffloading:
                     vocoder.to("cpu")
                     del audio_decoder, vocoder
                     synchronize_and_cleanup()
-                elif audio is not None and audio_strength == 1.0:
+                elif skip_for_external_audio:
                     print(">>> Skipping audio VAE decode (audio_strength=1.0, will use original audio)")
+                    decoded_audio = None
+                elif skip_for_v2v_preserve:
+                    print(">>> Skipping audio VAE decode (v2v_audio_mode=preserve, will copy from input video)")
                     decoded_audio = None
                 else:
                     decoded_audio = None
@@ -4571,18 +4473,28 @@ class LTXVideoGeneratorWithOffloading:
         # For normal two-stage, use stage2_steps (default 3)
         if self.refine_only and input_video:
             # Generate base sigma schedule (1.0 to 0.0)
-            base_sigmas = LTX2Scheduler().execute(steps=refine_steps).to(
-                dtype=torch.float32, device=self.device
-            )
+            if kandinsky_scheduler:
+                timesteps = torch.linspace(1.0, 0.0, refine_steps + 1, device=self.device, dtype=torch.float32)
+                scale = kandinsky_scheduler_scale
+                base_sigmas = scale * timesteps / (1.0 + (scale - 1.0) * timesteps)
+            else:
+                base_sigmas = LTX2Scheduler().execute(steps=refine_steps).to(
+                    dtype=torch.float32, device=self.device
+                )
             # Scale sigmas by refine_strength so they start from refine_strength instead of 1.0
             # This preserves (1 - refine_strength) of the input content
             distilled_sigmas = base_sigmas * refine_strength
             print(f">>> Using {refine_steps} refinement steps with strength {refine_strength}")
         elif self.pipeline_mode == "linear":
             # Linear mode: Stage 2 uses SAME schedule as Stage 1 (full denoising)
-            distilled_sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(
-                dtype=torch.float32, device=self.device
-            )
+            if kandinsky_scheduler:
+                timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=self.device, dtype=torch.float32)
+                scale = kandinsky_scheduler_scale
+                distilled_sigmas = scale * timesteps / (1.0 + (scale - 1.0) * timesteps)
+            else:
+                distilled_sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(
+                    dtype=torch.float32, device=self.device
+                )
             print(f">>> Linear mode Stage 2: using {num_inference_steps} steps (same as Stage 1)")
         else:
             # Exponential mode: use pre-tuned sigma values for refinement with distilled LoRA
@@ -4821,39 +4733,41 @@ class LTXVideoGeneratorWithOffloading:
         # Stage 1 conditioning is sufficient for establishing coherence.
 
         print(f">>> Stage 2: Refining at {stage_2_output_shape.width}x{stage_2_output_shape.height}...")
-        # For refine-only mode, use audio_latent from input video encoding
-        # For v2v mode, use v2v_audio_latent if available
-        # For normal generation, use audio_state.latent from stage 1
-        if self.refine_only and input_video:
+        # For refine-only mode with preserve: use audio_latent from input video encoding
+        # For v2v mode with preserve: use v2v_audio_latent
+        # For other modes (regenerate, condition, external): use audio_state.latent from denoising
+        if self.refine_only and input_video and v2v_audio_mode == "preserve" and audio_latent is not None:
             # Get expected audio shape for Stage 2
             from ltx_core.types import AudioLatentShape
             expected_audio_shape = AudioLatentShape.from_video_pixel_shape(stage_2_output_shape)
             expected_shape = expected_audio_shape.to_torch_shape()
 
-            if audio_latent is not None:
-                actual_shape = audio_latent.shape
-                if actual_shape != expected_shape:
-                    print(f">>> [Refine Audio] Shape mismatch: actual {actual_shape} vs expected {expected_shape}")
-                    # Pad or trim frames dimension (dim 2) to match expected
-                    actual_frames = actual_shape[2]
-                    expected_frames = expected_shape[2]
-                    if actual_frames < expected_frames:
-                        pad_frames = expected_frames - actual_frames
-                        audio_latent = torch.nn.functional.pad(audio_latent, (0, 0, 0, pad_frames))
-                        print(f">>> [Refine Audio] Padded audio latent by {pad_frames} frames")
-                    elif actual_frames > expected_frames:
-                        audio_latent = audio_latent[:, :, :expected_frames, :]
-                        print(f">>> [Refine Audio] Trimmed audio latent by {actual_frames - expected_frames} frames")
+            actual_shape = audio_latent.shape
+            if actual_shape != expected_shape:
+                print(f">>> [Refine Audio] Shape mismatch: actual {actual_shape} vs expected {expected_shape}")
+                # Pad or trim frames dimension (dim 2) to match expected
+                actual_frames = actual_shape[2]
+                expected_frames = expected_shape[2]
+                if actual_frames < expected_frames:
+                    pad_frames = expected_frames - actual_frames
+                    audio_latent = torch.nn.functional.pad(audio_latent, (0, 0, 0, pad_frames))
+                    print(f">>> [Refine Audio] Padded audio latent by {pad_frames} frames")
+                elif actual_frames > expected_frames:
+                    audio_latent = audio_latent[:, :, :expected_frames, :]
+                    print(f">>> [Refine Audio] Trimmed audio latent by {actual_frames - expected_frames} frames")
 
             stage_2_initial_audio = audio_latent
-        elif v2v_audio_latent is not None:
+            print(">>> Using preserved audio from input video (refine-only, v2v_audio_mode=preserve)")
+        elif v2v_audio_latent is not None and v2v_audio_mode == "preserve":
+            # Only use v2v_audio_latent directly when mode is "preserve"
+            # For "condition" mode, audio was used as conditioning and denoised result is in audio_state
             # Get expected audio shape for Stage 2
             from ltx_core.types import AudioLatentShape
             expected_audio_shape = AudioLatentShape.from_video_pixel_shape(stage_2_output_shape)
             expected_shape = expected_audio_shape.to_torch_shape()
             actual_shape = v2v_audio_latent.shape
 
-            print(">>> Using audio from input video")
+            print(">>> Using preserved audio from input video (v2v_audio_mode=preserve)")
 
             # Check if shapes match and fix if needed
             if actual_shape != expected_shape:
@@ -4880,6 +4794,12 @@ class LTXVideoGeneratorWithOffloading:
                     raise ValueError(f"Audio latent mel_bins mismatch: got {actual_mel}, expected {expected_mel}")
 
             stage_2_initial_audio = v2v_audio_latent
+        elif self.refine_only and input_video:
+            # Refine-only mode with non-preserve audio mode (regenerate/condition/external)
+            # Stage 1 was skipped, so audio_state doesn't exist
+            # Pass None to generate fresh audio in stage 2
+            stage_2_initial_audio = None
+            print(f">>> Refine-only mode: Audio will be generated fresh (v2v_audio_mode={v2v_audio_mode})")
         else:
             stage_2_initial_audio = audio_state.latent
 
@@ -5125,9 +5045,14 @@ class LTXVideoGeneratorWithOffloading:
             # Generate sigma schedule for stage 3
             if self.pipeline_mode == "linear":
                 # Linear mode: Stage 3 uses SAME schedule as Stage 1 (full denoising)
-                stage3_sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(
-                    dtype=torch.float32, device=self.device
-                )
+                if kandinsky_scheduler:
+                    timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=self.device, dtype=torch.float32)
+                    scale = kandinsky_scheduler_scale
+                    stage3_sigmas = scale * timesteps / (1.0 + (scale - 1.0) * timesteps)
+                else:
+                    stage3_sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(
+                        dtype=torch.float32, device=self.device
+                    )
                 print(f">>> Linear mode Stage 3: using {num_inference_steps} steps (same as Stage 1)")
             elif stage3_steps == 3:
                 # Exponential mode: use refinement schedule
@@ -5323,9 +5248,12 @@ class LTXVideoGeneratorWithOffloading:
             synchronize_and_cleanup()
             phase_barrier("video_decoding_two_stage")
 
-        # Skip audio VAE decode when audio_strength == 1.0 (frozen audio)
-        # to avoid corruption - original audio will be concatenated via ffmpeg
-        if not disable_audio and not (audio is not None and audio_strength == 1.0):
+        # Skip audio VAE decode when:
+        # - audio_strength == 1.0 (frozen external audio)
+        # - v2v_audio_mode == "preserve" (copy audio from input video)
+        skip_for_external_audio = audio is not None and audio_strength == 1.0
+        skip_for_v2v_preserve = input_video and v2v_audio_mode == "preserve"
+        if not disable_audio and not skip_for_external_audio and not skip_for_v2v_preserve:
             print(">>> Decoding audio...")
             audio_decoder = self.stage_2_model_ledger.audio_decoder()
             vocoder = self.stage_2_model_ledger.vocoder()
@@ -5338,8 +5266,11 @@ class LTXVideoGeneratorWithOffloading:
             vocoder.to("cpu")
             del audio_decoder, vocoder
             synchronize_and_cleanup()
-        elif audio is not None and audio_strength == 1.0:
+        elif skip_for_external_audio:
             print(">>> Skipping audio VAE decode (audio_strength=1.0, will use original audio)")
+            decoded_audio = None
+        elif skip_for_v2v_preserve:
+            print(">>> Skipping audio VAE decode (v2v_audio_mode=preserve, will copy from input video)")
             decoded_audio = None
         else:
             decoded_audio = None
@@ -5510,6 +5441,9 @@ def generate_svi_multi_clip(
                 stage2_sampler=args.stage2_sampler,
                 # Stage 3 parameters
                 stage3_steps=args.stage3_steps,
+                # Kandinsky scheduler parameters
+                kandinsky_scheduler=args.kandinsky_scheduler,
+                kandinsky_scheduler_scale=args.kandinsky_scheduler_scale,
             )
 
             # Collect video frames from iterator - move to CPU immediately to save GPU memory
@@ -5830,29 +5764,7 @@ def generate_av_extension(
     skip_stage2: bool = False,
     latent_norm_fn: Callable | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """
-    Extend a video using time-based audio-video masking.
 
-    This implements the LTXVSetAudioVideoMaskByTime approach from ComfyUI-LTXVideo:
-    1. Load and encode input video and audio to latent space
-    2. Create noise masks based on time windows (preserve before start_time, generate after)
-    3. Run masked denoising to generate new content while preserving original
-    4. Decode and return the extended video
-
-    Args:
-        generator: LTXVideoGeneratorWithOffloading instance
-        args: Command line arguments
-        input_video_path: Path to video to extend
-        start_time: Time (seconds) to start generating new content (default: end of video)
-        end_time: Time (seconds) to stop generation (default: start_time + 5)
-        extend_steps: Number of denoising steps for extension
-        terminal: Terminal sigma for partial denoising (smaller = smoother continuation)
-        slope_len: Transition length at mask boundaries
-        skip_stage2: Whether to skip stage 2 refinement
-
-    Returns:
-        Tuple of (video_tensor [F, H, W, C], audio_tensor or None)
-    """
     import cv2
     from dataclasses import replace as dataclass_replace
     from ltx_core.types import LatentState, VideoPixelShape
@@ -6356,12 +6268,18 @@ def generate_av_extension(
     else:
         transformer = generator.stage_1_model_ledger.transformer()
 
-    sigmas = LTX2Scheduler().execute(
-        steps=extend_steps,
-        latent=extended_video_latent,
-        terminal=terminal,
-        stretch=True,
-    ).to(dtype=torch.float32, device=device)
+    if args.kandinsky_scheduler:
+        # Kandinsky-style front-loaded scheduler for better fast motion
+        timesteps = torch.linspace(1.0, 0.0, extend_steps + 1, device=device, dtype=torch.float32)
+        scale = args.kandinsky_scheduler_scale
+        sigmas = scale * timesteps / (1.0 + (scale - 1.0) * timesteps)
+    else:
+        sigmas = LTX2Scheduler().execute(
+            steps=extend_steps,
+            latent=extended_video_latent,
+            terminal=terminal,
+            stretch=True,
+        ).to(dtype=torch.float32, device=device)
 
     # Initialize diffusion components
     generator_torch = torch.Generator(device=device).manual_seed(args.seed)
@@ -7773,12 +7691,18 @@ def generate_v2v_join(
         transformer = generator.stage_1_model_ledger.transformer()
 
     # Create sigmas schedule
-    sigmas = LTX2Scheduler().execute(
-        steps=extend_steps,
-        latent=video_latent,
-        terminal=terminal,
-        stretch=True,
-    ).to(dtype=torch.float32, device=device)
+    if args.kandinsky_scheduler:
+        # Kandinsky-style front-loaded scheduler for better fast motion
+        timesteps = torch.linspace(1.0, 0.0, extend_steps + 1, device=device, dtype=torch.float32)
+        scale = args.kandinsky_scheduler_scale
+        sigmas = scale * timesteps / (1.0 + (scale - 1.0) * timesteps)
+    else:
+        sigmas = LTX2Scheduler().execute(
+            steps=extend_steps,
+            latent=video_latent,
+            terminal=terminal,
+            stretch=True,
+        ).to(dtype=torch.float32, device=device)
 
     # Initialize diffusion components
     generator_torch = torch.Generator(device=device).manual_seed(args.seed)
@@ -9214,6 +9138,9 @@ def sliding_window_generate(
             stage2_sampler=args.stage2_sampler,
             # Stage 3 parameters
             stage3_steps=args.stage3_steps,
+            # Kandinsky scheduler parameters
+            kandinsky_scheduler=args.kandinsky_scheduler,
+            kandinsky_scheduler_scale=args.kandinsky_scheduler_scale,
         )
 
         # Collect video frames from iterator - move to CPU immediately to save GPU memory
@@ -9730,9 +9657,13 @@ def main():
             v2v_chunk_frames=args.v2v_chunk_frames,
             v2v_overlap_frames=args.v2v_overlap_frames,
             refine_latent_stride=args.refine_latent_stride,
+            v2v_audio_mode=args.v2v_audio_mode,
+            v2v_audio_strength=args.v2v_audio_strength,
             sampler=args.sampler,
             stage2_sampler=args.stage2_sampler,
             stage3_steps=args.stage3_steps,
+            kandinsky_scheduler=args.kandinsky_scheduler,
+            kandinsky_scheduler_scale=args.kandinsky_scheduler_scale,
         )
 
     # Encode and save video
@@ -9802,6 +9733,42 @@ def main():
             '-c:a', 'aac',
             '-map', '0:v:0',
             '-map', '1:a:0',
+            '-shortest',
+            args.output_path
+        ], check=True)
+
+        os.unlink(temp_video_path)
+    elif args.input_video and args.v2v_audio_mode == "preserve":
+        # V2V preserve mode: copy audio from input video
+        import subprocess
+        import tempfile
+        import os
+
+        print(">>> V2V Preserve: Encoding video and copying audio from input video...")
+
+        # First encode video without audio to a temp file
+        temp_video = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
+        temp_video_path = temp_video.name
+        temp_video.close()
+
+        encode_video(
+            video=video,
+            fps=args.frame_rate,
+            audio=None,
+            audio_sample_rate=None,
+            output_path=temp_video_path,
+            video_chunks_number=video_chunks_number,
+        )
+
+        # Copy audio from input video
+        subprocess.run([
+            'ffmpeg', '-y',
+            '-i', temp_video_path,
+            '-i', args.input_video,
+            '-c:v', 'copy',
+            '-c:a', 'aac',
+            '-map', '0:v:0',
+            '-map', '1:a:0?',  # ? makes audio optional (handles videos without audio)
             '-shortest',
             args.output_path
         ], check=True)
@@ -9877,6 +9844,8 @@ def main():
         "v2v_chunk_frames": args.v2v_chunk_frames if args.input_video else None,
         "v2v_overlap_frames": args.v2v_overlap_frames if args.input_video else None,
         "refine_latent_stride": args.refine_latent_stride if args.input_video else None,
+        "v2v_audio_mode": args.v2v_audio_mode if args.input_video else None,
+        "v2v_audio_strength": args.v2v_audio_strength if args.input_video and args.v2v_audio_mode == "condition" else None,
         # Anchor settings
         "anchor_image": args.anchor_image,
         "anchor_interval": args.anchor_interval,
