@@ -1671,6 +1671,7 @@ Examples:
     # ==========================================================================
     # MultiModal Guidance Mode (NEW)
     # ==========================================================================
+    guidance_group = parser.add_argument_group("MultiModal Guidance")
     guidance_group.add_argument(
         "--guidance-mode",
         type=str,
