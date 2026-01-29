@@ -5764,29 +5764,7 @@ def generate_av_extension(
     skip_stage2: bool = False,
     latent_norm_fn: Callable | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """
-    Extend a video using time-based audio-video masking.
 
-    This implements the LTXVSetAudioVideoMaskByTime approach from ComfyUI-LTXVideo:
-    1. Load and encode input video and audio to latent space
-    2. Create noise masks based on time windows (preserve before start_time, generate after)
-    3. Run masked denoising to generate new content while preserving original
-    4. Decode and return the extended video
-
-    Args:
-        generator: LTXVideoGeneratorWithOffloading instance
-        args: Command line arguments
-        input_video_path: Path to video to extend
-        start_time: Time (seconds) to start generating new content (default: end of video)
-        end_time: Time (seconds) to stop generation (default: start_time + 5)
-        extend_steps: Number of denoising steps for extension
-        terminal: Terminal sigma for partial denoising (smaller = smoother continuation)
-        slope_len: Transition length at mask boundaries
-        skip_stage2: Whether to skip stage 2 refinement
-
-    Returns:
-        Tuple of (video_tensor [F, H, W, C], audio_tensor or None)
-    """
     import cv2
     from dataclasses import replace as dataclass_replace
     from ltx_core.types import LatentState, VideoPixelShape
