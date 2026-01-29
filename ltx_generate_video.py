@@ -30,7 +30,7 @@ from tqdm import tqdm
 
 # Import LTX-2 components
 from ltx_core.components.diffusion_steps import EulerDiffusionStep
-from ltx_core.components.guiders import CFGGuider, STGGuider
+from ltx_core.components.guiders import CFGGuider, STGGuider, MultiModalGuider, MultiModalGuiderParams
 from ltx_core.guidance.perturbations import (
     BatchedPerturbationConfig,
     Perturbation,
@@ -39,7 +39,7 @@ from ltx_core.guidance.perturbations import (
 )
 from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.protocols import DiffusionStepProtocol
-from ltx_core.components.schedulers import LTX2Scheduler
+from ltx_core.components.schedulers import LTX2Scheduler, LinearQuadraticScheduler, BetaScheduler
 from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
 from ltx_core.model.audio_vae import AudioProcessor, decode_audio as vae_decode_audio
 from ltx_core.model.upsampler import upsample_video
@@ -97,6 +97,16 @@ DEFAULT_GEMMA_ROOT = "./gemma-3-12b-it-qat-q4_0-unquantized"
 DEFAULT_CHECKPOINT_PATH = "./weights/ltx-2-19b-dev.safetensors"
 DEFAULT_SPATIAL_UPSAMPLER_PATH = "./weights/ltx-2-spatial-upscaler-x2-1.0.safetensors"
 DEFAULT_DISTILLED_LORA_PATH = "./weights/ltx-2-19b-distilled-lora-384.safetensors"
+
+
+def get_scheduler(scheduler_type: str = "ltx2"):
+    """Get the appropriate scheduler based on type."""
+    if scheduler_type == "linear_quadratic":
+        return LinearQuadraticScheduler()
+    elif scheduler_type == "beta":
+        return BetaScheduler()
+    else:  # default to ltx2
+        return LTX2Scheduler()
 
 
 # =============================================================================
@@ -454,6 +464,217 @@ def cfg_stg_denoising_func(
         return denoised_video, denoised_audio
 
     return cfg_stg_denoising_step
+
+
+def multi_modal_guider_denoising_func(
+    video_guider: "MultiModalGuider",
+    audio_guider: "MultiModalGuider",
+    v_context_p: torch.Tensor,
+    a_context_p: torch.Tensor,
+    transformer,
+):
+    """
+    Create a denoising function using MultiModalGuider for full multi-modal guidance.
+
+    This function supports up to 4 forward passes per step:
+    1. Positive pass (always) - conditioned on positive prompt
+    2. Negative pass (if CFG enabled) - conditioned on negative prompt
+    3. Perturbed pass (if STG enabled) - self-attention skipped
+    4. Modality pass (if modality guidance enabled) - cross-attention skipped
+
+    Features:
+    - Separate video/audio guidance parameters
+    - Variance rescaling to prevent oversaturation
+    - Cross-modal guidance (A2V, V2A)
+    - Step skipping for speedup
+    - Adaptive CFG for video extension (preserved frames)
+    - Block swap compatible (latent cloning)
+
+    Args:
+        video_guider: MultiModalGuider for video with params and negative_context
+        audio_guider: MultiModalGuider for audio with params and negative_context
+        v_context_p: Positive video context embeddings
+        a_context_p: Positive audio context embeddings
+        transformer: The X0Model transformer
+
+    Returns:
+        A denoising function compatible with euler_denoising_loop.
+    """
+    from ltx_core.model.transformer.modality import Modality
+    from ltx_core.guidance.perturbations import (
+        Perturbation,
+        PerturbationType,
+        BatchedPerturbationConfig,
+    )
+
+    # Cache for step skipping
+    last_denoised_video = None
+    last_denoised_audio = None
+
+    def modality_from_latent_state(state: LatentState, context: torch.Tensor, sigma: float, clone_latent: bool = False) -> Modality:
+        """Create a Modality object from a LatentState."""
+        timesteps = sigma * state.denoise_mask
+        latent = state.latent.clone() if clone_latent else state.latent
+
+        return Modality(
+            enabled=True,
+            latent=latent,
+            timesteps=timesteps,
+            positions=state.positions,
+            context=context,
+            context_mask=None,
+        )
+
+    def build_stg_perturbation_config(video_blocks: list[int], audio_blocks: list[int]) -> BatchedPerturbationConfig:
+        """Build perturbation config for STG (skip self-attention)."""
+        perturbations = [
+            Perturbation(type=PerturbationType.SKIP_VIDEO_SELF_ATTN, blocks=video_blocks),
+            Perturbation(type=PerturbationType.SKIP_AUDIO_SELF_ATTN, blocks=audio_blocks),
+        ]
+        return BatchedPerturbationConfig.from_unbatched(perturbations)
+
+    def build_modality_perturbation_config() -> BatchedPerturbationConfig:
+        """Build perturbation config for modality guidance (skip cross-attention)."""
+        perturbations = [
+            Perturbation(type=PerturbationType.SKIP_A2V_CROSS_ATTN, blocks=None),
+            Perturbation(type=PerturbationType.SKIP_V2A_CROSS_ATTN, blocks=None),
+        ]
+        return BatchedPerturbationConfig.from_unbatched(perturbations)
+
+    def multi_modal_denoising_step(
+        video_state: LatentState,
+        audio_state: LatentState,
+        sigmas: torch.Tensor,
+        step_index: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        nonlocal last_denoised_video, last_denoised_audio
+
+        sigma = sigmas[step_index]
+
+        # Step skipping - return cached results if both guiders skip this step
+        if video_guider.should_skip_step(step_index) and audio_guider.should_skip_step(step_index):
+            if last_denoised_video is not None and last_denoised_audio is not None:
+                return last_denoised_video, last_denoised_audio
+
+        # Detect plain block swap - need to clone latents for multi-pass
+        plain_block_swap = (
+            getattr(transformer, '_block_swap_offloader', None) is not None and
+            not hasattr(transformer, '_activation_offload_verbose')
+        )
+        if not plain_block_swap and hasattr(transformer, 'velocity_model'):
+            vm = transformer.velocity_model
+            plain_block_swap = (
+                getattr(vm, '_block_swap_offloader', None) is not None and
+                not hasattr(vm, '_activation_offload_verbose')
+            )
+
+        # ========== Pass 1: Positive conditioning (always) ==========
+        pos_video = modality_from_latent_state(video_state, v_context_p, sigma)
+        pos_audio = modality_from_latent_state(audio_state, a_context_p, sigma)
+
+        pos_denoised_video, pos_denoised_audio = transformer(
+            video=pos_video, audio=pos_audio, perturbations=None
+        )
+
+        # Initialize uncond values as 0 (no effect when not used)
+        neg_denoised_video = 0.0
+        neg_denoised_audio = 0.0
+        ptb_denoised_video = 0.0
+        ptb_denoised_audio = 0.0
+        mod_denoised_video = 0.0
+        mod_denoised_audio = 0.0
+
+        # ========== Pass 2: Negative conditioning (if CFG enabled) ==========
+        if video_guider.do_unconditional_generation() or audio_guider.do_unconditional_generation():
+            v_context_n = video_guider.negative_context
+            a_context_n = audio_guider.negative_context
+
+            if v_context_n is not None and a_context_n is not None:
+                neg_video = modality_from_latent_state(video_state, v_context_n, sigma, clone_latent=plain_block_swap)
+                neg_audio = modality_from_latent_state(audio_state, a_context_n, sigma, clone_latent=plain_block_swap)
+
+                neg_denoised_video, neg_denoised_audio = transformer(
+                    video=neg_video, audio=neg_audio, perturbations=None
+                )
+
+        # ========== Pass 3: Perturbed conditioning (if STG enabled) ==========
+        if video_guider.do_perturbed_generation() or audio_guider.do_perturbed_generation():
+            video_stg_blocks = video_guider.params.stg_blocks or [29]
+            audio_stg_blocks = audio_guider.params.stg_blocks or [29]
+            stg_config = build_stg_perturbation_config(video_stg_blocks, audio_stg_blocks)
+
+            ptb_video = modality_from_latent_state(video_state, v_context_p, sigma, clone_latent=plain_block_swap)
+            ptb_audio = modality_from_latent_state(audio_state, a_context_p, sigma, clone_latent=plain_block_swap)
+
+            ptb_denoised_video, ptb_denoised_audio = transformer(
+                video=ptb_video, audio=ptb_audio, perturbations=stg_config
+            )
+
+        # ========== Pass 4: Modality-isolated conditioning (if modality guidance enabled) ==========
+        if video_guider.do_isolated_modality_generation() or audio_guider.do_isolated_modality_generation():
+            mod_config = build_modality_perturbation_config()
+
+            mod_video = modality_from_latent_state(video_state, v_context_p, sigma, clone_latent=plain_block_swap)
+            mod_audio = modality_from_latent_state(audio_state, a_context_p, sigma, clone_latent=plain_block_swap)
+
+            mod_denoised_video, mod_denoised_audio = transformer(
+                video=mod_video, audio=mod_audio, perturbations=mod_config
+            )
+
+        # ========== Calculate final outputs using MultiModalGuider ==========
+        # Adaptive CFG for preserved frames (video extension mode)
+        preserved_ratio = (1.0 - video_state.denoise_mask).mean().item()
+
+        if preserved_ratio > 0.3:
+            # Scale down CFG proportionally for preserved frames
+            video_effective_cfg = 1.0 + (video_guider.params.cfg_scale - 1.0) * (1.0 - preserved_ratio)
+            audio_effective_cfg = 1.0 + (audio_guider.params.cfg_scale - 1.0) * (1.0 - preserved_ratio)
+
+            if step_index == 0:
+                print(f"[MultiModal] Adaptive CFG - video: {video_guider.params.cfg_scale:.1f} -> {video_effective_cfg:.2f}, "
+                      f"audio: {audio_guider.params.cfg_scale:.1f} -> {audio_effective_cfg:.2f} (preserved: {preserved_ratio:.1%})")
+
+            # Create adjusted guiders for this step
+            adjusted_video_params = MultiModalGuiderParams(
+                cfg_scale=video_effective_cfg,
+                stg_scale=video_guider.params.stg_scale,
+                stg_blocks=video_guider.params.stg_blocks,
+                rescale_scale=video_guider.params.rescale_scale,
+                modality_scale=video_guider.params.modality_scale,
+                skip_step=video_guider.params.skip_step,
+            )
+            adjusted_audio_params = MultiModalGuiderParams(
+                cfg_scale=audio_effective_cfg,
+                stg_scale=audio_guider.params.stg_scale,
+                stg_blocks=audio_guider.params.stg_blocks,
+                rescale_scale=audio_guider.params.rescale_scale,
+                modality_scale=audio_guider.params.modality_scale,
+                skip_step=audio_guider.params.skip_step,
+            )
+            adjusted_video_guider = MultiModalGuider(params=adjusted_video_params)
+            adjusted_audio_guider = MultiModalGuider(params=adjusted_audio_params)
+
+            denoised_video = adjusted_video_guider.calculate(
+                pos_denoised_video, neg_denoised_video, ptb_denoised_video, mod_denoised_video
+            )
+            denoised_audio = adjusted_audio_guider.calculate(
+                pos_denoised_audio, neg_denoised_audio, ptb_denoised_audio, mod_denoised_audio
+            )
+        else:
+            denoised_video = video_guider.calculate(
+                pos_denoised_video, neg_denoised_video, ptb_denoised_video, mod_denoised_video
+            )
+            denoised_audio = audio_guider.calculate(
+                pos_denoised_audio, neg_denoised_audio, ptb_denoised_audio, mod_denoised_audio
+            )
+
+        # Cache results for step skipping
+        last_denoised_video = denoised_video
+        last_denoised_audio = denoised_audio
+
+        return denoised_video, denoised_audio
+
+    return multi_modal_denoising_step
 
 
 class VideoConditionByMotionLatent:
@@ -1445,6 +1666,103 @@ Examples:
         default="stg_av",
         help="STG mode: 'stg_av' perturbs both audio and video self-attention, "
              "'stg_v' perturbs video only. (default: stg_av)",
+    )
+
+    # ==========================================================================
+    # MultiModal Guidance Mode (NEW)
+    # ==========================================================================
+    guidance_group.add_argument(
+        "--guidance-mode",
+        type=str,
+        choices=["legacy", "multimodal"],
+        default="legacy",
+        help="Guidance mode: 'legacy' uses CFGGuider+STGGuider (default), "
+             "'multimodal' uses new MultiModalGuider with separate video/audio control.",
+    )
+
+    # Video guidance (only used when --guidance-mode multimodal)
+    guidance_group.add_argument(
+        "--video-cfg-guidance-scale",
+        type=float,
+        default=3.0,
+        help="[multimodal mode] Video CFG scale. Higher = more prompt adherence. (default: 3.0)",
+    )
+    guidance_group.add_argument(
+        "--video-stg-scale",
+        type=float,
+        default=1.0,
+        help="[multimodal mode] Video STG scale. 0.0 disables. (default: 1.0)",
+    )
+    guidance_group.add_argument(
+        "--video-stg-blocks",
+        type=int,
+        nargs="*",
+        default=[29],
+        help="[multimodal mode] Transformer blocks to perturb for video STG. (default: [29])",
+    )
+    guidance_group.add_argument(
+        "--video-rescale-scale",
+        type=float,
+        default=0.7,
+        help="[multimodal mode] Video variance rescaling to prevent oversaturation. (default: 0.7)",
+    )
+    guidance_group.add_argument(
+        "--a2v-guidance-scale",
+        type=float,
+        default=3.0,
+        help="[multimodal mode] Audio-to-Video cross-modal guidance. Improves lipsync. (default: 3.0)",
+    )
+    guidance_group.add_argument(
+        "--video-skip-step",
+        type=int,
+        default=0,
+        help="[multimodal mode] Skip video guidance every N+1 steps. 0=no skip. (default: 0)",
+    )
+
+    # Audio guidance (only used when --guidance-mode multimodal)
+    guidance_group.add_argument(
+        "--audio-cfg-guidance-scale",
+        type=float,
+        default=7.0,
+        help="[multimodal mode] Audio CFG scale. Higher = more prompt adherence. (default: 7.0)",
+    )
+    guidance_group.add_argument(
+        "--audio-stg-scale",
+        type=float,
+        default=1.0,
+        help="[multimodal mode] Audio STG scale. 0.0 disables. (default: 1.0)",
+    )
+    guidance_group.add_argument(
+        "--audio-stg-blocks",
+        type=int,
+        nargs="*",
+        default=[29],
+        help="[multimodal mode] Transformer blocks to perturb for audio STG. (default: [29])",
+    )
+    guidance_group.add_argument(
+        "--audio-rescale-scale",
+        type=float,
+        default=0.7,
+        help="[multimodal mode] Audio variance rescaling. (default: 0.7)",
+    )
+    guidance_group.add_argument(
+        "--v2a-guidance-scale",
+        type=float,
+        default=3.0,
+        help="[multimodal mode] Video-to-Audio cross-modal guidance. Improves lipsync. (default: 3.0)",
+    )
+    guidance_group.add_argument(
+        "--audio-skip-step",
+        type=int,
+        default=0,
+        help="[multimodal mode] Skip audio guidance every N+1 steps. 0=no skip. (default: 0)",
+    )
+    guidance_group.add_argument(
+        "--scheduler",
+        type=str,
+        choices=["ltx2", "linear_quadratic", "beta"],
+        default="ltx2",
+        help="Scheduler type for sigma schedule: 'ltx2' (default), 'linear_quadratic', or 'beta'.",
     )
 
     # ==========================================================================
@@ -2556,6 +2874,24 @@ class LTXVideoGeneratorWithOffloading:
         stg_scale: float = 1.0,
         stg_blocks: list[int] | None = None,
         stg_mode: str = "stg_av",
+        # MultiModal Guidance Mode parameters
+        guidance_mode: str = "legacy",
+        # Video guidance (only used when guidance_mode="multimodal")
+        video_cfg_guidance_scale: float = 3.0,
+        video_stg_scale: float = 1.0,
+        video_stg_blocks: list[int] | None = None,
+        video_rescale_scale: float = 0.7,
+        a2v_guidance_scale: float = 3.0,
+        video_skip_step: int = 0,
+        # Audio guidance (only used when guidance_mode="multimodal")
+        audio_cfg_guidance_scale: float = 7.0,
+        audio_stg_scale: float = 1.0,
+        audio_stg_blocks: list[int] | None = None,
+        audio_rescale_scale: float = 0.7,
+        v2a_guidance_scale: float = 3.0,
+        audio_skip_step: int = 0,
+        # Scheduler type
+        scheduler_type: str = "ltx2",
         # SVI Pro parameters
         _motion_latent: torch.Tensor | None = None,
         _num_motion_latent: int = 0,
@@ -2591,15 +2927,25 @@ class LTXVideoGeneratorWithOffloading:
         generator = torch.Generator(device=self.device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
         stepper = EulerDiffusionStep()
-        cfg_guider = CFGGuider(cfg_guidance_scale)
-        # Initialize STG (Spatio-Temporal Guidance) components
-        effective_stg_blocks = stg_blocks if stg_blocks is not None else [29]
-        stg_guider = STGGuider(stg_scale)
-        stg_perturbation_config = build_stg_perturbation_config(
-            stg_scale=stg_scale,
-            stg_blocks=effective_stg_blocks,
-            stg_mode=stg_mode,
-        )
+
+        # Initialize guidance components based on mode
+        if guidance_mode == "multimodal":
+            # MultiModal mode - will create guiders after text encoding (need negative context)
+            cfg_guider = None
+            stg_guider = None
+            stg_perturbation_config = None
+            print(f">>> Using MultiModal guidance mode (video_cfg={video_cfg_guidance_scale}, audio_cfg={audio_cfg_guidance_scale})")
+        else:
+            # Legacy mode - existing behavior
+            cfg_guider = CFGGuider(cfg_guidance_scale)
+            effective_stg_blocks = stg_blocks if stg_blocks is not None else [29]
+            stg_guider = STGGuider(stg_scale)
+            stg_perturbation_config = build_stg_perturbation_config(
+                stg_scale=stg_scale,
+                stg_blocks=effective_stg_blocks,
+                stg_mode=stg_mode,
+            )
+
         dtype = self.dtype
 
         start_time = time.time()
@@ -2928,8 +3274,8 @@ class LTXVideoGeneratorWithOffloading:
                 set_ffn_chunk_size(transformer, self.ffn_chunk_size)
 
             # Create diffusion schedule
-            # Both distilled and standard checkpoints use configurable LTX2Scheduler
-            sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(
+            # Both distilled and standard checkpoints use configurable scheduler
+            sigmas = get_scheduler(scheduler_type).execute(steps=num_inference_steps).to(
                 dtype=torch.float32, device=self.device
             )
             print(f">>> Using {num_inference_steps} inference steps")
@@ -2943,12 +3289,60 @@ class LTXVideoGeneratorWithOffloading:
                 a_context_n = a_context_n.to(self.device)
 
             # Define denoising function for stage 1
-            # Use CFG+STG guidance if either is enabled, otherwise simple denoising
-            use_cfg = cfg_guidance_scale > 1.0 and v_context_n is not None
-            use_stg = stg_guider.enabled() and stg_perturbation_config is not None
             # Convert anchor_decay "none" to None for the denoising loop
             effective_anchor_decay = anchor_decay if anchor_decay and anchor_decay != "none" else None
-            if use_cfg or use_stg:
+
+            if guidance_mode == "multimodal":
+                # MultiModal guidance mode - create guiders with full parameter control
+                video_guider = MultiModalGuider(
+                    params=MultiModalGuiderParams(
+                        cfg_scale=video_cfg_guidance_scale,
+                        stg_scale=video_stg_scale,
+                        stg_blocks=video_stg_blocks or [29],
+                        rescale_scale=video_rescale_scale,
+                        modality_scale=a2v_guidance_scale,
+                        skip_step=video_skip_step,
+                    ),
+                    negative_context=v_context_n,
+                )
+                audio_guider = MultiModalGuider(
+                    params=MultiModalGuiderParams(
+                        cfg_scale=audio_cfg_guidance_scale,
+                        stg_scale=audio_stg_scale,
+                        stg_blocks=audio_stg_blocks or [29],
+                        rescale_scale=audio_rescale_scale,
+                        modality_scale=v2a_guidance_scale,
+                        skip_step=audio_skip_step,
+                    ),
+                    negative_context=a_context_n,
+                )
+
+                def first_stage_denoising_loop(
+                    sigmas: torch.Tensor,
+                    video_state: LatentState,
+                    audio_state: LatentState,
+                    stepper: DiffusionStepProtocol,
+                ) -> tuple[LatentState, LatentState]:
+                    return euler_denoising_loop(
+                        sigmas=sigmas,
+                        video_state=video_state,
+                        audio_state=audio_state,
+                        stepper=stepper,
+                        denoise_fn=multi_modal_guider_denoising_func(
+                            video_guider=video_guider,
+                            audio_guider=audio_guider,
+                            v_context_p=v_context_p,
+                            a_context_p=a_context_p,
+                            transformer=transformer,
+                        ),
+                        anchor_decay=effective_anchor_decay,
+                        callback=preview_callback,
+                        callback_interval=preview_callback_interval,
+                        latent_norm_fn=latent_norm_fn,
+                    )
+
+            # Legacy mode - use CFG+STG guidance if either is enabled, otherwise simple denoising
+            elif cfg_guidance_scale > 1.0 and v_context_n is not None or (stg_guider is not None and stg_guider.enabled() and stg_perturbation_config is not None):
                 # CFG+STG guidance (handles both independently)
                 def first_stage_denoising_loop(
                     sigmas: torch.Tensor,
@@ -3646,7 +4040,7 @@ class LTXVideoGeneratorWithOffloading:
         # For normal two-stage, use stage2_steps (default 3)
         if self.refine_only and input_video:
             # Generate base sigma schedule (1.0 to 0.0)
-            base_sigmas = LTX2Scheduler().execute(steps=refine_steps).to(
+            base_sigmas = get_scheduler(scheduler_type).execute(steps=refine_steps).to(
                 dtype=torch.float32, device=self.device
             )
             # Scale sigmas by refine_strength so they start from refine_strength instead of 1.0
@@ -4245,6 +4639,22 @@ def generate_svi_multi_clip(
                 stg_scale=args.stg_scale,
                 stg_blocks=args.stg_blocks,
                 stg_mode=args.stg_mode,
+                # MultiModal guidance parameters
+                guidance_mode=args.guidance_mode,
+                video_cfg_guidance_scale=args.video_cfg_guidance_scale,
+                video_stg_scale=args.video_stg_scale,
+                video_stg_blocks=args.video_stg_blocks,
+                video_rescale_scale=args.video_rescale_scale,
+                a2v_guidance_scale=args.a2v_guidance_scale,
+                video_skip_step=args.video_skip_step,
+                audio_cfg_guidance_scale=args.audio_cfg_guidance_scale,
+                audio_stg_scale=args.audio_stg_scale,
+                audio_stg_blocks=args.audio_stg_blocks,
+                audio_rescale_scale=args.audio_rescale_scale,
+                v2a_guidance_scale=args.v2a_guidance_scale,
+                audio_skip_step=args.audio_skip_step,
+                # Scheduler
+                scheduler_type=getattr(args, 'scheduler', 'ltx2'),
                 # SVI-specific parameters
                 _motion_latent=prev_motion_latent if clip_idx > 0 else None,
                 _num_motion_latent=num_motion_latent if clip_idx > 0 else 0,
@@ -5063,7 +5473,8 @@ def generate_av_extension(
     else:
         transformer = generator.stage_1_model_ledger.transformer()
 
-    sigmas = LTX2Scheduler().execute(
+    scheduler_type = getattr(args, 'scheduler', 'ltx2')
+    sigmas = get_scheduler(scheduler_type).execute(
         steps=extend_steps,
         latent=extended_video_latent,
         terminal=terminal,
@@ -5074,15 +5485,22 @@ def generate_av_extension(
     generator_torch = torch.Generator(device=device).manual_seed(args.seed)
     noiser = GaussianNoiser(generator=generator_torch)
     stepper = EulerDiffusionStep()
-    cfg_guider = CFGGuider(args.cfg_guidance_scale)
-    # Initialize STG (Spatio-Temporal Guidance) components
-    effective_stg_blocks = args.stg_blocks if args.stg_blocks is not None else [29]
-    stg_guider = STGGuider(args.stg_scale)
-    stg_perturbation_config = build_stg_perturbation_config(
-        stg_scale=args.stg_scale,
-        stg_blocks=effective_stg_blocks,
-        stg_mode=args.stg_mode,
-    )
+
+    # Initialize guidance components based on mode
+    if args.guidance_mode == "multimodal":
+        cfg_guider = None
+        stg_guider = None
+        stg_perturbation_config = None
+    else:
+        cfg_guider = CFGGuider(args.cfg_guidance_scale)
+        # Initialize STG (Spatio-Temporal Guidance) components
+        effective_stg_blocks = args.stg_blocks if args.stg_blocks is not None else [29]
+        stg_guider = STGGuider(args.stg_scale)
+        stg_perturbation_config = build_stg_perturbation_config(
+            stg_scale=args.stg_scale,
+            stg_blocks=effective_stg_blocks,
+            stg_mode=args.stg_mode,
+        )
 
     # Create output shape
     output_shape = VideoPixelShape(
@@ -5099,22 +5517,55 @@ def generate_av_extension(
     # Run denoising loop
     print(f">>> Denoising with {len(sigmas) - 1} steps...")
 
-    # Create the denoise function (CFG + STG combined)
-    use_cfg = args.cfg_guidance_scale > 1.0 and v_context_n is not None
-    use_stg = stg_guider.enabled() and stg_perturbation_config is not None
-    if use_cfg or use_stg:
-        denoise_fn = cfg_stg_denoising_func(
-            cfg_guider=cfg_guider,
-            stg_guider=stg_guider,
-            stg_perturbation_config=stg_perturbation_config,
+    # Create the denoise function based on guidance mode
+    if args.guidance_mode == "multimodal":
+        # MultiModal guidance mode
+        video_guider = MultiModalGuider(
+            params=MultiModalGuiderParams(
+                cfg_scale=args.video_cfg_guidance_scale,
+                stg_scale=args.video_stg_scale,
+                stg_blocks=args.video_stg_blocks or [29],
+                rescale_scale=args.video_rescale_scale,
+                modality_scale=args.a2v_guidance_scale,
+                skip_step=args.video_skip_step,
+            ),
+            negative_context=v_context_n,
+        )
+        audio_guider = MultiModalGuider(
+            params=MultiModalGuiderParams(
+                cfg_scale=args.audio_cfg_guidance_scale,
+                stg_scale=args.audio_stg_scale,
+                stg_blocks=args.audio_stg_blocks or [29],
+                rescale_scale=args.audio_rescale_scale,
+                modality_scale=args.v2a_guidance_scale,
+                skip_step=args.audio_skip_step,
+            ),
+            negative_context=a_context_n,
+        )
+        denoise_fn = multi_modal_guider_denoising_func(
+            video_guider=video_guider,
+            audio_guider=audio_guider,
             v_context_p=v_context_p,
-            v_context_n=v_context_n,
             a_context_p=a_context_p,
-            a_context_n=a_context_n,
             transformer=transformer,
         )
     else:
-        denoise_fn = simple_denoising_func(v_context_p, a_context_p, transformer)
+        # Legacy mode - CFG + STG combined
+        use_cfg = args.cfg_guidance_scale > 1.0 and v_context_n is not None
+        use_stg = stg_guider is not None and stg_guider.enabled() and stg_perturbation_config is not None
+        if use_cfg or use_stg:
+            denoise_fn = cfg_stg_denoising_func(
+                cfg_guider=cfg_guider,
+                stg_guider=stg_guider,
+                stg_perturbation_config=stg_perturbation_config,
+                v_context_p=v_context_p,
+                v_context_n=v_context_n,
+                a_context_p=a_context_p,
+                a_context_n=a_context_n,
+                transformer=transformer,
+            )
+        else:
+            denoise_fn = simple_denoising_func(v_context_p, a_context_p, transformer)
 
     from ltx_core.types import VideoLatentShape, AudioLatentShape
     from ltx_core.tools import VideoLatentTools, AudioLatentTools
@@ -6325,7 +6776,8 @@ def generate_v2v_join(
         transformer = generator.stage_1_model_ledger.transformer()
 
     # Create sigmas schedule
-    sigmas = LTX2Scheduler().execute(
+    scheduler_type = getattr(args, 'scheduler', 'ltx2')
+    sigmas = get_scheduler(scheduler_type).execute(
         steps=extend_steps,
         latent=video_latent,
         terminal=terminal,
@@ -6336,34 +6788,74 @@ def generate_v2v_join(
     generator_torch = torch.Generator(device=device).manual_seed(args.seed)
     noiser = GaussianNoiser(generator=generator_torch)
     stepper = EulerDiffusionStep()
-    cfg_guider = CFGGuider(args.cfg_guidance_scale)
-    effective_stg_blocks = args.stg_blocks if args.stg_blocks is not None else [29]
-    stg_guider = STGGuider(args.stg_scale)
-    stg_perturbation_config = build_stg_perturbation_config(
-        stg_scale=args.stg_scale,
-        stg_blocks=effective_stg_blocks,
-        stg_mode=args.stg_mode,
-    )
+
+    # Initialize guidance components based on mode
+    if args.guidance_mode == "multimodal":
+        cfg_guider = None
+        stg_guider = None
+        stg_perturbation_config = None
+    else:
+        cfg_guider = CFGGuider(args.cfg_guidance_scale)
+        effective_stg_blocks = args.stg_blocks if args.stg_blocks is not None else [29]
+        stg_guider = STGGuider(args.stg_scale)
+        stg_perturbation_config = build_stg_perturbation_config(
+            stg_scale=args.stg_scale,
+            stg_blocks=effective_stg_blocks,
+            stg_mode=args.stg_mode,
+        )
 
     # Get components
     components = generator.pipeline_components
 
-    # Create the denoise function (CFG + STG combined)
-    use_cfg = args.cfg_guidance_scale > 1.0 and v_context_n is not None
-    use_stg = stg_guider.enabled() and stg_perturbation_config is not None
-    if use_cfg or use_stg:
-        denoise_fn = cfg_stg_denoising_func(
-            cfg_guider=cfg_guider,
-            stg_guider=stg_guider,
-            stg_perturbation_config=stg_perturbation_config,
+    # Create the denoise function based on guidance mode
+    if args.guidance_mode == "multimodal":
+        # MultiModal guidance mode
+        video_guider = MultiModalGuider(
+            params=MultiModalGuiderParams(
+                cfg_scale=args.video_cfg_guidance_scale,
+                stg_scale=args.video_stg_scale,
+                stg_blocks=args.video_stg_blocks or [29],
+                rescale_scale=args.video_rescale_scale,
+                modality_scale=args.a2v_guidance_scale,
+                skip_step=args.video_skip_step,
+            ),
+            negative_context=v_context_n,
+        )
+        audio_guider = MultiModalGuider(
+            params=MultiModalGuiderParams(
+                cfg_scale=args.audio_cfg_guidance_scale,
+                stg_scale=args.audio_stg_scale,
+                stg_blocks=args.audio_stg_blocks or [29],
+                rescale_scale=args.audio_rescale_scale,
+                modality_scale=args.v2a_guidance_scale,
+                skip_step=args.audio_skip_step,
+            ),
+            negative_context=a_context_n,
+        )
+        denoise_fn = multi_modal_guider_denoising_func(
+            video_guider=video_guider,
+            audio_guider=audio_guider,
             v_context_p=v_context_p,
-            v_context_n=v_context_n,
             a_context_p=a_context_p,
-            a_context_n=a_context_n,
             transformer=transformer,
         )
     else:
-        denoise_fn = simple_denoising_func(v_context_p, a_context_p, transformer)
+        # Legacy mode - CFG + STG combined
+        use_cfg = args.cfg_guidance_scale > 1.0 and v_context_n is not None
+        use_stg = stg_guider is not None and stg_guider.enabled() and stg_perturbation_config is not None
+        if use_cfg or use_stg:
+            denoise_fn = cfg_stg_denoising_func(
+                cfg_guider=cfg_guider,
+                stg_guider=stg_guider,
+                stg_perturbation_config=stg_perturbation_config,
+                v_context_p=v_context_p,
+                v_context_n=v_context_n,
+                a_context_p=a_context_p,
+                a_context_n=a_context_n,
+                transformer=transformer,
+            )
+        else:
+            denoise_fn = simple_denoising_func(v_context_p, a_context_p, transformer)
 
     from ltx_core.types import VideoLatentShape, AudioLatentShape, LatentState
     from ltx_core.tools import VideoLatentTools, AudioLatentTools
@@ -7696,6 +8188,22 @@ def sliding_window_generate(
             stg_scale=args.stg_scale,
             stg_blocks=args.stg_blocks,
             stg_mode=args.stg_mode,
+            # MultiModal guidance parameters
+            guidance_mode=args.guidance_mode,
+            video_cfg_guidance_scale=args.video_cfg_guidance_scale,
+            video_stg_scale=args.video_stg_scale,
+            video_stg_blocks=args.video_stg_blocks,
+            video_rescale_scale=args.video_rescale_scale,
+            a2v_guidance_scale=args.a2v_guidance_scale,
+            video_skip_step=args.video_skip_step,
+            audio_cfg_guidance_scale=args.audio_cfg_guidance_scale,
+            audio_stg_scale=args.audio_stg_scale,
+            audio_stg_blocks=args.audio_stg_blocks,
+            audio_rescale_scale=args.audio_rescale_scale,
+            v2a_guidance_scale=args.v2a_guidance_scale,
+            audio_skip_step=args.audio_skip_step,
+            # Scheduler
+            scheduler_type=getattr(args, 'scheduler', 'ltx2'),
             # Sliding window overlap conditioning
             _overlap_latent=overlap_latent,
             _num_overlap_latent=num_overlap_latent,
@@ -8200,6 +8708,22 @@ def main():
             stg_scale=args.stg_scale,
             stg_blocks=args.stg_blocks,
             stg_mode=args.stg_mode,
+            # MultiModal guidance parameters
+            guidance_mode=args.guidance_mode,
+            video_cfg_guidance_scale=args.video_cfg_guidance_scale,
+            video_stg_scale=args.video_stg_scale,
+            video_stg_blocks=args.video_stg_blocks,
+            video_rescale_scale=args.video_rescale_scale,
+            a2v_guidance_scale=args.a2v_guidance_scale,
+            video_skip_step=args.video_skip_step,
+            audio_cfg_guidance_scale=args.audio_cfg_guidance_scale,
+            audio_stg_scale=args.audio_stg_scale,
+            audio_stg_blocks=args.audio_stg_blocks,
+            audio_rescale_scale=args.audio_rescale_scale,
+            v2a_guidance_scale=args.v2a_guidance_scale,
+            audio_skip_step=args.audio_skip_step,
+            # Scheduler
+            scheduler_type=getattr(args, 'scheduler', 'ltx2'),
             preview_callback=preview_callback,
             preview_callback_interval=args.preview_interval,
             # Depth Control (IC-LoRA) parameters
