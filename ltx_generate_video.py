@@ -531,7 +531,8 @@ def multi_modal_guider_denoising_func(
             Perturbation(type=PerturbationType.SKIP_VIDEO_SELF_ATTN, blocks=video_blocks),
             Perturbation(type=PerturbationType.SKIP_AUDIO_SELF_ATTN, blocks=audio_blocks),
         ]
-        return BatchedPerturbationConfig.from_unbatched(perturbations)
+        perturbation_config = PerturbationConfig(perturbations=perturbations)
+        return BatchedPerturbationConfig(perturbations=[perturbation_config])
 
     def build_modality_perturbation_config() -> BatchedPerturbationConfig:
         """Build perturbation config for modality guidance (skip cross-attention)."""
@@ -539,7 +540,8 @@ def multi_modal_guider_denoising_func(
             Perturbation(type=PerturbationType.SKIP_A2V_CROSS_ATTN, blocks=None),
             Perturbation(type=PerturbationType.SKIP_V2A_CROSS_ATTN, blocks=None),
         ]
-        return BatchedPerturbationConfig.from_unbatched(perturbations)
+        perturbation_config = PerturbationConfig(perturbations=perturbations)
+        return BatchedPerturbationConfig(perturbations=[perturbation_config])
 
     def multi_modal_denoising_step(
         video_state: LatentState,
