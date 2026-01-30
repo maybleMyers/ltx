@@ -17,6 +17,62 @@ from ltx_core.model.transformer.transformer_args import (
 from ltx_core.utils import to_denoised
 
 
+def _offload_transformer_args_to_cpu(args: TransformerArgs) -> TransformerArgs:
+    from dataclasses import replace
+
+    def to_pinned(t):
+        if t is None:
+            return t
+        if t.is_pinned():
+            return t
+        pinned = torch.empty_like(t, device='cpu', pin_memory=True)
+        pinned.copy_(t.cpu() if t.is_cuda else t)
+        return pinned
+
+    def pe_to_pinned(pe):
+        if pe is None:
+            return None
+        return (to_pinned(pe[0]), to_pinned(pe[1]))
+
+    return replace(args,
+        x=to_pinned(args.x),
+        timesteps=to_pinned(args.timesteps),
+        embedded_timestep=to_pinned(args.embedded_timestep),
+        context=to_pinned(args.context),
+        context_mask=to_pinned(args.context_mask) if args.context_mask is not None else None,
+        positional_embeddings=pe_to_pinned(args.positional_embeddings),
+        cross_positional_embeddings=pe_to_pinned(args.cross_positional_embeddings),
+        cross_scale_shift_timestep=to_pinned(args.cross_scale_shift_timestep),
+        cross_gate_timestep=to_pinned(args.cross_gate_timestep),
+    )
+
+
+def _move_transformer_args_to_device(args: TransformerArgs, device: torch.device) -> TransformerArgs:
+    from dataclasses import replace
+
+    def to_device(t):
+        if t is None or t.device == device:
+            return t
+        return t.to(device)
+
+    def pe_to_device(pe):
+        if pe is None:
+            return None
+        return (to_device(pe[0]), to_device(pe[1]))
+
+    return replace(args,
+        x=to_device(args.x),
+        timesteps=to_device(args.timesteps),
+        embedded_timestep=to_device(args.embedded_timestep),
+        context=to_device(args.context),
+        context_mask=to_device(args.context_mask),
+        positional_embeddings=pe_to_device(args.positional_embeddings),
+        cross_positional_embeddings=pe_to_device(args.cross_positional_embeddings),
+        cross_scale_shift_timestep=to_device(args.cross_scale_shift_timestep),
+        cross_gate_timestep=to_device(args.cross_gate_timestep),
+    )
+
+
 class LTXModelType(Enum):
     AudioVideo = "ltx av model"
     VideoOnly = "ltx video only model"
@@ -359,7 +415,7 @@ class LTXModel(torch.nn.Module):
         """Process output for LTXV."""
         # Apply scale-shift modulation
         scale_shift_values = (
-            scale_shift_table[None, None].to(device=x.device, dtype=x.dtype) + embedded_timestep[:, :, None]
+            scale_shift_table[None, None].to(device=x.device, dtype=x.dtype) + embedded_timestep.to(device=x.device)[:, :, None]
         )
         shift, scale = scale_shift_values[:, :, 0], scale_shift_values[:, :, 1]
 
@@ -395,6 +451,19 @@ class LTXModel(torch.nn.Module):
 
         video_args = self.video_args_preprocessor.prepare(video) if video is not None else None
         audio_args = self.audio_args_preprocessor.prepare(audio) if audio is not None else None
+
+        if getattr(self, '_activation_offload_verbose', False):
+            if video_args is not None:
+                video_args = _offload_transformer_args_to_cpu(video_args)
+            if audio_args is not None:
+                audio_args = _offload_transformer_args_to_cpu(audio_args)
+        else:
+            device = video.latent.device if video is not None else audio.latent.device
+            if video_args is not None:
+                video_args = _move_transformer_args_to_device(video_args, device)
+            if audio_args is not None:
+                audio_args = _move_transformer_args_to_device(audio_args, device)
+
         # Process transformer blocks
         video_out, audio_out = self._process_transformer_blocks(
             video=video_args,

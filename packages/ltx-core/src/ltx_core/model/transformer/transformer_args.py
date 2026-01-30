@@ -55,20 +55,36 @@ class TransformerArgsPreprocessor:
         self.rope_type = rope_type
 
     def _prepare_timestep(
-        self, timestep: torch.Tensor, batch_size: int, hidden_dtype: torch.dtype
+        self, timestep: torch.Tensor, batch_size: int, hidden_dtype: torch.dtype, chunk_size: int = 50000
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Prepare timestep embeddings."""
-
         timestep = timestep * self.timestep_scale_multiplier
-        timestep, embedded_timestep = self.adaln(
-            timestep.flatten(),
-            hidden_dtype=hidden_dtype,
-        )
 
-        # Second dimension is 1 or number of tokens (if timestep_per_token)
-        timestep = timestep.view(batch_size, -1, timestep.shape[-1])
-        embedded_timestep = embedded_timestep.view(batch_size, -1, embedded_timestep.shape[-1])
-        return timestep, embedded_timestep
+        N = timestep.shape[1] if timestep.ndim > 1 else timestep.shape[0] // batch_size
+
+        if N <= chunk_size:
+            timestep_out, embedded_timestep = self.adaln(
+                timestep.flatten(),
+                hidden_dtype=hidden_dtype,
+            )
+            timestep_out = timestep_out.view(batch_size, -1, timestep_out.shape[-1])
+            embedded_timestep = embedded_timestep.view(batch_size, -1, embedded_timestep.shape[-1])
+        else:
+            ts_chunks, emb_chunks = [], []
+            for start in range(0, N, chunk_size):
+                end = min(start + chunk_size, N)
+                ts_chunk = timestep[:, start:end] if timestep.ndim > 1 else timestep.view(batch_size, -1)[:, start:end]
+                ts_out, emb_out = self.adaln(ts_chunk.flatten(), hidden_dtype=hidden_dtype)
+                ts_chunks.append(ts_out.cpu())
+                emb_chunks.append(emb_out.cpu())
+                del ts_chunk, ts_out, emb_out
+            timestep_all = torch.cat(ts_chunks, dim=0)
+            embedded_all = torch.cat(emb_chunks, dim=0)
+            del ts_chunks, emb_chunks
+            timestep_out = timestep_all.view(batch_size, -1, timestep_all.shape[-1])
+            embedded_timestep = embedded_all.view(batch_size, -1, embedded_all.shape[-1])
+
+        return timestep_out, embedded_timestep
 
     def _prepare_context(
         self,
@@ -219,21 +235,39 @@ class MultiModalTransformerArgsPreprocessor:
         timestep_scale_multiplier: int,
         batch_size: int,
         hidden_dtype: torch.dtype,
+        chunk_size: int = 50000,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Prepare cross attention timestep embeddings."""
         timestep = timestep * timestep_scale_multiplier
-
         av_ca_factor = self.av_ca_timestep_scale_multiplier / timestep_scale_multiplier
 
-        scale_shift_timestep, _ = self.cross_scale_shift_adaln(
-            timestep.flatten(),
-            hidden_dtype=hidden_dtype,
-        )
-        scale_shift_timestep = scale_shift_timestep.view(batch_size, -1, scale_shift_timestep.shape[-1])
-        gate_noise_timestep, _ = self.cross_gate_adaln(
-            timestep.flatten() * av_ca_factor,
-            hidden_dtype=hidden_dtype,
-        )
-        gate_noise_timestep = gate_noise_timestep.view(batch_size, -1, gate_noise_timestep.shape[-1])
+        N = timestep.shape[1] if timestep.ndim > 1 else timestep.shape[0] // batch_size
+
+        if N <= chunk_size:
+            scale_shift_timestep, _ = self.cross_scale_shift_adaln(
+                timestep.flatten(),
+                hidden_dtype=hidden_dtype,
+            )
+            scale_shift_timestep = scale_shift_timestep.view(batch_size, -1, scale_shift_timestep.shape[-1])
+            gate_noise_timestep, _ = self.cross_gate_adaln(
+                timestep.flatten() * av_ca_factor,
+                hidden_dtype=hidden_dtype,
+            )
+            gate_noise_timestep = gate_noise_timestep.view(batch_size, -1, gate_noise_timestep.shape[-1])
+        else:
+            ss_chunks, gate_chunks = [], []
+            for start in range(0, N, chunk_size):
+                end = min(start + chunk_size, N)
+                ts_chunk = timestep[:, start:end] if timestep.ndim > 1 else timestep.view(batch_size, -1)[:, start:end]
+                ss_chunk, _ = self.cross_scale_shift_adaln(ts_chunk.flatten(), hidden_dtype=hidden_dtype)
+                gate_chunk, _ = self.cross_gate_adaln(ts_chunk.flatten() * av_ca_factor, hidden_dtype=hidden_dtype)
+                ss_chunks.append(ss_chunk.cpu())
+                gate_chunks.append(gate_chunk.cpu())
+                del ts_chunk, ss_chunk, gate_chunk
+            scale_shift_all = torch.cat(ss_chunks, dim=0)
+            gate_all = torch.cat(gate_chunks, dim=0)
+            del ss_chunks, gate_chunks
+            scale_shift_timestep = scale_shift_all.view(batch_size, -1, scale_shift_all.shape[-1])
+            gate_noise_timestep = gate_all.view(batch_size, -1, gate_all.shape[-1])
 
         return scale_shift_timestep, gate_noise_timestep

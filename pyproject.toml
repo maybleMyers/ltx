@@ -47,6 +47,8 @@ dependencies = [
     "imageio-ffmpeg>=0.5.1",
     "torchvision",
     "loguru",
+    # Upscaling dependencies
+    "spandrel>=0.3.0",
 ]
 
 [tool.uv.sources]

@@ -22,8 +22,9 @@ import os
 import sys
 import time
 from collections.abc import Callable, Iterator
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Optional
 
 import torch
 from tqdm import tqdm
@@ -107,6 +108,260 @@ def get_scheduler(scheduler_type: str = "ltx2"):
         return BetaScheduler()
     else:  # default to ltx2
         return LTX2Scheduler()
+
+
+# =============================================================================
+# Alternative Samplers (UniPC, LCM)
+# =============================================================================
+
+class UniPCDiffusionStep(DiffusionStepProtocol):
+    """
+    UniPC (Unified Predictor-Corrector) sampler for flow matching models.
+
+    A training-free framework for fast sampling that uses a predictor-corrector
+    approach with B(h) coefficients. Works well with 10-25 steps.
+
+    Based on: https://arxiv.org/abs/2302.04867
+    Adapted from FlowUniPCMultistepScheduler for LTX-2's DiffusionStepProtocol interface.
+    """
+
+    def __init__(self, solver_order: int = 2, predict_x0: bool = True, solver_type: str = "bh2"):
+        """
+        Args:
+            solver_order: Order of the UniPC solver (2 or 3 recommended). Higher = more accurate but needs more history.
+            predict_x0: Whether to predict x0 (True) or epsilon (False). x0 prediction is more stable.
+            solver_type: "bh1" for unconditional sampling with few steps, "bh2" otherwise.
+        """
+        self.solver_order = solver_order
+        self.predict_x0 = predict_x0
+        self.solver_type = solver_type
+
+        # History buffers for multi-step
+        self.model_outputs: list = []
+        self.timestep_list: list = []
+        self.last_sample: torch.Tensor | None = None
+        self.lower_order_nums = 0
+
+    def reset(self):
+        """Reset history buffers for a new denoising run."""
+        self.model_outputs = []
+        self.timestep_list = []
+        self.last_sample = None
+        self.lower_order_nums = 0
+
+    def _sigma_to_alpha_sigma_t(self, sigma: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Convert sigma to (alpha_t, sigma_t) for flow matching."""
+        return 1 - sigma, sigma
+
+    def step(
+        self, sample: torch.Tensor, denoised_sample: torch.Tensor, sigmas: torch.Tensor, step_index: int
+    ) -> torch.Tensor:
+        """
+        Perform one UniPC step.
+
+        Args:
+            sample: Current noisy sample x_t
+            denoised_sample: Model's prediction of x_0
+            sigmas: Full sigma schedule
+            step_index: Current step index
+
+        Returns:
+            Next sample x_{t+1}
+        """
+        # Convert denoised prediction to model output format
+        sigma = sigmas[step_index]
+        if self.predict_x0:
+            model_output = denoised_sample
+        else:
+            # Convert x0 prediction to velocity/epsilon
+            model_output = (sample - denoised_sample) / sigma if sigma > 0 else torch.zeros_like(sample)
+
+        # Store history
+        if len(self.model_outputs) >= self.solver_order:
+            self.model_outputs.pop(0)
+            self.timestep_list.pop(0)
+        self.model_outputs.append(model_output)
+        self.timestep_list.append(step_index)
+
+        # Determine effective order (warm up from order 1)
+        this_order = min(self.solver_order, len(self.model_outputs), self.lower_order_nums + 1)
+
+        # Get sigma values
+        sigma_t = sigmas[step_index + 1]  # Next sigma
+        sigma_s0 = sigmas[step_index]     # Current sigma
+
+        alpha_t, sigma_t_val = self._sigma_to_alpha_sigma_t(sigma_t)
+        alpha_s0, sigma_s0_val = self._sigma_to_alpha_sigma_t(sigma_s0)
+
+        # Compute lambda values (log-SNR)
+        lambda_t = torch.log(alpha_t) - torch.log(sigma_t_val) if sigma_t_val > 0 else torch.tensor(float('inf'))
+        lambda_s0 = torch.log(alpha_s0) - torch.log(sigma_s0_val) if sigma_s0_val > 0 else torch.tensor(float('inf'))
+
+        h = lambda_t - lambda_s0
+
+        m0 = self.model_outputs[-1]
+
+        # Handle edge case of h being inf or zero
+        if torch.isinf(h) or h == 0:
+            # Fall back to simple Euler step
+            from ltx_core.utils import to_velocity
+            velocity = to_velocity(sample, sigma_s0, denoised_sample)
+            dt = sigma_t - sigma_s0
+            self.lower_order_nums = min(self.lower_order_nums + 1, self.solver_order)
+            return (sample.to(torch.float32) + velocity.to(torch.float32) * dt).to(sample.dtype)
+
+        device = sample.device
+
+        # Compute B(h) coefficient
+        hh = -h if self.predict_x0 else h
+        h_phi_1 = torch.expm1(hh)  # e^h - 1
+
+        if self.solver_type == "bh1":
+            B_h = hh
+        else:  # bh2
+            B_h = torch.expm1(hh)
+
+        if this_order == 1:
+            # First-order update (similar to Euler)
+            if self.predict_x0:
+                x_t = sigma_t_val / sigma_s0_val * sample - alpha_t * h_phi_1 * m0
+            else:
+                x_t = alpha_t / alpha_s0 * sample - sigma_t_val * h_phi_1 * m0
+        else:
+            # Higher-order update with history
+            rks = []
+            D1s = []
+
+            for i in range(1, this_order):
+                if step_index - i >= 0:
+                    si = step_index - i
+                    mi = self.model_outputs[-(i + 1)] if i < len(self.model_outputs) else m0
+                    alpha_si, sigma_si = self._sigma_to_alpha_sigma_t(sigmas[si])
+                    lambda_si = torch.log(alpha_si) - torch.log(sigma_si) if sigma_si > 0 else torch.tensor(float('inf'))
+                    rk = (lambda_si - lambda_s0) / h if h != 0 else torch.tensor(1.0)
+                    rks.append(rk)
+                    D1s.append((mi - m0) / rk if rk != 0 else torch.zeros_like(m0))
+
+            rks.append(1.0)
+            rks = torch.tensor(rks, device=device)
+
+            # Compute coefficients
+            h_phi_k = h_phi_1 / hh - 1 if hh != 0 else torch.tensor(0.0)
+
+            if len(D1s) > 0 and this_order == 2:
+                rhos_p = torch.tensor([0.5], dtype=sample.dtype, device=device)
+                D1s_tensor = torch.stack(D1s, dim=0)
+                pred_res = torch.einsum("k,k...->...", rhos_p[:len(D1s)], D1s_tensor)
+            else:
+                pred_res = 0
+
+            if self.predict_x0:
+                x_t = sigma_t_val / sigma_s0_val * sample - alpha_t * h_phi_1 * m0 - alpha_t * B_h * pred_res
+            else:
+                x_t = alpha_t / alpha_s0 * sample - sigma_t_val * h_phi_1 * m0 - sigma_t_val * B_h * pred_res
+
+        self.lower_order_nums = min(self.lower_order_nums + 1, self.solver_order)
+        self.last_sample = sample
+
+        return x_t.to(sample.dtype)
+
+
+class LCMDiffusionStep(DiffusionStepProtocol):
+    """
+    LCM (Latent Consistency Model) sampler for flow matching.
+
+    Optimized for very few steps (4-8) with distilled/consistency-trained models.
+    Uses SGM Uniform sigma schedule internally for optimal step distribution.
+
+    Based on: https://arxiv.org/abs/2310.04378
+    """
+
+    def __init__(self):
+        """Initialize LCM sampler."""
+        pass
+
+    def step(
+        self, sample: torch.Tensor, denoised_sample: torch.Tensor, sigmas: torch.Tensor, step_index: int
+    ) -> torch.Tensor:
+        """
+        Perform one LCM step.
+
+        LCM uses a consistency model approach where the model is trained to
+        directly predict the clean sample from any noise level. This allows
+        for very few steps while maintaining quality.
+
+        Args:
+            sample: Current noisy sample x_t
+            denoised_sample: Model's prediction of x_0
+            sigmas: Full sigma schedule
+            step_index: Current step index
+
+        Returns:
+            Next sample x_{t+1}
+        """
+        sigma = sigmas[step_index]
+        sigma_next = sigmas[step_index + 1]
+
+        # LCM step: Linear interpolation toward the denoised prediction
+        # This is equivalent to: x_{t+1} = x_t + (x_0 - x_t) * (1 - sigma_next/sigma)
+        # Simplified: x_{t+1} = denoised + (sample - denoised) * (sigma_next / sigma)
+
+        if sigma > 0:
+            # Ratio-based interpolation (more stable)
+            ratio = sigma_next / sigma
+            x_t = denoised_sample + (sample - denoised_sample) * ratio
+        else:
+            # At sigma=0, just return denoised
+            x_t = denoised_sample
+
+        return x_t.to(sample.dtype)
+
+
+class SGMUniformScheduler:
+    """
+    SGM Uniform scheduler that generates uniformly-spaced sigmas.
+
+    Used with LCM for optimal step distribution. Creates sigmas that are
+    evenly spaced in sigma-space (not log-space), which works well with
+    consistency models.
+    """
+
+    @staticmethod
+    def get_sigmas(num_steps: int, sigma_min: float = 0.0, sigma_max: float = 1.0) -> torch.Tensor:
+        """
+        Generate uniformly-spaced sigmas for SGM Uniform schedule.
+
+        Args:
+            num_steps: Number of inference steps
+            sigma_min: Minimum sigma value (typically 0)
+            sigma_max: Maximum sigma value (typically 1 for flow matching)
+
+        Returns:
+            Tensor of sigmas with shape (num_steps + 1,)
+        """
+        # Uniform spacing from max to min
+        sigmas = torch.linspace(sigma_max, sigma_min, num_steps + 1)
+        return sigmas.to(torch.float32)
+
+
+def get_sampler(sampler_name: str) -> DiffusionStepProtocol:
+    """
+    Factory function to get the appropriate sampler.
+
+    Args:
+        sampler_name: One of "euler", "unipc", "lcm"
+
+    Returns:
+        Sampler instance implementing DiffusionStepProtocol
+    """
+    if sampler_name == "euler":
+        return EulerDiffusionStep()
+    elif sampler_name == "unipc":
+        return UniPCDiffusionStep(solver_order=2, predict_x0=True, solver_type="bh2")
+    elif sampler_name == "lcm":
+        return LCMDiffusionStep()
+    else:
+        raise ValueError(f"Unknown sampler: {sampler_name}. Choose from: euler, unipc, lcm")
 
 
 # =============================================================================
@@ -248,6 +503,232 @@ LATENT_RGB_FACTORS_BIAS_LTXV = [-0.0571, -0.1657, -0.2512]
 
 
 # =============================================================================
+# OOM Retry Infrastructure
+# =============================================================================
+
+class OOMError(RuntimeError):
+    """Exception raised when all OOM retry strategies are exhausted."""
+    pass
+
+
+@dataclass
+class OOMRetryState:
+    """Tracks OOM retry state across attempts."""
+    stage: str  # "stage1" or "stage2"
+    attempt: int = 0
+    max_attempts: int = 70  # Gradual block reduction + progressive chunk reduction
+
+    # Configuration tracking
+    original_blocks: int = 0
+    current_blocks: int = 0
+    min_blocks: int = 1
+
+    blocks_with_activation_offload: int = 4
+
+    original_ffn_chunk_size: Optional[int] = None
+    ffn_chunking_enabled: bool = False
+    current_ffn_chunk_size: int = 0
+
+    original_activation_offload: bool = False
+    activation_offload_enabled: bool = False
+
+    original_temporal_chunk_size: int = 0
+    current_temporal_chunk_size: int = 0
+
+    # Initial (large) chunk sizes when first enabling chunking
+    initial_ffn_chunk_size: int = 16384
+    initial_temporal_chunk_size: int = 200000
+
+    # Minimum chunk sizes (floor)
+    min_ffn_chunk_size: int = 512
+    min_temporal_chunk_size: int = 10000
+
+    # Step sizes for reduction
+    ffn_chunk_step: int = 512
+    temporal_chunk_step: int = 10000
+
+    def can_retry(self) -> bool:
+        return self.attempt < self.max_attempts
+
+    def get_next_strategy(self) -> Optional[dict]:
+        """Returns next retry strategy or None if exhausted.
+
+        Strategy order:
+        1. Enable activation offload (if not already)
+        2. Reduce blocks down to 1 with activation offload (no FFN/temporal chunking)
+        3. Enable FFN chunking and reduce chunk size
+        4. Enable temporal chunking and reduce chunk size
+        """
+        self.attempt += 1
+
+        # Strategy 1: Enable activation offload first (no FFN/temporal chunking yet)
+        if not self.activation_offload_enabled:
+            return {
+                'blocks': self.current_blocks,
+                'ffn_chunk_size': None,
+                'activation_offload': True,
+                'temporal_chunk_size': 0,
+                'description': f"Enabling activation offload with {self.current_blocks} blocks"
+            }
+
+        # Strategy 2: Reduce blocks while keeping activation offload on (no FFN/temporal chunking)
+        # Go all the way down to min_blocks before trying chunking
+        if self.current_blocks > self.min_blocks and self.current_ffn_chunk_size == 0:
+            new_blocks = self.current_blocks - 1
+            return {
+                'blocks': new_blocks,
+                'ffn_chunk_size': None,
+                'activation_offload': True,
+                'temporal_chunk_size': 0,
+                'description': f"Reducing blocks {self.current_blocks}→{new_blocks} (activation offload only)"
+            }
+
+        # Strategy 3: Enable FFN chunking (blocks already at minimum)
+        if self.current_ffn_chunk_size == 0:
+            return {
+                'blocks': self.min_blocks,
+                'ffn_chunk_size': self.initial_ffn_chunk_size,
+                'activation_offload': True,
+                'temporal_chunk_size': 0,
+                'description': f"Enabling FFN chunking ({self.initial_ffn_chunk_size}) with {self.min_blocks} blocks"
+            }
+
+        # Strategy 4: Reduce FFN chunk size
+        if self.current_ffn_chunk_size > self.min_ffn_chunk_size:
+            new_ffn = max(self.current_ffn_chunk_size - self.ffn_chunk_step, self.min_ffn_chunk_size)
+            return {
+                'blocks': self.min_blocks,
+                'ffn_chunk_size': new_ffn,
+                'activation_offload': True,
+                'temporal_chunk_size': self.current_temporal_chunk_size,
+                'description': f"Reducing FFN chunks: {self.current_ffn_chunk_size}→{new_ffn}"
+            }
+
+        # Strategy 5: Enable temporal chunking (FFN at minimum)
+        if self.current_temporal_chunk_size == 0:
+            return {
+                'blocks': self.min_blocks,
+                'ffn_chunk_size': self.min_ffn_chunk_size,
+                'activation_offload': True,
+                'temporal_chunk_size': self.initial_temporal_chunk_size,
+                'description': f"Enabling temporal chunking ({self.initial_temporal_chunk_size})"
+            }
+
+        # Strategy 6: Reduce temporal chunk size
+        if self.current_temporal_chunk_size > self.min_temporal_chunk_size:
+            new_temporal = max(self.current_temporal_chunk_size - self.temporal_chunk_step, self.min_temporal_chunk_size)
+            return {
+                'blocks': self.min_blocks,
+                'ffn_chunk_size': self.min_ffn_chunk_size,
+                'activation_offload': True,
+                'temporal_chunk_size': new_temporal,
+                'description': f"Reducing temporal chunks: {self.current_temporal_chunk_size}→{new_temporal}"
+            }
+
+        # No more strategies
+        return None
+
+
+def oom_retry_wrapper(
+    retry_state: OOMRetryState,
+    denoising_fn: Callable,
+    transformer,
+    generator_instance,
+    block_swap_manager,
+    seed: int,
+    **denoising_kwargs
+):
+    """
+    Executes denoising with progressive OOM retry.
+
+    On OOM:
+    1. Get next strategy from retry_state
+    2. Reconfigure transformer (blocks/FFN/activation)
+    3. Cleanup memory
+    4. Reset generator seed
+    5. Retry denoising
+    """
+    while retry_state.can_retry():
+        try:
+            result = denoising_fn(**denoising_kwargs)
+            if retry_state.attempt > 0:
+                print(f">>> SUCCESS after {retry_state.attempt} retry attempts")
+            return result, block_swap_manager
+
+        except torch.OutOfMemoryError as e:
+            strategy = retry_state.get_next_strategy()
+            if strategy is None:
+                # Build comprehensive error message
+                strategies_tried = []
+                if retry_state.original_blocks > retry_state.min_blocks:
+                    strategies_tried.append(
+                        f"  - Gradual block reduction: {retry_state.original_blocks} → ... → {retry_state.min_blocks}"
+                    )
+                if retry_state.activation_offload_enabled:
+                    strategies_tried.append(
+                        f"  - Activation offload + FFN chunking: Enabled (FFN chunk={retry_state.min_ffn_chunk_size}, temporal chunk={retry_state.min_temporal_chunk_size})"
+                    )
+
+                error_msg = f"""OUT OF MEMORY in {retry_state.stage} after exhausting all retry strategies.
+Attempts made: {retry_state.attempt}
+Strategies tried:
+{chr(10).join(strategies_tried)}
+
+Suggested actions:
+  1. Reduce resolution: --width 640 --height 416
+  2. Reduce video length: --num-frames 64
+  3. Use --one-stage to skip stage 2
+  4. Process in smaller chunks (sliding window mode)
+  5. Consider GPU with 48GB+ VRAM"""
+
+                raise OOMError(error_msg) from e
+
+            print(f">>> OOM in {retry_state.stage}! Retry {retry_state.attempt}: {strategy['description']}")
+
+            # Apply strategy: reconfigure blocks, FFN, activation
+            cleanup_memory()
+
+            # Reconfigure if ANY block swap setting changed
+            needs_reconfigure = (
+                strategy['blocks'] != retry_state.current_blocks or
+                strategy['activation_offload'] != retry_state.activation_offload_enabled or
+                strategy['temporal_chunk_size'] != retry_state.current_temporal_chunk_size
+            )
+
+            if needs_reconfigure and block_swap_manager:
+                print(f">>> Reconfiguring: blocks={strategy['blocks']}, activation_offload={strategy['activation_offload']}, temporal_chunk={strategy['temporal_chunk_size']}")
+                block_swap_manager, _ = reconfigure_block_swap(
+                    transformer,
+                    new_blocks_in_memory=strategy['blocks'],
+                    device=torch.device(generator_instance.device),
+                    enable_activation_offload=strategy['activation_offload'],
+                    temporal_chunk_size=strategy['temporal_chunk_size'],
+                )
+
+            # Handle FFN chunking
+            if strategy['ffn_chunk_size'] is not None:
+                set_ffn_chunk_size(transformer, strategy['ffn_chunk_size'])
+            elif retry_state.ffn_chunking_enabled:
+                set_ffn_chunk_size(transformer, None)
+
+            # Update state
+            retry_state.current_blocks = strategy['blocks']
+            retry_state.current_temporal_chunk_size = strategy['temporal_chunk_size']
+            retry_state.current_ffn_chunk_size = strategy['ffn_chunk_size'] or 0
+            retry_state.ffn_chunking_enabled = strategy['ffn_chunk_size'] is not None
+            retry_state.activation_offload_enabled = strategy['activation_offload']
+
+            # Reset generator
+            generator_torch = torch.Generator(device=generator_instance.device).manual_seed(seed)
+            if 'noiser' in denoising_kwargs:
+                denoising_kwargs['noiser'] = GaussianNoiser(generator=generator_torch)
+
+            cleanup_memory()
+
+    raise RuntimeError("Retry loop exited unexpectedly")
+
+
+# =============================================================================
 # Helper Functions
 # =============================================================================
 
@@ -256,8 +737,9 @@ def build_anchor_image_tuples(
     anchor_interval: int | None,
     anchor_strength: float,
     num_frames: int,
-    images: list[tuple[str, int, float]],
-) -> list[tuple[str, int, float]]:
+    images: list[tuple],
+    anchor_crf: float = 33.0,
+) -> list[tuple[str, int, float, float]]:
     """
     Build anchor conditioning tuples for guiding latent injection.
 
@@ -267,9 +749,10 @@ def build_anchor_image_tuples(
         anchor_strength: Conditioning strength for anchors
         num_frames: Total number of frames in the video
         images: Existing image conditionings (to extract first image if needed)
+        anchor_crf: H.264 CRF for anchor image preprocessing (0=lossless, 33=default)
 
     Returns:
-        List of (image_path, frame_idx, strength) tuples for anchor conditioning
+        List of (image_path, frame_idx, strength, crf) tuples for anchor conditioning
     """
     if anchor_interval is None:
         return []
@@ -284,7 +767,7 @@ def build_anchor_image_tuples(
 
     # Generate frames: [interval, 2*interval, ...] (skip 0, that's handled by i2v)
     anchor_frames = list(range(anchor_interval, num_frames, anchor_interval))
-    return [(anchor_path, frame_idx, anchor_strength) for frame_idx in anchor_frames]
+    return [(anchor_path, frame_idx, anchor_strength, anchor_crf) for frame_idx in anchor_frames]
 
 
 def build_stg_perturbation_config(
@@ -734,15 +1217,9 @@ class VideoConditionByMotionLatent:
         motion_latent = self.motion_latent.to(device=device, dtype=dtype)
         num_motion_frames = motion_latent.shape[2]
 
-        # Position motion frames at the END of the temporal sequence
-        # This provides "where we're going" context for motion continuity
         for i in range(num_motion_frames):
-            # Extract single latent frame: [1, C, 1, H, W]
             frame_latent = motion_latent[:, :, i:i+1, :, :]
-
-            # Frame index at end: num_frames - num_motion_frames + i
-            # Convert to pixel frame index for VideoConditionByKeyframeIndex
-            frame_idx = num_frames - num_motion_frames + i + self.frame_offset
+            frame_idx = i + self.frame_offset
 
             conditionings.append(
                 VideoConditionByKeyframeIndex(
@@ -1457,14 +1934,18 @@ def resolve_path(path: str) -> str:
 
 
 class ImageAction(argparse.Action):
-    """Parse image conditioning arguments: PATH FRAME_IDX STRENGTH"""
+    """Parse image conditioning arguments: PATH FRAME_IDX STRENGTH [CRF]"""
     def __call__(self, parser, namespace, values, option_string=None):
-        path, frame_idx, strength_str = values
+        if len(values) < 3 or len(values) > 4:
+            msg = f"{option_string} requires 3-4 arguments (PATH FRAME_IDX STRENGTH [CRF]), got {len(values)}"
+            raise argparse.ArgumentError(self, msg)
+        path, frame_idx, strength_str = values[:3]
+        crf = float(values[3]) if len(values) > 3 else 33.0  # Default CRF
         resolved_path = resolve_path(path)
         frame_idx = int(frame_idx)
         strength = float(strength_str)
         current = getattr(namespace, self.dest) or []
-        current.append((resolved_path, frame_idx, strength))
+        current.append((resolved_path, frame_idx, strength, crf))
         setattr(namespace, self.dest, current)
 
 
@@ -1576,6 +2057,42 @@ Examples:
              "Uses LTX2Scheduler to generate sigma schedule.",
     )
     model_group.add_argument(
+        "--stage3-steps",
+        type=int,
+        default=3,
+        help="Number of denoising steps for stage 3 refinement (default: 3). "
+             "Only used when --num-stages is 3.",
+    )
+    model_group.add_argument(
+        "--stage2-strength",
+        type=float,
+        default=1.0,
+        help="Sigma scaling for stage 2 (0.0-1.0). Lower = less noise = more preservation. Default: 1.0",
+    )
+    model_group.add_argument(
+        "--stage3-strength",
+        type=float,
+        default=1.0,
+        help="Sigma scaling for stage 3 (0.0-1.0). Lower = less noise = more preservation. Default: 1.0",
+    )
+    model_group.add_argument(
+        "--num-stages",
+        type=int,
+        choices=[1, 2, 3],
+        default=2,
+        help="Number of pipeline stages: 1 (single-stage), 2 (default two-stage), "
+             "or 3 (three-stage with additional refinement).",
+    )
+    model_group.add_argument(
+        "--pipeline-mode",
+        type=str,
+        choices=["exponential", "linear"],
+        default="exponential",
+        help="Pipeline mode for multi-stage generation. "
+             "'exponential': stage 1 at half resolution, then upsample (default). "
+             "'linear': all stages at full resolution (no upsampling).",
+    )
+    model_group.add_argument(
         "--vae",
         type=resolve_path,
         default=None,
@@ -1642,6 +2159,25 @@ Examples:
         help=f"Number of denoising steps for stage 1 (default: {DEFAULT_NUM_INFERENCE_STEPS}).",
     )
     gen_group.add_argument(
+        "--sampler",
+        type=str,
+        default="euler",
+        choices=["euler", "unipc", "lcm"],
+        help="Sampler to use for stage 1 denoising. 'euler' is the default first-order method. "
+             "'unipc' is a higher-order predictor-corrector (good with 10-25 steps). "
+             "'lcm' is optimized for few steps (4-8) with distilled models using SGM Uniform schedule. "
+             "(default: euler)",
+    )
+    gen_group.add_argument(
+        "--stage2-sampler",
+        type=str,
+        default="euler",
+        choices=["euler", "unipc", "lcm"],
+        help="Sampler to use for stage 2/3 denoising. 'euler' is recommended for distilled models "
+             "with few steps. If not specified, defaults to 'euler'. Stage 3 inherits this choice. "
+             "(default: euler)",
+    )
+    gen_group.add_argument(
         "--cfg-guidance-scale",
         type=float,
         default=DEFAULT_CFG_GUIDANCE_SCALE,
@@ -1650,9 +2186,9 @@ Examples:
     gen_group.add_argument(
         "--stg-scale",
         type=float,
-        default=1.0,
+        default=0.0,
         help="STG (Spatio-Temporal Guidance) scale. 0.0 disables STG. "
-             "Recommended: 1.0 for dev model. (default: 1.0)",
+             "Recommended: 1.0 for dev model. (default: 0.0)",
     )
     gen_group.add_argument(
         "--stg-blocks",
@@ -1668,6 +2204,25 @@ Examples:
         default="stg_av",
         help="STG mode: 'stg_av' perturbs both audio and video self-attention, "
              "'stg_v' perturbs video only. (default: stg_av)",
+    )
+    gen_group.add_argument(
+        "--kandinsky-scheduler",
+        action="store_true",
+        default=False,
+        help="Use Kandinsky-style front-loaded scheduler instead of LTX2Scheduler. "
+             "Better for fast motion but may reduce fine detail quality. "
+             "Recommended with 50+ steps and --kandinsky-scheduler-scale 5.0. "
+             "(default: False, uses LTX2Scheduler)",
+    )
+    gen_group.add_argument(
+        "--kandinsky-scheduler-scale",
+        type=float,
+        default=5.0,
+        help="Scheduler scale for Kandinsky-style front-loading. Higher values concentrate "
+             "more steps in the high-noise region (better structure/motion), lower values "
+             "concentrate steps in low-noise region (better details). "
+             "Recommended: 3.0-7.0. Only used when --kandinsky-scheduler is enabled. "
+             "(default: 5.0)",
     )
 
     # ==========================================================================
@@ -1776,10 +2331,10 @@ Examples:
         "--image",
         dest="images",
         action=ImageAction,
-        nargs=3,
-        metavar=("PATH", "FRAME_IDX", "STRENGTH"),
+        nargs="+",
+        metavar="ARG",
         default=[],
-        help="Image conditioning: path, frame index, strength. Can be repeated.",
+        help="Image conditioning: PATH FRAME_IDX STRENGTH [CRF]. CRF is optional (0=lossless, 33=default). Can be repeated.",
     )
 
     # ==========================================================================
@@ -1791,6 +2346,12 @@ Examples:
         type=resolve_path,
         default=None,
         help="Anchor image path for periodic guidance. If not provided but --anchor-interval is set, uses first --image.",
+    )
+    anchor_group.add_argument(
+        "--anchor-crf",
+        type=float,
+        default=33,
+        help="H.264 CRF for anchor image preprocessing (0=lossless, 33=default).",
     )
     anchor_group.add_argument(
         "--anchor-interval",
@@ -1836,6 +2397,16 @@ Examples:
         metavar=("PATH", "STRENGTH"),
         default=[],
         help="User LoRA for stage 2 (refinement) only: path and optional strength. Can be repeated.",
+    )
+    lora_group.add_argument(
+        "--stage3-lora",
+        dest="stage3_loras",
+        action=LoraAction,
+        nargs="+",
+        metavar=("PATH", "STRENGTH"),
+        default=[],
+        help="User LoRA for stage 3 (refinement) only: path and optional strength. "
+             "Only used when --num-stages is 3 and --pipeline-mode is 'exponential'.",
     )
 
     # ==========================================================================
@@ -1921,6 +2492,19 @@ Examples:
         type=int,
         default=22,
         help="Number of refiner transformer blocks to keep in GPU (default: 22).",
+    )
+    # Stage 3 block swapping
+    mem_group.add_argument(
+        "--enable-stage3-block-swap",
+        action="store_true",
+        help="Enable block swapping for stage 3 transformer. "
+             "Only used when --num-stages is 3.",
+    )
+    mem_group.add_argument(
+        "--stage3-blocks-in-memory",
+        type=int,
+        default=22,
+        help="Number of stage 3 transformer blocks to keep in GPU (default: 22).",
     )
     # FFN chunking for long sequences
     mem_group.add_argument(
@@ -2009,6 +2593,40 @@ Examples:
         type=int,
         default=10,
         help="Number of refinement steps for refine-only mode. Default: 10",
+    )
+    v2v_group.add_argument(
+        "--v2v-chunk-frames",
+        type=int,
+        default=121,
+        help="Frames per chunk for sequential V2V (8k+1). Default: 121",
+    )
+    v2v_group.add_argument(
+        "--v2v-overlap-frames",
+        type=int,
+        default=24,
+        help="Overlap frames between chunks (divisible by 8). Default: 24",
+    )
+    v2v_group.add_argument(
+        "--refine-latent-stride",
+        type=int,
+        default=8,
+        help="Condition every Nth frame in refine-only mode. Lower values (1-4) produce smoother video but use more VRAM. Default: 8",
+    )
+    v2v_group.add_argument(
+        "--v2v-audio-mode",
+        type=str,
+        choices=["preserve", "condition", "regenerate", "external"],
+        default="preserve",
+        help="How to handle audio from input video in V2V mode. "
+             "'preserve'=keep original audio exactly, 'condition'=use as conditioning with strength, "
+             "'regenerate'=generate new audio, 'external'=use --audio file instead. Default: preserve",
+    )
+    v2v_group.add_argument(
+        "--v2v-audio-strength",
+        type=float,
+        default=1.0,
+        help="Audio conditioning strength when v2v-audio-mode is 'condition'. "
+             "1.0=frozen/exact, 0.0=regenerate with guidance. Default: 1.0",
     )
 
     # ==========================================================================
@@ -2442,6 +3060,10 @@ def reconfigure_block_swap(
         del ltx_model._blocks_to_swap
     if hasattr(ltx_model, "_blocks_ref"):
         del ltx_model._blocks_ref
+    if hasattr(ltx_model, "_activation_offload_verbose"):
+        del ltx_model._activation_offload_verbose
+    if hasattr(ltx_model, "_temporal_chunk_size"):
+        del ltx_model._temporal_chunk_size
 
     if isinstance(transformer, X0Model):
         if hasattr(transformer, "_block_swap_offloader"):
@@ -2450,6 +3072,8 @@ def reconfigure_block_swap(
             del transformer._blocks_to_swap
         if hasattr(transformer, "_blocks_ref"):
             del transformer._blocks_ref
+        if hasattr(transformer, "_temporal_chunk_size"):
+            del transformer._temporal_chunk_size
 
     # Re-enable block swap with new configuration
     if enable_activation_offload:
@@ -2632,126 +3256,144 @@ def apply_loras_chunked_gpu(
 def encode_video_chunked(
     video_tensor: torch.Tensor,
     video_encoder,
-    chunk_frames: int = 65,  # 8*8 + 1
-    overlap_frames: int = 8,  # kept for API compatibility, but we use context_frames internally
+    chunk_frames: int = 65,  # Ignored - kept for API compatibility
+    overlap_frames: int = 24,  # Ignored - kept for API compatibility
+    device: torch.device | str | None = None,
+    dtype: torch.dtype | None = None,
+    spatial_tile_size: int = 256,  # Spatial tile size in pixels (smaller = less memory)
+    spatial_overlap: int = 64,     # Overlap between spatial tiles
+    min_tile_size: int = 64,       # Minimum tile size before giving up on OOM
 ) -> torch.Tensor:
     """
-    Encode video in temporal chunks to reduce memory usage.
+    Encode video using spatial tiling with full temporal extent.
 
-    Uses autoregressive chunking to handle the causal VAE encoder properly:
-    - The VAE encoder uses causal convolutions where each frame depends on previous frames
-    - For chunks after the first, we include context frames and discard the corresponding
-      latent tokens (the "warm-up" region where the encoder lacks sufficient context)
-    - This avoids blending artifacts from mismatched latents at chunk boundaries
+    Uses spatial tiles to reduce memory while keeping all frames together
+    to preserve temporal consistency (no chunking artifacts from temporal splits).
+
+    Automatically handles CUDA OOM by reducing tile size and retrying.
 
     Args:
-        video_tensor: Shape (1, C, F, H, W) normalized video
-        video_encoder: VideoEncoder model
-        chunk_frames: Frames per chunk (must be 8*k+1)
-        overlap_frames: Legacy parameter, context_frames is used internally
+        video_tensor: Shape (1, C, F, H, W) normalized video (can be on CPU)
+        video_encoder: VideoEncoder model (must have tiled_encode method)
+        chunk_frames: Ignored - kept for API compatibility
+        overlap_frames: Ignored - kept for API compatibility
+        device: Device to use for encoding (if None, uses encoder's device)
+        dtype: Dtype to use for encoding (if None, uses video_tensor's dtype)
+        spatial_tile_size: Size of spatial tiles in pixels (default 256)
+        spatial_overlap: Overlap between spatial tiles in pixels (default 64)
+        min_tile_size: Minimum tile size to try before raising OOM error (default 64)
 
     Returns:
-        Encoded latent tensor (1, latent_channels, F', H', W')
+        Encoded latent tensor (1, latent_channels, F', H', W') on the specified device
     """
+    from ltx_core.model.video_vae.tiling import TilingConfig, SpatialTilingConfig
+
+    if device is None:
+        device = next(video_encoder.parameters()).device
+    if dtype is None:
+        dtype = video_tensor.dtype
+
     _, c, total_frames, h, w = video_tensor.shape
 
-    # If video fits in one chunk, encode directly
-    if total_frames <= chunk_frames:
-        return video_encoder(video_tensor)
+    # Ensure total_frames satisfies 8k+1 constraint
+    if (total_frames - 1) % 8 != 0:
+        target_frames = ((total_frames - 1) // 8 + 1) * 8 + 1
+        pad_frames = target_frames - total_frames
+        print(f">>> Padding video from {total_frames} to {target_frames} frames for encoding...")
+        last_frame = video_tensor[:, :, -1:, :, :]
+        padding = last_frame.expand(-1, -1, pad_frames, -1, -1)
+        video_tensor = torch.cat([video_tensor, padding], dim=2)
+        total_frames = target_frames
 
-    # Validate
-    assert (chunk_frames - 1) % 8 == 0, "chunk_frames must be 8*k+1"
+    video_tensor = video_tensor.to(dtype=dtype)
 
-    # Context frames for causal encoder warm-up (must be 8*k for clean latent boundaries)
-    # Using 24 frames (3 latent tokens) provides enough context for the encoder's receptive field
-    context_frames = 24
-    context_latents = context_frames // 8  # 3 latent tokens to discard
+    # Track current tile size for OOM retry loop
+    current_tile_size = spatial_tile_size
+    original_overlap = spatial_overlap
 
-    # Calculate how many new frames each chunk contributes (excluding context)
-    new_frames_per_chunk = chunk_frames - context_frames  # e.g., 65 - 24 = 41 frames
-    new_latents_per_chunk = new_frames_per_chunk // 8  # e.g., 41 // 8 = 5 latent tokens
+    while current_tile_size >= min_tile_size:
+        # Scale overlap proportionally with tile size, minimum 32 (must be divisible by 32)
+        current_overlap = max(32, (original_overlap * current_tile_size) // spatial_tile_size)
+        current_overlap = (current_overlap // 32) * 32
 
-    # Build chunk list: (start_frame, end_frame, is_first)
-    chunks_info = []
+        # Determine if spatial tiling is needed
+        needs_spatial_tiling = h > current_tile_size or w > current_tile_size
 
-    # First chunk: starts at 0, uses all latent tokens
-    first_end = min(chunk_frames, total_frames)
-    chunks_info.append((0, first_end, True))
+        if not needs_spatial_tiling:
+            # Small enough to encode directly
+            print(f">>> Encoding {total_frames} frames at {w}x{h} directly...")
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                video_on_device = video_tensor.to(device=device)
+                with torch.no_grad():
+                    result = video_encoder(video_on_device)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                return result
+            except torch.cuda.OutOfMemoryError:
+                # Can't reduce further for direct encoding, re-raise
+                raise RuntimeError(
+                    f"CUDA OOM during direct video encoding at {w}x{h}. "
+                    f"Video is too large to encode even without tiling."
+                )
 
-    # Subsequent chunks: start with context overlap, discard context latents
-    current_frame = first_end - context_frames  # Where the next chunk's "new" content starts
-    while current_frame + context_frames < total_frames:
-        chunk_start = current_frame  # Include context frames
-        chunk_end = min(chunk_start + chunk_frames, total_frames)
-        chunks_info.append((chunk_start, chunk_end, False))
-        current_frame = chunk_end - context_frames
+        # Calculate tile grid for progress message
+        stride = current_tile_size - current_overlap
+        h_tiles = max(1, (h - current_overlap + stride - 1) // stride)
+        w_tiles = max(1, (w - current_overlap + stride - 1) // stride)
+        total_tiles = h_tiles * w_tiles
 
-    print(f">>> Encoding {len(chunks_info)} chunk(s) with {context_frames}-frame context...")
+        print(f">>> Encoding {total_frames} frames at {w}x{h} using {total_tiles} spatial tiles ({w_tiles}x{h_tiles}, tile_size={current_tile_size})...")
 
-    # Encode chunks and collect latent segments
-    latent_segments = []
+        # Create spatial-only tiling config (NO temporal tiling to preserve causality)
+        tiling_config = TilingConfig(
+            temporal_config=None,  # Keep full temporal extent
+            spatial_config=SpatialTilingConfig(
+                tile_size_in_pixels=current_tile_size,
+                tile_overlap_in_pixels=current_overlap,
+            ),
+        )
 
-    for i, (start, end, is_first) in enumerate(chunks_info):
-        actual_frames = end - start
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-        # Pad if needed to satisfy 8*k+1
-        if (actual_frames - 1) % 8 != 0:
-            target = 8 * ((actual_frames - 1) // 8 + 1) + 1
-            pad_frames = target - actual_frames
-        else:
-            pad_frames = 0
+            with torch.no_grad():
+                result = video_encoder.tiled_encode(
+                    video_tensor,
+                    tiling_config,
+                    target_device=device,
+                )
 
-        print(f">>> Encoding chunk {i+1}/{len(chunks_info)} (frames {start}-{end})...")
-        chunk = video_tensor[:, :, start:end, :, :]
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-        # Pad if necessary
-        if pad_frames > 0:
-            last_frame = chunk[:, :, -1:, :, :]
-            padding = last_frame.expand(-1, -1, pad_frames, -1, -1)
-            chunk = torch.cat([chunk, padding], dim=2)
+            return result
 
-        # Encode
-        with torch.no_grad():
-            latent = video_encoder(chunk)
+        except torch.cuda.OutOfMemoryError:
+            # Clear CUDA cache and try with smaller tiles
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
 
-        # Remove padded latent tokens if we padded
-        if pad_frames > 0:
-            valid_tokens = (actual_frames - 1) // 8 + 1
-            latent = latent[:, :, :valid_tokens, :, :]
+            old_size = current_tile_size
+            current_tile_size = current_tile_size // 2
 
-        # For first chunk: use all latent tokens
-        # For subsequent chunks: discard context latents (warm-up region)
-        if is_first:
-            latent_segments.append(latent)
-        else:
-            # Discard the first context_latents tokens (the warm-up region)
-            if latent.shape[2] > context_latents:
-                latent_segments.append(latent[:, :, context_latents:, :, :])
-            # If chunk is very short, it might be entirely context - skip it
+            # Ensure tile size meets constraints (divisible by 32, >= min_tile_size)
+            current_tile_size = (current_tile_size // 32) * 32
+            current_tile_size = max(current_tile_size, min_tile_size)
 
-        # Free memory
-        del chunk
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            if current_tile_size < min_tile_size or current_tile_size == old_size:
+                raise RuntimeError(
+                    f"CUDA OOM during video encoding. Failed even with minimum tile size {min_tile_size}. "
+                    f"Try reducing video resolution or frame count."
+                )
 
-    # Concatenate all segments directly (no blending needed with this approach)
-    if len(latent_segments) == 1:
-        result = latent_segments[0]
-    else:
-        result = torch.cat(latent_segments, dim=2)
+            print(f">>> OOM at tile size {old_size}, retrying with tile size {current_tile_size}...")
 
-    # Trim to exact expected length
-    total_latent_frames = (total_frames - 1) // 8 + 1
-    if result.shape[2] > total_latent_frames:
-        result = result[:, :, :total_latent_frames, :, :]
-    elif result.shape[2] < total_latent_frames:
-        # Pad with last token if we're short (shouldn't happen with correct chunking)
-        pad_latents = total_latent_frames - result.shape[2]
-        last_latent = result[:, :, -1:, :, :]
-        padding = last_latent.expand(-1, -1, pad_latents, -1, -1)
-        result = torch.cat([result, padding], dim=2)
-
-    return result
+    # Should not reach here, but just in case
+    raise RuntimeError(f"CUDA OOM during video encoding with minimum tile size {min_tile_size}")
 
 
 # =============================================================================
@@ -2774,6 +3416,7 @@ class LTXVideoGeneratorWithOffloading:
         gemma_root: str,
         loras: list[LoraPathStrengthAndSDOps],
         stage2_loras: list[LoraPathStrengthAndSDOps] = None,
+        stage3_loras: list[LoraPathStrengthAndSDOps] = None,
         device: str = None,
         fp8transformer: bool = False,
         offload: bool = False,
@@ -2784,6 +3427,8 @@ class LTXVideoGeneratorWithOffloading:
         text_encoder_blocks_in_memory: int = 6,
         enable_refiner_block_swap: bool = False,
         refiner_blocks_in_memory: int = 22,
+        enable_stage3_block_swap: bool = False,
+        stage3_blocks_in_memory: int = 22,
         enable_activation_offload: bool = False,
         temporal_chunk_size: int = 0,
         one_stage: bool = False,
@@ -2792,6 +3437,8 @@ class LTXVideoGeneratorWithOffloading:
         stage2_checkpoint: str | None = None,
         ffn_chunk_size: int | None = None,
         vae_path: str | None = None,
+        num_stages: int = 2,
+        pipeline_mode: str = "exponential",
     ):
         self.device = device or get_device()
         self.dtype = torch.bfloat16
@@ -2803,6 +3450,10 @@ class LTXVideoGeneratorWithOffloading:
         self.text_encoder_blocks_in_memory = text_encoder_blocks_in_memory
         self.enable_refiner_block_swap = enable_refiner_block_swap
         self.refiner_blocks_in_memory = refiner_blocks_in_memory
+        # Stage 3 inherits refiner block swap settings by default (same refinement role)
+        self.enable_stage3_block_swap = enable_stage3_block_swap or enable_refiner_block_swap
+        # Use stage3 blocks if explicitly different, otherwise inherit from refiner
+        self.stage3_blocks_in_memory = stage3_blocks_in_memory if enable_stage3_block_swap else refiner_blocks_in_memory
         self.enable_activation_offload = enable_activation_offload
         self.temporal_chunk_size = temporal_chunk_size
         self.one_stage = one_stage
@@ -2811,6 +3462,15 @@ class LTXVideoGeneratorWithOffloading:
         self.stage2_checkpoint = stage2_checkpoint
         self.ffn_chunk_size = ffn_chunk_size
         self.vae_path = vae_path
+        self.num_stages = num_stages
+        self.pipeline_mode = pipeline_mode
+
+        # If num_stages=1, treat as one_stage mode
+        if num_stages == 1:
+            self.one_stage = True
+
+        # Store stage 1 loras for use in linear mode
+        self._stage_1_loras = loras
 
         # Create model ledger for stage 1
         self.stage_1_model_ledger = ModelLedger(
@@ -2835,6 +3495,18 @@ class LTXVideoGeneratorWithOffloading:
         self._stage_2_distilled_lora = distilled_lora
         self._stage_2_fp8transformer = fp8transformer
 
+        # Store params for stage 3 (only used when num_stages >= 3)
+        # Use same checkpoint as stage 2 by default
+        self._stage_3_checkpoint_path = stage2_checkpoint if stage2_checkpoint else checkpoint_path
+        self._stage_3_gemma_root = gemma_root
+        self._stage_3_spatial_upsampler_path = spatial_upsampler_path
+        self._stage_3_vae_path = vae_path
+        # In exponential mode: stage3_loras + distilled_lora
+        # In linear mode: use stage 1 loras (same as all stages)
+        self._stage_3_loras = stage3_loras or []
+        self._stage_3_distilled_lora = distilled_lora
+        self._stage_3_fp8transformer = fp8transformer
+
         # Create model ledger for stage 2 (with distilled LoRA)
         # Note: Creating via with_loras for now, will create fresh in generate if needed
         self.stage_2_model_ledger = self.stage_1_model_ledger.with_loras(
@@ -2846,6 +3518,21 @@ class LTXVideoGeneratorWithOffloading:
             dtype=self.dtype,
             device=self.device,
         )
+
+    @staticmethod
+    def _linear_blend_latents(
+        latent1: torch.Tensor,
+        latent2: torch.Tensor,
+        overlap_frames: int,
+    ) -> torch.Tensor:
+        alpha = torch.linspace(1, 0, overlap_frames, device=latent1.device, dtype=latent1.dtype)
+        alpha = alpha.view(1, 1, -1, 1, 1)
+        pre_overlap = latent1[:, :, :-overlap_frames, :, :]
+        overlap_1 = latent1[:, :, -overlap_frames:, :, :]
+        overlap_2 = latent2[:, :, :overlap_frames, :, :]
+        post_overlap = latent2[:, :, overlap_frames:, :, :]
+        blended = alpha * overlap_1 + (1 - alpha) * overlap_2
+        return torch.cat([pre_overlap, blended, post_overlap], dim=2)
 
     @torch.inference_mode()
     def generate(
@@ -2867,10 +3554,13 @@ class LTXVideoGeneratorWithOffloading:
         refine_strength: float = 0.3,
         refine_steps: int = 10,
         stage2_steps: int = 3,
+        stage2_strength: float = 1.0,
+        stage3_strength: float = 1.0,
         anchor_image: str | None = None,
         anchor_interval: int | None = None,
         anchor_strength: float = 0.8,
         anchor_decay: str | None = None,
+        anchor_crf: float = 33.0,
         audio: str | None = None,
         audio_strength: float = 1.0,
         # STG (Spatio-Temporal Guidance) parameters
@@ -2916,6 +3606,21 @@ class LTXVideoGeneratorWithOffloading:
         # V2A mode (video-to-audio: freeze video, generate audio)
         v2a_mode: bool = False,
         v2a_strength: float = 1.0,
+        # Sequential V2V chunk processing
+        v2v_chunk_frames: int = 121,
+        v2v_overlap_frames: int = 24,
+        refine_latent_stride: int = 8,
+        # V2V Audio control
+        v2v_audio_mode: str = "preserve",
+        v2v_audio_strength: float = 1.0,
+        # Sampler selection
+        sampler: str = "euler",
+        stage2_sampler: str = "euler",
+        # Stage 3 parameters
+        stage3_steps: int = 3,
+        # Kandinsky scheduler parameters
+        kandinsky_scheduler: bool = False,
+        kandinsky_scheduler_scale: float = 5.0,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor | None, str | None]:
         """
         Generate video with optional audio.
@@ -3035,7 +3740,7 @@ class LTXVideoGeneratorWithOffloading:
         audio_conditionings = []
 
         if self.refine_only and input_video:
-            print(">>> Refine-only mode: Loading input video and creating keyframe conditionings...")
+            print(">>> Refine-only mode: Loading and encoding input video...")
             refine_start = time.time()
 
             video_encoder = self.stage_1_model_ledger.video_encoder()
@@ -3050,55 +3755,28 @@ class LTXVideoGeneratorWithOffloading:
                 device=self.device,
             )
 
-            # Use keyframe conditioning approach (like Wan2GP) instead of encoding whole video
-            # This avoids chunked encoding glitches from the causal VAE encoder
-            # Extract every 8th frame and create conditionings with strength=1.0
-            latent_stride = 8
             actual_frames = video_tensor.shape[2]
+            print(f">>> Encoding {actual_frames} frames to latent space...")
 
-            # Get latent indices already covered by --image args (don't duplicate conditioning)
-            image_latent_indices = set()
-            if images:
-                for _, frame_idx, _ in images:
-                    image_latent_indices.add(frame_idx // latent_stride)
+            # Encode full video to use as initial latent for denoising
+            # This allows refine_strength to actually control how much of the input is preserved
+            # Note: video_tensor is kept on CPU, chunks are moved to GPU one at a time
+            upscaled_video_latent = encode_video_chunked(
+                video_tensor,
+                video_encoder,
+                chunk_frames=v2v_chunk_frames,
+                device=self.device,
+                dtype=dtype,
+            )
 
-            print(f">>> Creating keyframe conditionings for {actual_frames} frames (every {latent_stride} frames)...")
-            if image_latent_indices:
-                print(f">>> Skipping latent indices {sorted(image_latent_indices)} (covered by --image)")
-
-            from ltx_core.conditioning import VideoConditionByLatentIndex
-            for frame_idx in range(0, actual_frames, latent_stride):
-                latent_idx = frame_idx // latent_stride
-
-                # Skip frames already covered by --image conditionings
-                if latent_idx in image_latent_indices:
-                    continue
-
-                # Extract single frame: video_tensor is [1, C, F, H, W]
-                frame = video_tensor[:, :, frame_idx:frame_idx+1, :, :]  # [1, C, 1, H, W]
-
-                # Encode frame to latent
-                with torch.no_grad():
-                    encoded_frame = video_encoder(frame)
-
-                # Create conditioning with strength=1.0 to preserve frame exactly
-                refine_keyframe_conditionings.append(
-                    VideoConditionByLatentIndex(
-                        latent=encoded_frame,
-                        strength=1.0,
-                        latent_idx=latent_idx,
-                    )
-                )
-
-            print(f">>> Created {len(refine_keyframe_conditionings)} keyframe conditionings")
-
-            # No initial video latent - using keyframe conditionings instead
-            upscaled_video_latent = None
+            print(f">>> Video encoded to latent shape {upscaled_video_latent.shape}")
 
             # Extract and encode audio from input video (like stage 1 would)
+            # Only extract if v2v_audio_mode is "preserve" - for other modes, audio will be
+            # regenerated or handled differently
             audio_latent = None
-            if not disable_audio:
-                print(">>> Encoding audio from input video...")
+            if not disable_audio and v2v_audio_mode == "preserve":
+                print(">>> Encoding audio from input video (v2v_audio_mode=preserve)...")
 
                 # Extract audio waveform from input video
                 waveform, sample_rate = decode_audio_from_file(input_video, self.device)
@@ -3157,6 +3835,10 @@ class LTXVideoGeneratorWithOffloading:
         # Phase 2: Stage 1 - Low Resolution Generation (skip for refine-only)
         # =====================================================================
         skip_stage_1 = self.refine_only and input_video
+
+        # Initialize V2V initial latent (will be set if input_video is provided for non-refine-only)
+        v2v_initial_latent = None
+
         if not skip_stage_1:
             print(">>> Stage 1: Loading video encoder and transformer...")
             stage1_start = time.time()
@@ -3254,27 +3936,57 @@ class LTXVideoGeneratorWithOffloading:
                 if hasattr(transformer.velocity_model, "av_ca_v2a_gate_adaln_single"):
                     transformer.velocity_model.av_ca_v2a_gate_adaln_single.to(self.device)
 
-                # Use activation offload for extreme memory savings (moves activations to CPU between blocks)
-                if self.enable_activation_offload:
-                    block_swap_manager = enable_block_swap_with_activation_offload(
-                        transformer,
-                        blocks_in_memory=self.dit_blocks_in_memory,
-                        device=self.device,
-                        verbose=True,
-                        temporal_chunk_size=self.temporal_chunk_size,
-                    )
-                else:
-                    block_swap_manager = enable_block_swap(
-                        transformer,
-                        blocks_in_memory=self.dit_blocks_in_memory,
-                        device=self.device,
-                    )
+                # Try to enable block swap with OOM retry (reduce blocks if needed)
+                # Stage 1 uses fast defaults - activation offload/chunking only enabled via OOM retry
+                current_blocks = self.dit_blocks_in_memory
+                min_blocks = 1
+                block_swap_manager = None
+                use_activation_offload = False
+
+                while current_blocks >= min_blocks:
+                    try:
+                        if use_activation_offload:
+                            block_swap_manager = enable_block_swap_with_activation_offload(
+                                transformer,
+                                blocks_in_memory=current_blocks,
+                                device=self.device,
+                                verbose=True,
+                                temporal_chunk_size=0,
+                            )
+                        else:
+                            block_swap_manager = enable_block_swap(
+                                transformer,
+                                blocks_in_memory=current_blocks,
+                                device=self.device,
+                            )
+                        # Update instance variable for later retry logic
+                        self.dit_blocks_in_memory = current_blocks
+                        break
+                    except torch.OutOfMemoryError:
+                        current_blocks -= 1
+                        if current_blocks < min_blocks:
+                            if not use_activation_offload:
+                                # Fall back to activation offload as last resort
+                                print(f">>> OOM at minimum blocks, enabling activation offload...")
+                                use_activation_offload = True
+                                current_blocks = self.dit_blocks_in_memory  # reset blocks
+                                if torch.cuda.is_available():
+                                    torch.cuda.synchronize()
+                                    torch.cuda.empty_cache()
+                                gc.collect()
+                                continue
+                            else:
+                                print(f">>> OOM Error during block swap setup: Already at minimum blocks ({min_blocks}) with activation offload")
+                                raise
+                        print(f">>> OOM during enable_block_swap! Retrying with {current_blocks} blocks...")
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                            torch.cuda.empty_cache()
+                        gc.collect()
             else:
                 transformer = self.stage_1_model_ledger.transformer()
 
-            # Enable FFN chunking for long sequences if configured
-            if self.ffn_chunk_size is not None:
-                set_ffn_chunk_size(transformer, self.ffn_chunk_size)
+            # Stage 1 does not use FFN chunking by default (only enabled via OOM retry)
 
             # Create diffusion schedule
             # Both distilled and standard checkpoints use configurable scheduler
@@ -3399,6 +4111,16 @@ class LTXVideoGeneratorWithOffloading:
 
             # Stage 1 output shape (half resolution for two-stage, full for one-stage)
             if self.one_stage:
+                # One-stage: full resolution
+                stage_1_output_shape = VideoPixelShape(
+                    batch=1,
+                    frames=num_frames,
+                    width=width,
+                    height=height,
+                    fps=frame_rate,
+                )
+            elif self.pipeline_mode == "linear":
+                # Linear mode: all stages at full resolution (no upsampling)
                 stage_1_output_shape = VideoPixelShape(
                     batch=1,
                     frames=num_frames,
@@ -3407,6 +4129,7 @@ class LTXVideoGeneratorWithOffloading:
                     fps=frame_rate,
                 )
             else:
+                # Exponential mode: stage 1 at half resolution
                 stage_1_output_shape = VideoPixelShape(
                     batch=1,
                     frames=num_frames,
@@ -3433,6 +4156,7 @@ class LTXVideoGeneratorWithOffloading:
                     anchor_strength=anchor_strength,
                     num_frames=num_frames,
                     images=images,
+                    anchor_crf=anchor_crf,
                 )
                 if anchor_tuples:
                     anchor_conditionings = image_conditionings_by_adding_guiding_latent(
@@ -3446,17 +4170,17 @@ class LTXVideoGeneratorWithOffloading:
                     stage_1_conditionings = stage_1_conditionings + anchor_conditionings
                     print(f">>> Added {len(anchor_conditionings)} anchor points at frames {[t[1] for t in anchor_tuples]}")
 
-            # V2V: Add video conditioning from input video (like ic_lora pipeline)
-            # Uses tiled encoding to handle long videos without OOM
-            v2v_audio_latent = None  # Will be set if input_video has audio
-            # V2V Mode: Add video conditioning for refinement
-            # Skip if V2A mode is active (V2A will handle video freezing)
+            # V2V: Encode input video as initial latent for denoising
+            # This allows refine_strength to control how much of the input is preserved
+            v2v_audio_latent = None
+            v2v_initial_latent = None
+            v2v_sequential_latent = None
+            v2v_sequential_audio_state = None
             if input_video and not self.refine_only and not v2a_mode:
-                from ltx_core.conditioning import VideoConditionByKeyframeIndex
-                print(f">>> V2V: Loading and encoding input video with tiled encoding...")
+                from ltx_core.conditioning import VideoConditionByKeyframeIndex, VideoConditionByGuideLatent
+                print(f">>> V2V: Loading and encoding input video...")
                 v2v_start = time.time()
 
-                # Load input video at stage 1 resolution - keep on CPU to save GPU memory
                 video_tensor = load_video_conditioning(
                     video_path=input_video,
                     height=stage_1_output_shape.height,
@@ -3466,111 +4190,92 @@ class LTXVideoGeneratorWithOffloading:
                     device=torch.device("cpu"),
                 )
 
-                # Tiled encoding parameters (matching decoder's default temporal tiling)
-                # tile_size must be 8k+1 for valid VAE input
-                # Use small tiles since transformer is already in GPU memory
-                tile_size = 17  # 2 latent frames + 1 - minimal size for memory safety
-                tile_overlap = 8  # Overlap in pixel frames (divisible by 8)
-                tile_stride = tile_size - tile_overlap  # Non-overlapping portion
-
                 actual_frames = video_tensor.shape[2]
-                num_chunks = 0
 
-                # Encode video in overlapping tiles
-                frame_idx = 0
-                while frame_idx < actual_frames:
-                    # Calculate chunk bounds
-                    chunk_end = min(frame_idx + tile_size, actual_frames)
-                    chunk_frames = chunk_end - frame_idx
+                # V2V: Encode full video as initial latent for stage 1
+                # This allows refine_strength to control preservation of input
+                # Note: video_tensor is kept on CPU, chunks are moved to GPU one at a time
+                print(f">>> V2V: Encoding {actual_frames} frames to latent space...")
 
-                    # Ensure valid frame count (8k+1) for VAE
-                    valid_frames = ((chunk_frames - 1) // 8) * 8 + 1
-                    if valid_frames < 9:  # Need at least 9 frames for meaningful encoding
-                        break
-                    chunk_end = frame_idx + valid_frames
+                v2v_initial_latent = encode_video_chunked(
+                    video_tensor,
+                    video_encoder,
+                    chunk_frames=v2v_chunk_frames,
+                    device=self.device,
+                    dtype=dtype,
+                )
 
-                    # Extract chunk and move to GPU for encoding
-                    chunk = video_tensor[:, :, frame_idx:chunk_end, :, :].to(device=self.device, dtype=dtype)
-                    with torch.no_grad():
-                        encoded_chunk = video_encoder(chunk)
-                    del chunk
-                    torch.cuda.empty_cache()
-
-                    # Move encoded latent to CPU to free GPU memory
-                    encoded_chunk_cpu = encoded_chunk.cpu()
-                    del encoded_chunk
-                    torch.cuda.empty_cache()
-
-                    # Add as keyframe conditioning with frame offset
-                    stage_1_conditionings.append(
-                        VideoConditionByKeyframeIndex(
-                            keyframes=encoded_chunk_cpu,
-                            frame_idx=frame_idx,
-                            strength=refine_strength,
-                        )
-                    )
-                    num_chunks += 1
-
-                    # Move to next tile (with overlap)
-                    frame_idx += tile_stride
-                    if frame_idx >= actual_frames - 8:  # Don't create tiny final chunks
-                        break
-
-                # Clean up video tensor
                 del video_tensor
+                torch.cuda.empty_cache()
 
-                print(f">>> V2V: Added {num_chunks} video conditioning chunks (strength={refine_strength}) in {time.time() - v2v_start:.1f}s")
+                print(f">>> V2V: Video encoded to latent shape {v2v_initial_latent.shape} in {time.time() - v2v_start:.1f}s")
 
-                # Extract and encode audio from input video to preserve it
+                # Extract and encode audio from input video based on v2v_audio_mode
                 # Skip if V2A mode is active (V2A will handle audio extraction)
+                v2v_audio_as_conditioning = False
                 if not disable_audio and not v2a_mode:
-                    print(">>> V2V: Extracting audio from input video...")
-                    waveform, sample_rate = decode_audio_from_file(input_video, self.device)
+                    if v2v_audio_mode in ("preserve", "condition"):
+                        mode_label = "preserve" if v2v_audio_mode == "preserve" else f"condition (strength={v2v_audio_strength})"
+                        print(f">>> V2V: Extracting audio from input video ({mode_label})...")
+                        waveform, sample_rate = decode_audio_from_file(input_video, self.device)
 
-                    if waveform is not None:
-                        # Calculate expected audio duration and trim/pad waveform to match
-                        expected_duration = float(num_frames) / float(frame_rate)
-                        expected_samples = int(expected_duration * sample_rate)
+                        if waveform is not None:
+                            # Calculate expected audio duration and trim/pad waveform to match
+                            expected_duration = float(num_frames) / float(frame_rate)
+                            expected_samples = int(expected_duration * sample_rate)
 
-                        # Trim waveform if longer than expected
-                        if waveform.shape[-1] > expected_samples:
-                            waveform = waveform[..., :expected_samples]
-                            print(f">>> V2V: Trimmed audio to {expected_samples} samples ({expected_duration:.3f}s)")
-                        elif waveform.shape[-1] < expected_samples:
-                            # Pad waveform if shorter than expected
-                            padding = expected_samples - waveform.shape[-1]
-                            waveform = torch.nn.functional.pad(waveform, (0, padding))
-                            print(f">>> V2V: Padded audio by {padding} samples to {expected_samples} total ({expected_duration:.3f}s)")
+                            # Trim waveform if longer than expected
+                            if waveform.shape[-1] > expected_samples:
+                                waveform = waveform[..., :expected_samples]
+                                print(f">>> V2V: Trimmed audio to {expected_samples} samples ({expected_duration:.3f}s)")
+                            elif waveform.shape[-1] < expected_samples:
+                                # Pad waveform if shorter than expected
+                                padding = expected_samples - waveform.shape[-1]
+                                waveform = torch.nn.functional.pad(waveform, (0, padding))
+                                print(f">>> V2V: Padded audio by {padding} samples to {expected_samples} total ({expected_duration:.3f}s)")
 
-                        audio_encoder = self.stage_1_model_ledger.audio_encoder()
+                            audio_encoder = self.stage_1_model_ledger.audio_encoder()
 
-                        audio_processor = AudioProcessor(
-                            sample_rate=audio_encoder.sample_rate,
-                            mel_bins=audio_encoder.mel_bins,
-                            mel_hop_length=audio_encoder.mel_hop_length,
-                            n_fft=audio_encoder.n_fft,
-                        ).to(self.device)
+                            audio_processor = AudioProcessor(
+                                sample_rate=audio_encoder.sample_rate,
+                                mel_bins=audio_encoder.mel_bins,
+                                mel_hop_length=audio_encoder.mel_hop_length,
+                                n_fft=audio_encoder.n_fft,
+                            ).to(self.device)
 
-                        if waveform.dim() == 3:
-                            num_frames_audio, channels, samples_per_frame = waveform.shape
-                            waveform = waveform.permute(1, 0, 2).reshape(channels, -1).unsqueeze(0)
-                        elif waveform.dim() == 2:
-                            waveform = waveform.unsqueeze(0)
+                            if waveform.dim() == 3:
+                                num_frames_audio, channels, samples_per_frame = waveform.shape
+                                waveform = waveform.permute(1, 0, 2).reshape(channels, -1).unsqueeze(0)
+                            elif waveform.dim() == 2:
+                                waveform = waveform.unsqueeze(0)
 
-                        mel_spectrogram = audio_processor.waveform_to_mel(
-                            waveform.to(dtype=torch.float32),
-                            waveform_sample_rate=sample_rate
-                        )
+                            mel_spectrogram = audio_processor.waveform_to_mel(
+                                waveform.to(dtype=torch.float32),
+                                waveform_sample_rate=sample_rate
+                            )
 
-                        v2v_audio_latent = audio_encoder(mel_spectrogram.to(dtype=torch.float32))
-                        v2v_audio_latent = v2v_audio_latent.to(dtype=dtype)
+                            v2v_audio_latent = audio_encoder(mel_spectrogram.to(dtype=torch.float32))
+                            v2v_audio_latent = v2v_audio_latent.to(dtype=dtype)
 
-                        del audio_encoder, audio_processor
-                        cleanup_memory()
-                        print(">>> V2V: Audio extracted and encoded successfully")
-                    else:
+                            del audio_encoder, audio_processor
+                            cleanup_memory()
+                            print(">>> V2V: Audio extracted and encoded successfully")
+
+                            # Mark for conditioning mode if applicable
+                            if v2v_audio_mode == "condition":
+                                v2v_audio_as_conditioning = True
+                        else:
+                            v2v_audio_latent = None
+                            print(">>> V2V: Input video has no audio track")
+                    elif v2v_audio_mode == "regenerate":
                         v2v_audio_latent = None
-                        print(">>> V2V: Input video has no audio track")
+                        print(">>> V2V: Audio will be regenerated (not preserving input audio)")
+                    elif v2v_audio_mode == "external":
+                        v2v_audio_latent = None
+                        if audio is not None:
+                            print(">>> V2V: Using external audio file instead of input video audio")
+                        else:
+                            print(">>> V2V: External audio mode but no audio file provided, will regenerate")
                 else:
                     v2v_audio_latent = None
 
@@ -3768,27 +4473,123 @@ class LTXVideoGeneratorWithOffloading:
                 else:
                     print(">>> Warning: Could not load audio file")
 
+            # Add V2V audio as conditioning when mode is "condition"
+            if v2v_audio_latent is not None and v2v_audio_as_conditioning:
+                from ltx_core.conditioning import AudioConditionByLatent
+                audio_conditionings.append(
+                    AudioConditionByLatent(
+                        latent=v2v_audio_latent,
+                        strength=v2v_audio_strength,
+                    )
+                )
+                print(f">>> V2V: Audio added as conditioning with strength {v2v_audio_strength}")
+
             stage_label = "One-stage" if self.one_stage else "Stage 1"
-            print(f">>> {stage_label}: Generating at {stage_1_output_shape.width}x{stage_1_output_shape.height}...")
 
-            # For V2A mode with audio refinement, adjust noise scale based on strength
-            # strength 0.0 = no noise (keep original), strength 1.0 = full noise (regenerate)
-            audio_noise_scale = v2a_strength if v2a_preserved_audio_latent is not None else 1.0
+            if v2v_sequential_latent is not None:
+                print(f">>> {stage_label}: Using pre-computed sequential V2V result...")
 
-            video_state, audio_state = denoise_audio_video(
-                output_shape=stage_1_output_shape,
-                conditionings=stage_1_conditionings,
-                noiser=noiser,
-                sigmas=sigmas,
-                stepper=stepper,
-                denoising_loop_fn=first_stage_denoising_loop,
-                components=self.pipeline_components,
-                dtype=dtype,
-                device=self.device,
-                initial_audio_latent=v2a_preserved_audio_latent,
-                audio_conditionings=audio_conditionings if audio_conditionings else None,
-                audio_noise_scale=audio_noise_scale,
-            )
+                seq_latent = v2v_sequential_latent.to(device=self.device, dtype=dtype)
+                video_state = LatentState(
+                    latent=seq_latent,
+                    denoise_mask=torch.zeros(1, seq_latent.shape[1] * seq_latent.shape[3] * seq_latent.shape[4], device=self.device, dtype=dtype),
+                    positions=torch.zeros(1, seq_latent.shape[1] * seq_latent.shape[3] * seq_latent.shape[4], 3, device=self.device, dtype=torch.long),
+                    clean_latent=seq_latent.clone(),
+                )
+
+                if v2v_sequential_audio_state is not None:
+                    audio_state = v2v_sequential_audio_state
+                else:
+                    audio_noise_scale = v2a_strength if v2a_preserved_audio_latent is not None else 1.0
+
+                    # Create retry state for V2V sequential audio-only denoising (fast defaults)
+                    audio_retry_state = OOMRetryState(
+                        stage="stage1_audio",
+                        original_blocks=self.dit_blocks_in_memory if self.enable_dit_block_swap else 0,
+                        current_blocks=self.dit_blocks_in_memory if self.enable_dit_block_swap else 0,
+                        min_blocks=2,  # DiT minimum
+                        original_ffn_chunk_size=None,
+                        original_activation_offload=False,
+                        original_temporal_chunk_size=0,
+                    )
+
+                    audio_denoising_kwargs = {
+                        'output_shape': stage_1_output_shape,
+                        'conditionings': [],
+                        'noiser': noiser,
+                        'sigmas': sigmas,
+                        'stepper': stepper,
+                        'denoising_loop_fn': first_stage_denoising_loop,
+                        'components': self.pipeline_components,
+                        'dtype': dtype,
+                        'device': self.device,
+                        'initial_audio_latent': v2a_preserved_audio_latent,
+                        'audio_conditionings': audio_conditionings if audio_conditionings else None,
+                        'audio_noise_scale': audio_noise_scale,
+                    }
+
+                    # Execute with OOM retry
+                    (_, audio_state), block_swap_manager = oom_retry_wrapper(
+                        retry_state=audio_retry_state,
+                        denoising_fn=denoise_audio_video,
+                        transformer=transformer,
+                        generator_instance=self,
+                        block_swap_manager=block_swap_manager,
+                        seed=seed,
+                        **audio_denoising_kwargs
+                    )
+            else:
+                print(f">>> {stage_label}: Generating at {stage_1_output_shape.width}x{stage_1_output_shape.height}...")
+
+                audio_noise_scale = v2a_strength if v2a_preserved_audio_latent is not None else 1.0
+
+                # Scale sigmas for V2V mode to preserve input content based on refine_strength
+                # Lower strength = less noise = more preservation of input video
+                stage_1_sigmas = sigmas
+                video_noise_scale = sigmas[0]  # Default: full noise
+                if v2v_initial_latent is not None:
+                    stage_1_sigmas = sigmas * refine_strength
+                    video_noise_scale = stage_1_sigmas[0]  # Scale initial noise to match sigmas
+                    print(f">>> V2V: Scaling sigmas by {refine_strength} to preserve input video (noise_scale={video_noise_scale:.4f})")
+
+                # Create retry state for Stage 1 (fast defaults, chunking only enabled via OOM retry)
+                stage1_retry_state = OOMRetryState(
+                    stage="stage1",
+                    original_blocks=self.dit_blocks_in_memory if self.enable_dit_block_swap else 0,
+                    current_blocks=self.dit_blocks_in_memory if self.enable_dit_block_swap else 0,
+                    min_blocks=2,  # DiT minimum
+                    original_ffn_chunk_size=None,
+                    original_activation_offload=False,
+                    original_temporal_chunk_size=0,
+                )
+
+                denoising_kwargs = {
+                    'output_shape': stage_1_output_shape,
+                    'conditionings': stage_1_conditionings,
+                    'noiser': noiser,
+                    'sigmas': stage_1_sigmas,
+                    'stepper': stepper,
+                    'denoising_loop_fn': first_stage_denoising_loop,
+                    'components': self.pipeline_components,
+                    'dtype': dtype,
+                    'device': self.device,
+                    'noise_scale': video_noise_scale,
+                    'initial_video_latent': v2v_initial_latent,
+                    'initial_audio_latent': v2a_preserved_audio_latent,
+                    'audio_conditionings': audio_conditionings if audio_conditionings else None,
+                    'audio_noise_scale': audio_noise_scale,
+                }
+
+                # Execute with OOM retry
+                (video_state, audio_state), block_swap_manager = oom_retry_wrapper(
+                    retry_state=stage1_retry_state,
+                    denoising_fn=denoise_audio_video,
+                    transformer=transformer,
+                    generator_instance=self,
+                    block_swap_manager=block_swap_manager,
+                    seed=seed,
+                    **denoising_kwargs
+                )
 
             print(f">>> {stage_label} completed in {time.time() - stage1_start:.1f}s", flush=True)
 
@@ -3851,7 +4652,12 @@ class LTXVideoGeneratorWithOffloading:
                     synchronize_and_cleanup()
                     phase_barrier("video_decoding_one_stage")
 
-                if not disable_audio:
+                # Skip audio VAE decode when:
+                # - audio_strength == 1.0 (frozen external audio)
+                # - v2v_audio_mode == "preserve" (copy audio from input video)
+                skip_for_external_audio = audio is not None and audio_strength == 1.0
+                skip_for_v2v_preserve = input_video and v2v_audio_mode == "preserve"
+                if not disable_audio and not skip_for_external_audio and not skip_for_v2v_preserve:
                     print(">>> Decoding audio...")
                     audio_decoder = self.stage_1_model_ledger.audio_decoder()
                     vocoder = self.stage_1_model_ledger.vocoder()
@@ -3864,6 +4670,12 @@ class LTXVideoGeneratorWithOffloading:
                     vocoder.to("cpu")
                     del audio_decoder, vocoder
                     synchronize_and_cleanup()
+                elif skip_for_external_audio:
+                    print(">>> Skipping audio VAE decode (audio_strength=1.0, will use original audio)")
+                    decoded_audio = None
+                elif skip_for_v2v_preserve:
+                    print(">>> Skipping audio VAE decode (v2v_audio_mode=preserve, will copy from input video)")
+                    decoded_audio = None
                 else:
                     decoded_audio = None
 
@@ -3873,21 +4685,27 @@ class LTXVideoGeneratorWithOffloading:
                 return decoded_video, decoded_audio, enhanced_prompt
 
             # =====================================================================
-            # Phase 3: Spatial Upsampling (two-stage only)
+            # Phase 3: Spatial Upsampling (exponential mode only)
             # =====================================================================
-            print(">>> Upsampling latents (2x)...", flush=True)
-            upsample_start = time.time()
+            if self.pipeline_mode == "linear":
+                # Linear mode: no upsampling needed, use latent directly
+                print(">>> Linear mode: skipping upsampling (all stages at same resolution)")
+                upscaled_video_latent = video_state.latent[:1]
+            else:
+                # Exponential mode: upsample 2x
+                print(">>> Upsampling latents (2x)...", flush=True)
+                upsample_start = time.time()
 
-            spatial_upsampler = self.stage_2_model_ledger.spatial_upsampler()
-            upscaled_video_latent = upsample_video(
-                latent=video_state.latent[:1],
-                video_encoder=video_encoder,
-                upsampler=spatial_upsampler,
-            )
+                spatial_upsampler = self.stage_2_model_ledger.spatial_upsampler()
+                upscaled_video_latent = upsample_video(
+                    latent=video_state.latent[:1],
+                    video_encoder=video_encoder,
+                    upsampler=spatial_upsampler,
+                )
 
-            torch.cuda.synchronize()
-            cleanup_memory()
-            print(f">>> Upsampling completed in {time.time() - upsample_start:.1f}s", flush=True)
+                torch.cuda.synchronize()
+                cleanup_memory()
+                print(f">>> Upsampling completed in {time.time() - upsample_start:.1f}s", flush=True)
         # End of skip_stage_1 block
 
         # =====================================================================
@@ -4050,8 +4868,19 @@ class LTXVideoGeneratorWithOffloading:
             # This preserves (1 - refine_strength) of the input content
             distilled_sigmas = base_sigmas * refine_strength
             print(f">>> Using {refine_steps} refinement steps with strength {refine_strength}")
+        elif self.pipeline_mode == "linear":
+            # Linear mode: Stage 2 uses SAME schedule as Stage 1 (full denoising)
+            if kandinsky_scheduler:
+                timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=self.device, dtype=torch.float32)
+                scale = kandinsky_scheduler_scale
+                distilled_sigmas = scale * timesteps / (1.0 + (scale - 1.0) * timesteps)
+            else:
+                distilled_sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(
+                    dtype=torch.float32, device=self.device
+                )
+            print(f">>> Linear mode Stage 2: using {num_inference_steps} steps (same as Stage 1)")
         else:
-            # Use pre-tuned sigma values for stage 2 refinement with distilled LoRA
+            # Exponential mode: use pre-tuned sigma values for refinement with distilled LoRA
             # These values are specifically calibrated for the distilled model
             if stage2_steps == 3:
                 # Use exact tuned values for default 3 steps
@@ -4086,9 +4915,18 @@ class LTXVideoGeneratorWithOffloading:
                 distilled_sigmas = distilled_sigmas.to(self.device)
                 print(f">>> Stage 2 using {stage2_steps} steps (interpolated from tuned schedule)")
 
+        # Apply stage2_strength scaling
+        if stage2_strength < 1.0:
+            distilled_sigmas = distilled_sigmas * stage2_strength
+            print(f">>> Stage 2: Scaling sigmas by {stage2_strength} (noise_scale={distilled_sigmas[0]:.4f})")
+
         # Move text embeddings to GPU for stage 2 denoising
         v_context_p = v_context_p.to(self.device)
         a_context_p = a_context_p.to(self.device)
+
+        # Reset stage2 stepper history (important for UniPC which stores model outputs)
+        if hasattr(stage2_stepper, 'reset'):
+            stage2_stepper.reset()
 
         # Define denoising function for stage 2 (no CFG, just positive)
         # Convert anchor_decay "none" to None for the denoising loop (if not already done in stage 1)
@@ -4154,6 +4992,7 @@ class LTXVideoGeneratorWithOffloading:
                 anchor_strength=anchor_strength,
                 num_frames=num_frames,
                 images=images,
+                anchor_crf=anchor_crf,
             )
             if anchor_tuples:
                 # Load video encoder for anchor conditioning if needed
@@ -4277,39 +5116,41 @@ class LTXVideoGeneratorWithOffloading:
         # Stage 1 conditioning is sufficient for establishing coherence.
 
         print(f">>> Stage 2: Refining at {stage_2_output_shape.width}x{stage_2_output_shape.height}...")
-        # For refine-only mode, use audio_latent from input video encoding
-        # For v2v mode, use v2v_audio_latent if available
-        # For normal generation, use audio_state.latent from stage 1
-        if self.refine_only and input_video:
+        # For refine-only mode with preserve: use audio_latent from input video encoding
+        # For v2v mode with preserve: use v2v_audio_latent
+        # For other modes (regenerate, condition, external): use audio_state.latent from denoising
+        if self.refine_only and input_video and v2v_audio_mode == "preserve" and audio_latent is not None:
             # Get expected audio shape for Stage 2
             from ltx_core.types import AudioLatentShape
             expected_audio_shape = AudioLatentShape.from_video_pixel_shape(stage_2_output_shape)
             expected_shape = expected_audio_shape.to_torch_shape()
 
-            if audio_latent is not None:
-                actual_shape = audio_latent.shape
-                if actual_shape != expected_shape:
-                    print(f">>> [Refine Audio] Shape mismatch: actual {actual_shape} vs expected {expected_shape}")
-                    # Pad or trim frames dimension (dim 2) to match expected
-                    actual_frames = actual_shape[2]
-                    expected_frames = expected_shape[2]
-                    if actual_frames < expected_frames:
-                        pad_frames = expected_frames - actual_frames
-                        audio_latent = torch.nn.functional.pad(audio_latent, (0, 0, 0, pad_frames))
-                        print(f">>> [Refine Audio] Padded audio latent by {pad_frames} frames")
-                    elif actual_frames > expected_frames:
-                        audio_latent = audio_latent[:, :, :expected_frames, :]
-                        print(f">>> [Refine Audio] Trimmed audio latent by {actual_frames - expected_frames} frames")
+            actual_shape = audio_latent.shape
+            if actual_shape != expected_shape:
+                print(f">>> [Refine Audio] Shape mismatch: actual {actual_shape} vs expected {expected_shape}")
+                # Pad or trim frames dimension (dim 2) to match expected
+                actual_frames = actual_shape[2]
+                expected_frames = expected_shape[2]
+                if actual_frames < expected_frames:
+                    pad_frames = expected_frames - actual_frames
+                    audio_latent = torch.nn.functional.pad(audio_latent, (0, 0, 0, pad_frames))
+                    print(f">>> [Refine Audio] Padded audio latent by {pad_frames} frames")
+                elif actual_frames > expected_frames:
+                    audio_latent = audio_latent[:, :, :expected_frames, :]
+                    print(f">>> [Refine Audio] Trimmed audio latent by {actual_frames - expected_frames} frames")
 
             stage_2_initial_audio = audio_latent
-        elif v2v_audio_latent is not None:
+            print(">>> Using preserved audio from input video (refine-only, v2v_audio_mode=preserve)")
+        elif v2v_audio_latent is not None and v2v_audio_mode == "preserve":
+            # Only use v2v_audio_latent directly when mode is "preserve"
+            # For "condition" mode, audio was used as conditioning and denoised result is in audio_state
             # Get expected audio shape for Stage 2
             from ltx_core.types import AudioLatentShape
             expected_audio_shape = AudioLatentShape.from_video_pixel_shape(stage_2_output_shape)
             expected_shape = expected_audio_shape.to_torch_shape()
             actual_shape = v2v_audio_latent.shape
 
-            print(">>> Using audio from input video")
+            print(">>> Using preserved audio from input video (v2v_audio_mode=preserve)")
 
             # Check if shapes match and fix if needed
             if actual_shape != expected_shape:
@@ -4336,78 +5177,52 @@ class LTXVideoGeneratorWithOffloading:
                     raise ValueError(f"Audio latent mel_bins mismatch: got {actual_mel}, expected {expected_mel}")
 
             stage_2_initial_audio = v2v_audio_latent
+        elif self.refine_only and input_video:
+            # Refine-only mode with non-preserve audio mode (regenerate/condition/external)
+            # Stage 1 was skipped, so audio_state doesn't exist
+            # Pass None to generate fresh audio in stage 2
+            stage_2_initial_audio = None
+            print(f">>> Refine-only mode: Audio will be generated fresh (v2v_audio_mode={v2v_audio_mode})")
         else:
             stage_2_initial_audio = audio_state.latent
 
-        # OOM retry loop - reduces blocks in GPU until denoising succeeds
-        current_blocks = self.refiner_blocks_in_memory
-        min_blocks = 1  # Minimum blocks to try before giving up
-        max_retries = current_blocks - min_blocks + 1  # Maximum retry attempts
+        # Create retry state for Stage 2
+        stage2_retry_state = OOMRetryState(
+            stage="stage2",
+            original_blocks=self.refiner_blocks_in_memory if self.enable_refiner_block_swap else 0,
+            current_blocks=self.refiner_blocks_in_memory if self.enable_refiner_block_swap else 0,
+            min_blocks=1,  # Refiner minimum
+            original_ffn_chunk_size=self.ffn_chunk_size,
+            original_activation_offload=self.enable_activation_offload,
+            original_temporal_chunk_size=self.temporal_chunk_size,
+        )
 
-        for retry_attempt in range(max_retries):
-            try:
-                # Reset generator for reproducibility on retries
-                if retry_attempt > 0:
-                    generator = torch.Generator(device=self.device).manual_seed(seed)
-                    noiser = GaussianNoiser(generator=generator)
+        denoising_kwargs = {
+            'output_shape': stage_2_output_shape,
+            'conditionings': stage_2_conditionings,
+            'noiser': noiser,
+            'sigmas': distilled_sigmas,
+            'stepper': stage2_stepper,
+            'denoising_loop_fn': second_stage_denoising_loop,
+            'components': self.pipeline_components,
+            'dtype': dtype,
+            'device': self.device,
+            'noise_scale': distilled_sigmas[0],
+            'initial_video_latent': upscaled_video_latent,
+            'initial_audio_latent': stage_2_initial_audio,
+            'audio_conditionings': audio_conditionings if audio_conditionings else None,
+        }
 
-                video_state, audio_state = denoise_audio_video(
-                    output_shape=stage_2_output_shape,
-                    conditionings=stage_2_conditionings,
-                    noiser=noiser,
-                    sigmas=distilled_sigmas,
-                    stepper=stepper,
-                    denoising_loop_fn=second_stage_denoising_loop,
-                    components=self.pipeline_components,
-                    dtype=dtype,
-                    device=self.device,
-                    noise_scale=distilled_sigmas[0],
-                    initial_video_latent=upscaled_video_latent,
-                    initial_audio_latent=stage_2_initial_audio,
-                    audio_conditionings=audio_conditionings if audio_conditionings else None,
-                )
-                # Success - break out of retry loop
-                break
-
-            except torch.OutOfMemoryError as e:
-                # Check if we can retry with fewer blocks
-                if not block_swap_manager:
-                    print(f">>> OOM Error: Block swapping not enabled, cannot reduce memory usage")
-                    raise
-
-                current_blocks -= 1
-                if current_blocks < min_blocks:
-                    print(f">>> OOM Error: Already at minimum blocks ({min_blocks}), cannot reduce further")
-                    raise
-
-                print(f">>> OOM Error caught! Retrying with {current_blocks} blocks in GPU...")
-
-                # Clear CUDA error state and memory
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                    torch.cuda.empty_cache()
-                gc.collect()
-
-                # Reconfigure block swap with fewer blocks
-                block_swap_manager, current_blocks = reconfigure_block_swap(
-                    transformer,
-                    new_blocks_in_memory=current_blocks,
-                    device=torch.device(self.device),
-                    enable_activation_offload=self.enable_activation_offload,
-                    temporal_chunk_size=self.temporal_chunk_size,
-                )
-
-                if block_swap_manager is None:
-                    print(f">>> Failed to reconfigure block swap, cannot retry")
-                    raise
-
-                # Clear memory again after reconfiguration
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                    torch.cuda.empty_cache()
-                gc.collect()
-
-                print(f">>> Retry attempt {retry_attempt + 1}/{max_retries}...")
+        # Execute with OOM retry
+        (video_state, audio_state), block_swap_manager = oom_retry_wrapper(
+            retry_state=stage2_retry_state,
+            denoising_fn=denoise_audio_video,
+            transformer=transformer,
+            generator_instance=self,
+            block_swap_manager=block_swap_manager,
+            seed=seed,
+            **denoising_kwargs
+        )
 
         print(f">>> Stage 2 completed in {time.time() - stage2_start:.1f}s")
 
@@ -4450,6 +5265,343 @@ class LTXVideoGeneratorWithOffloading:
         phase_barrier("stage_2_denoising")
 
         # =====================================================================
+        # Phase 4.5: Stage 3 - Additional Refinement (3-stage pipelines only)
+        # =====================================================================
+        if self.num_stages >= 3:
+            print(">>> Stage 3: Loading transformer for final refinement...", flush=True)
+            stage3_start = time.time()
+
+            # Force complete cleanup before loading stage 3 transformer
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+
+            # Determine which LoRAs to use for stage 3
+            # Exponential mode: stage3_loras + distilled_lora
+            # Linear mode: stage 1 loras (same as all stages)
+            if self.pipeline_mode == "linear":
+                stage_3_loras_to_apply = self._stage_1_loras
+            else:
+                # Exponential mode: combine stage3_loras with distilled_lora
+                stage_3_loras_to_apply = (*self._stage_3_loras, *self._stage_3_distilled_lora) if self._stage_3_distilled_lora else self._stage_3_loras
+
+            # Load stage 3 transformer with LoRAs
+            block_swap_manager = None
+            if self.enable_stage3_block_swap and stage_3_loras_to_apply:
+                # Create ledger WITHOUT LoRAs - loading will be fast
+                stage_3_ledger_no_lora = ModelLedger(
+                    dtype=self.dtype,
+                    device=torch.device("cpu"),
+                    checkpoint_path=self._stage_3_checkpoint_path,
+                    gemma_root_path=self._stage_3_gemma_root,
+                    spatial_upsampler_path=self._stage_3_spatial_upsampler_path,
+                    vae_path=self._stage_3_vae_path,
+                    loras=(),  # No LoRAs - load base model only
+                    fp8transformer=self._stage_3_fp8transformer,
+                )
+                transformer = stage_3_ledger_no_lora.transformer()
+
+                # Load LoRA state dicts (same pattern as stage 2)
+                print(f">>> Stage 3: Loading {len(stage_3_loras_to_apply)} LoRA(s)...", flush=True)
+                from ltx_core.loader.sft_loader import SafetensorsStateDictLoader
+                lora_loader = SafetensorsStateDictLoader()
+                lora_state_dicts = []
+                lora_strengths = []
+                for lora_spec in stage_3_loras_to_apply:
+                    lora_sd = lora_loader.load(lora_spec.path, sd_ops=lora_spec.sd_ops, device=torch.device("cpu"))
+                    lora_state_dicts.append(lora_sd)
+                    lora_strengths.append(lora_spec.strength)
+
+                # Apply LoRAs using chunked GPU computation
+                apply_loras_chunked_gpu(
+                    model=transformer,
+                    lora_state_dicts=lora_state_dicts,
+                    lora_strengths=lora_strengths,
+                    gpu_device=self.device,
+                    dtype=self.dtype,
+                )
+
+                # Clean up LoRA state dicts
+                del lora_state_dicts
+                synchronize_and_cleanup()
+
+                # Move non-block components to GPU (same pattern as stage 2)
+                print(f">>> Enabling stage 3 block swapping ({self.stage3_blocks_in_memory} blocks in GPU)...")
+                transformer.velocity_model.patchify_proj.to(self.device)
+                transformer.velocity_model.adaln_single.to(self.device)
+                transformer.velocity_model.caption_projection.to(self.device)
+                transformer.velocity_model.norm_out.to(self.device)
+                transformer.velocity_model.proj_out.to(self.device)
+                transformer.velocity_model.scale_shift_table = torch.nn.Parameter(
+                    transformer.velocity_model.scale_shift_table.to(self.device)
+                )
+                if hasattr(transformer.velocity_model, "audio_patchify_proj"):
+                    transformer.velocity_model.audio_patchify_proj.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_adaln_single"):
+                    transformer.velocity_model.audio_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_caption_projection"):
+                    transformer.velocity_model.audio_caption_projection.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_norm_out"):
+                    transformer.velocity_model.audio_norm_out.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_proj_out"):
+                    transformer.velocity_model.audio_proj_out.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_scale_shift_table"):
+                    transformer.velocity_model.audio_scale_shift_table = torch.nn.Parameter(
+                        transformer.velocity_model.audio_scale_shift_table.to(self.device)
+                    )
+                # Cross-attention adaln components
+                if hasattr(transformer.velocity_model, "av_ca_video_scale_shift_adaln_single"):
+                    transformer.velocity_model.av_ca_video_scale_shift_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "av_ca_audio_scale_shift_adaln_single"):
+                    transformer.velocity_model.av_ca_audio_scale_shift_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "av_ca_a2v_gate_adaln_single"):
+                    transformer.velocity_model.av_ca_a2v_gate_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "av_ca_v2a_gate_adaln_single"):
+                    transformer.velocity_model.av_ca_v2a_gate_adaln_single.to(self.device)
+
+                # Enable block swap
+                block_swap_manager = enable_block_swap(transformer, self.stage3_blocks_in_memory)
+            elif self.enable_stage3_block_swap:
+                # Block swap without LoRAs
+                stage_3_ledger = ModelLedger(
+                    dtype=self.dtype,
+                    device=torch.device("cpu"),
+                    checkpoint_path=self._stage_3_checkpoint_path,
+                    gemma_root_path=self._stage_3_gemma_root,
+                    spatial_upsampler_path=self._stage_3_spatial_upsampler_path,
+                    vae_path=self._stage_3_vae_path,
+                    loras=(),
+                    fp8transformer=self._stage_3_fp8transformer,
+                )
+                transformer = stage_3_ledger.transformer()
+
+                # Move non-block components to GPU (same pattern as stage 2)
+                print(f">>> Enabling stage 3 block swapping ({self.stage3_blocks_in_memory} blocks in GPU)...")
+                transformer.velocity_model.patchify_proj.to(self.device)
+                transformer.velocity_model.adaln_single.to(self.device)
+                transformer.velocity_model.caption_projection.to(self.device)
+                transformer.velocity_model.norm_out.to(self.device)
+                transformer.velocity_model.proj_out.to(self.device)
+                transformer.velocity_model.scale_shift_table = torch.nn.Parameter(
+                    transformer.velocity_model.scale_shift_table.to(self.device)
+                )
+                if hasattr(transformer.velocity_model, "audio_patchify_proj"):
+                    transformer.velocity_model.audio_patchify_proj.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_adaln_single"):
+                    transformer.velocity_model.audio_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_caption_projection"):
+                    transformer.velocity_model.audio_caption_projection.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_norm_out"):
+                    transformer.velocity_model.audio_norm_out.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_proj_out"):
+                    transformer.velocity_model.audio_proj_out.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_scale_shift_table"):
+                    transformer.velocity_model.audio_scale_shift_table = torch.nn.Parameter(
+                        transformer.velocity_model.audio_scale_shift_table.to(self.device)
+                    )
+                # Cross-attention adaln components
+                if hasattr(transformer.velocity_model, "av_ca_video_scale_shift_adaln_single"):
+                    transformer.velocity_model.av_ca_video_scale_shift_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "av_ca_audio_scale_shift_adaln_single"):
+                    transformer.velocity_model.av_ca_audio_scale_shift_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "av_ca_a2v_gate_adaln_single"):
+                    transformer.velocity_model.av_ca_a2v_gate_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "av_ca_v2a_gate_adaln_single"):
+                    transformer.velocity_model.av_ca_v2a_gate_adaln_single.to(self.device)
+
+                block_swap_manager = enable_block_swap(transformer, self.stage3_blocks_in_memory)
+            else:
+                # No block swap - load with LoRAs directly to GPU
+                stage_3_ledger = ModelLedger(
+                    dtype=self.dtype,
+                    device=self.device,
+                    checkpoint_path=self._stage_3_checkpoint_path,
+                    gemma_root_path=self._stage_3_gemma_root,
+                    spatial_upsampler_path=self._stage_3_spatial_upsampler_path,
+                    vae_path=self._stage_3_vae_path,
+                    loras=stage_3_loras_to_apply,
+                    fp8transformer=self._stage_3_fp8transformer,
+                )
+                transformer = stage_3_ledger.transformer()
+
+            # Generate sigma schedule for stage 3
+            if self.pipeline_mode == "linear":
+                # Linear mode: Stage 3 uses SAME schedule as Stage 1 (full denoising)
+                if kandinsky_scheduler:
+                    timesteps = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=self.device, dtype=torch.float32)
+                    scale = kandinsky_scheduler_scale
+                    stage3_sigmas = scale * timesteps / (1.0 + (scale - 1.0) * timesteps)
+                else:
+                    stage3_sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(
+                        dtype=torch.float32, device=self.device
+                    )
+                print(f">>> Linear mode Stage 3: using {num_inference_steps} steps (same as Stage 1)")
+            elif stage3_steps == 3:
+                # Exponential mode: use refinement schedule
+                stage3_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
+            elif stage3_steps == 8:
+                stage3_sigmas = torch.Tensor(DISTILLED_SIGMA_VALUES).to(self.device)
+                print(f">>> Stage 3 using full trained 8-step distilled schedule")
+            else:
+                # Interpolate tuned values
+                tuned = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES)
+                orig_positions = torch.linspace(0, 1, len(tuned))
+                new_positions = torch.linspace(0, 1, stage3_steps + 1)
+                stage3_sigmas = torch.zeros(stage3_steps + 1)
+                for i, pos in enumerate(new_positions):
+                    idx = torch.searchsorted(orig_positions, pos, right=True)
+                    if idx == 0:
+                        stage3_sigmas[i] = tuned[0]
+                    elif idx >= len(tuned):
+                        stage3_sigmas[i] = tuned[-1]
+                    else:
+                        t = (pos - orig_positions[idx-1]) / (orig_positions[idx] - orig_positions[idx-1])
+                        stage3_sigmas[i] = tuned[idx-1] * (1 - t) + tuned[idx] * t
+                stage3_sigmas = stage3_sigmas.to(self.device)
+                print(f">>> Stage 3 using {stage3_steps} steps (interpolated from tuned schedule)")
+
+            # Apply stage3_strength scaling
+            if stage3_strength < 1.0:
+                stage3_sigmas = stage3_sigmas * stage3_strength
+                print(f">>> Stage 3: Scaling sigmas by {stage3_strength} (noise_scale={stage3_sigmas[0]:.4f})")
+
+            # Move text embeddings to GPU for stage 3 denoising
+            v_context_p = v_context_p.to(self.device)
+            a_context_p = a_context_p.to(self.device)
+
+            # Reset stage2 stepper history for stage 3 (stage 3 inherits stage2_sampler choice)
+            if hasattr(stage2_stepper, 'reset'):
+                stage2_stepper.reset()
+
+            # Define denoising function for stage 3
+            effective_anchor_decay = anchor_decay if anchor_decay and anchor_decay != "none" else None
+            def third_stage_denoising_loop(
+                sigmas: torch.Tensor,
+                video_state: LatentState,
+                audio_state: LatentState,
+                stepper: DiffusionStepProtocol,
+            ) -> tuple[LatentState, LatentState]:
+                return euler_denoising_loop(
+                    sigmas=sigmas,
+                    video_state=video_state,
+                    audio_state=audio_state,
+                    stepper=stepper,
+                    denoise_fn=simple_denoising_func(
+                        video_context=v_context_p,
+                        audio_context=a_context_p,
+                        transformer=transformer,
+                    ),
+                    anchor_decay=effective_anchor_decay,
+                    callback=preview_callback,
+                    callback_interval=preview_callback_interval,
+                    latent_norm_fn=latent_norm_fn,
+                )
+
+            # Stage 3 output shape (always full resolution)
+            stage_3_output_shape = VideoPixelShape(
+                batch=1,
+                frames=num_frames,
+                width=width,
+                height=height,
+                fps=frame_rate,
+            )
+
+            # Stage 3 conditionings (similar to stage 2)
+            # Load video encoder for stage 3 image conditioning if needed
+            stage_3_video_encoder = None
+            if images:
+                stage_3_video_encoder = self.stage_1_model_ledger.video_encoder()
+
+            stage_3_conditionings = image_conditionings_by_replacing_latent(
+                images=images,
+                height=stage_3_output_shape.height,
+                width=stage_3_output_shape.width,
+                video_encoder=stage_3_video_encoder,
+                dtype=dtype,
+                device=self.device,
+            )
+
+            # Cleanup video encoder after conditioning
+            if stage_3_video_encoder is not None:
+                stage_3_video_encoder.to("cpu")
+                del stage_3_video_encoder
+                synchronize_and_cleanup()
+
+            print(f">>> Stage 3: Refining at {stage_3_output_shape.width}x{stage_3_output_shape.height}...")
+
+            # Use stage 2 output as initial latent for stage 3
+            stage_3_initial_video = video_state.latent
+            stage_3_initial_audio = audio_state.latent
+
+            # OOM retry for stage 3
+            stage3_retry_state = OOMRetryState(
+                stage="stage3",
+                original_blocks=self.stage3_blocks_in_memory if self.enable_stage3_block_swap else 0,
+                current_blocks=self.stage3_blocks_in_memory if self.enable_stage3_block_swap else 0,
+            )
+
+            denoising_kwargs = {
+                'output_shape': stage_3_output_shape,
+                'conditionings': stage_3_conditionings,
+                'noiser': noiser,
+                'sigmas': stage3_sigmas,
+                'stepper': stage2_stepper,
+                'denoising_loop_fn': third_stage_denoising_loop,
+                'components': self.pipeline_components,
+                'dtype': dtype,
+                'device': self.device,
+                'noise_scale': stage3_sigmas[0],
+                'initial_video_latent': stage_3_initial_video,
+                'initial_audio_latent': stage_3_initial_audio,
+                'audio_conditionings': audio_conditionings if audio_conditionings else None,
+            }
+
+            # Execute with OOM retry
+            (video_state, audio_state), block_swap_manager = oom_retry_wrapper(
+                retry_state=stage3_retry_state,
+                denoising_fn=denoise_audio_video,
+                transformer=transformer,
+                generator_instance=self,
+                block_swap_manager=block_swap_manager,
+                seed=seed,
+                **denoising_kwargs
+            )
+
+            print(f">>> Stage 3 completed in {time.time() - stage3_start:.1f}s")
+
+            # Clear closure references
+            third_stage_denoising_loop = None
+
+            # Cleanup stage 3 models
+            if block_swap_manager:
+                offload_all_blocks(transformer)
+                if hasattr(transformer, 'velocity_model'):
+                    if hasattr(transformer.velocity_model, '_block_swap_offloader'):
+                        transformer.velocity_model._block_swap_offloader = None
+                    if hasattr(transformer.velocity_model, '_blocks_ref'):
+                        transformer.velocity_model._blocks_ref = None
+                if hasattr(transformer, '_block_swap_offloader'):
+                    transformer._block_swap_offloader = None
+                if hasattr(transformer, '_blocks_ref'):
+                    transformer._blocks_ref = None
+                block_swap_manager = None
+
+            if transformer is not None:
+                transformer.to("cpu")
+            transformer = None
+
+            del stage_3_conditionings
+
+            # Move text embeddings to CPU
+            v_context_p = v_context_p.cpu()
+            a_context_p = a_context_p.cpu()
+
+            torch.cuda.synchronize()
+            cleanup_memory()
+            phase_barrier("stage_3_denoising")
+
+        # =====================================================================
         # Phase 5: VAE Decoding (Sequential loading to minimize peak memory)
         # =====================================================================
 
@@ -4479,7 +5631,12 @@ class LTXVideoGeneratorWithOffloading:
             synchronize_and_cleanup()
             phase_barrier("video_decoding_two_stage")
 
-        if not disable_audio:
+        # Skip audio VAE decode when:
+        # - audio_strength == 1.0 (frozen external audio)
+        # - v2v_audio_mode == "preserve" (copy audio from input video)
+        skip_for_external_audio = audio is not None and audio_strength == 1.0
+        skip_for_v2v_preserve = input_video and v2v_audio_mode == "preserve"
+        if not disable_audio and not skip_for_external_audio and not skip_for_v2v_preserve:
             print(">>> Decoding audio...")
             audio_decoder = self.stage_2_model_ledger.audio_decoder()
             vocoder = self.stage_2_model_ledger.vocoder()
@@ -4492,6 +5649,12 @@ class LTXVideoGeneratorWithOffloading:
             vocoder.to("cpu")
             del audio_decoder, vocoder
             synchronize_and_cleanup()
+        elif skip_for_external_audio:
+            print(">>> Skipping audio VAE decode (audio_strength=1.0, will use original audio)")
+            decoded_audio = None
+        elif skip_for_v2v_preserve:
+            print(">>> Skipping audio VAE decode (v2v_audio_mode=preserve, will copy from input video)")
+            decoded_audio = None
         else:
             decoded_audio = None
 
@@ -4636,6 +5799,7 @@ def generate_svi_multi_clip(
                 anchor_interval=args.anchor_interval if clip_idx > 0 else None,
                 anchor_strength=args.anchor_strength,
                 anchor_decay=args.anchor_decay,
+                anchor_crf=args.anchor_crf,
                 audio=args.audio,
                 audio_strength=args.audio_strength,
                 # STG parameters
@@ -4671,6 +5835,14 @@ def generate_svi_multi_clip(
                 depth_stage2=args.depth_stage2,
                 # Latent normalization
                 latent_norm_fn=latent_norm_fn,
+                # Sampler
+                sampler=args.sampler,
+                stage2_sampler=args.stage2_sampler,
+                # Stage 3 parameters
+                stage3_steps=args.stage3_steps,
+                # Kandinsky scheduler parameters
+                kandinsky_scheduler=args.kandinsky_scheduler,
+                kandinsky_scheduler_scale=args.kandinsky_scheduler_scale,
             )
 
             # Collect video frames from iterator - move to CPU immediately to save GPU memory
@@ -4991,35 +6163,16 @@ def generate_av_extension(
     skip_stage2: bool = False,
     latent_norm_fn: Callable | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """
-    Extend a video using time-based audio-video masking.
 
-    This implements the LTXVSetAudioVideoMaskByTime approach from ComfyUI-LTXVideo:
-    1. Load and encode input video and audio to latent space
-    2. Create noise masks based on time windows (preserve before start_time, generate after)
-    3. Run masked denoising to generate new content while preserving original
-    4. Decode and return the extended video
-
-    Args:
-        generator: LTXVideoGeneratorWithOffloading instance
-        args: Command line arguments
-        input_video_path: Path to video to extend
-        start_time: Time (seconds) to start generating new content (default: end of video)
-        end_time: Time (seconds) to stop generation (default: start_time + 5)
-        extend_steps: Number of denoising steps for extension
-        terminal: Terminal sigma for partial denoising (smaller = smoother continuation)
-        slope_len: Transition length at mask boundaries
-        skip_stage2: Whether to skip stage 2 refinement
-
-    Returns:
-        Tuple of (video_tensor [F, H, W, C], audio_tensor or None)
-    """
     import cv2
     from dataclasses import replace as dataclass_replace
     from ltx_core.types import LatentState, VideoPixelShape
 
     device = generator.device
     dtype = generator.dtype
+
+    # Save original video path before any trimming (for quality preservation)
+    original_input_video_path = input_video_path
 
     print("=" * 60)
     print("AV Extension Mode (Time-Based Audio-Video Masking)")
@@ -5110,9 +6263,16 @@ def generate_av_extension(
     stage1_height = (stage1_height // 32) * 32
 
     # Load frames from input video
+    # Calculate frames to load (up to start_time + buffer), ensuring 8n+1 format
+    frames_to_load = min(total_frames, int(start_time * input_fps) + 16)
+    # Round up to nearest 8n+1
+    n_frames = max(1, (frames_to_load - 1 + 7) // 8)
+    frames_to_load = 8 * n_frames + 1
+    frames_to_load = min(frames_to_load, total_frames)
+
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     input_frames = []
-    for _ in range(min(total_frames, int(start_time * input_fps) + 16)):  # Load up to start_time + some buffer
+    for _ in range(frames_to_load):
         ret, frame = cap.read()
         if not ret:
             break
@@ -5121,6 +6281,13 @@ def generate_av_extension(
         frame = cv2.resize(frame, (stage1_width, stage1_height), interpolation=cv2.INTER_LANCZOS4)
         input_frames.append(frame)
     cap.release()
+
+    # Ensure loaded frames is 8n+1 (pad with last frame if needed)
+    if len(input_frames) > 1:
+        n_loaded = (len(input_frames) - 1 + 7) // 8
+        target_loaded = 8 * n_loaded + 1
+        while len(input_frames) < target_loaded:
+            input_frames.append(input_frames[-1])
 
     print(f">>> Loaded {len(input_frames)} frames, resized to {stage1_width}x{stage1_height}")
 
@@ -5179,15 +6346,23 @@ def generate_av_extension(
             end_frame = min(start_frame + chunk_pixel_frames, total_pixel_frames)
             actual_frames = end_frame - start_frame
 
-            # Ensure we have at least 9 frames (minimum for VAE)
-            if actual_frames < 9:
-                # Pad with last frame
-                pad_frames = 9 - actual_frames
-                chunk = video_input[:, :, start_frame:end_frame, :, :]
-                last_frame = chunk[:, :, -1:, :, :].expand(-1, -1, pad_frames, -1, -1)
-                chunk = torch.cat([chunk, last_frame], dim=2)
-            else:
-                chunk = video_input[:, :, start_frame:end_frame, :, :]
+            # Ensure chunk has valid 8n+1 frame count for VAE
+            # Valid counts: 1, 9, 17, 25, 33, 41, 49, 57, 65, ...
+            chunk = video_input[:, :, start_frame:end_frame, :, :]
+
+            if actual_frames > 1:
+                # Calculate nearest valid 8n+1 frame count (round up)
+                n = (actual_frames - 1 + 7) // 8  # Round up to next valid count
+                target_frames = 8 * n + 1
+
+                if actual_frames < target_frames:
+                    # Pad with last frame to reach target
+                    pad_frames = target_frames - actual_frames
+                    last_frame = chunk[:, :, -1:, :, :].expand(-1, -1, pad_frames, -1, -1)
+                    chunk = torch.cat([chunk, last_frame], dim=2)
+                elif actual_frames > target_frames:
+                    # This shouldn't happen with round up, but trim if needed
+                    chunk = chunk[:, :, :target_frames, :, :]
 
             # Encode chunk
             chunk_latent = video_encoder(chunk.to(device=device, dtype=encoder_dtype))
@@ -5349,7 +6524,23 @@ def generate_av_extension(
     print(">>> Running masked denoising...")
 
     # 7A: Load text encoder FIRST and encode prompts (before transformer!)
-    text_encoder = generator.stage_1_model_ledger.text_encoder()
+    text_encoder_block_swap = None
+    if generator.enable_text_encoder_block_swap:
+        # Load text encoder to CPU first for block swapping
+        original_device = generator.stage_1_model_ledger.device
+        generator.stage_1_model_ledger.device = torch.device("cpu")
+        text_encoder = generator.stage_1_model_ledger.text_encoder()
+        generator.stage_1_model_ledger.device = original_device
+
+        # Enable block swap for text encoder
+        print(f">>> Enabling text encoder block swap ({generator.text_encoder_blocks_in_memory} layers in GPU)...", flush=True)
+        text_encoder_block_swap = enable_text_encoder_block_swap(
+            text_encoder,
+            blocks_in_memory=generator.text_encoder_blocks_in_memory,
+            device=device,
+        )
+    else:
+        text_encoder = generator.stage_1_model_ledger.text_encoder()
     print(">>> Encoding prompts...")
     if args.cfg_guidance_scale > 1.0:
         context_p, context_n = encode_text(text_encoder, prompts=[args.prompt, args.negative_prompt])
@@ -5709,14 +6900,38 @@ def generate_av_extension(
         )
         audio_state = noiser(audio_state, noise_scale=1.0)
 
-    # Run denoising loop with properly masked states
-    final_video_state, final_audio_state = euler_denoising_loop(
-        sigmas=sigmas,
-        video_state=video_state,
-        audio_state=audio_state,
-        stepper=stepper,
-        denoise_fn=denoise_fn,
-        latent_norm_fn=latent_norm_fn,
+    # Create retry state for AV-Extension Stage 1 (fast defaults)
+    av_stage1_retry_state = OOMRetryState(
+        stage="av_extension_stage1",
+        original_blocks=generator.dit_blocks_in_memory if generator.enable_dit_block_swap else 0,
+        current_blocks=generator.dit_blocks_in_memory if generator.enable_dit_block_swap else 0,
+        min_blocks=2,  # DiT minimum
+        original_ffn_chunk_size=None,
+        original_activation_offload=False,
+        original_temporal_chunk_size=0,
+    )
+
+    def av_denoising_call(**kwargs):
+        return euler_denoising_loop(**kwargs)
+
+    av_denoising_kwargs = {
+        'sigmas': sigmas,
+        'video_state': video_state,
+        'audio_state': audio_state,
+        'stepper': stepper,
+        'denoise_fn': denoise_fn,
+        'latent_norm_fn': latent_norm_fn,
+    }
+
+    # Run denoising loop with properly masked states and OOM retry
+    (final_video_state, final_audio_state), block_swap_manager = oom_retry_wrapper(
+        retry_state=av_stage1_retry_state,
+        denoising_fn=av_denoising_call,
+        transformer=transformer,
+        generator_instance=generator,
+        block_swap_manager=block_swap_manager,
+        seed=args.seed,
+        **av_denoising_kwargs
     )
 
     # =========================================================================
@@ -5817,6 +7032,10 @@ def generate_av_extension(
         cap_full.set(cv2.CAP_PROP_POS_FRAMES, 0)
         full_res_frames = []
         frames_to_load = min(int(cap_full.get(cv2.CAP_PROP_FRAME_COUNT)), int(start_time * input_fps) + 16)
+        # Round to nearest 8n+1 format for VAE compatibility
+        n_frames_full = max(1, (frames_to_load - 1 + 7) // 8)
+        frames_to_load = 8 * n_frames_full + 1
+        frames_to_load = min(frames_to_load, int(cap_full.get(cv2.CAP_PROP_FRAME_COUNT)))
         for _ in range(frames_to_load):
             ret, frame = cap_full.read()
             if not ret:
@@ -5836,8 +7055,20 @@ def generate_av_extension(
         full_res_input = full_res_input * 2.0 - 1.0  # Normalize to [-1, 1]
 
         # Encode in temporal chunks (same logic as Stage 1)
+        # But use smaller chunks for high resolution to avoid OOM
+        # Base: 65 frames works at 512x512. Scale inversely with pixel count.
         encoder_dtype = next(video_encoder.parameters()).dtype
-        chunk_pixel_frames = 65
+        base_resolution = 512 * 512
+        current_resolution = stage2_width * stage2_height
+        resolution_ratio = current_resolution / base_resolution
+        # Scale chunk size inversely with resolution ratio
+        # Valid sizes: 9 (1*8+1), 17 (2*8+1), 25 (3*8+1), 33 (4*8+1), ..., 65 (8*8+1)
+        base_chunk = 65
+        scaled_chunk = int(base_chunk / resolution_ratio)
+        # Round down to nearest 8*k+1 format, minimum 9
+        k = max(1, (scaled_chunk - 1) // 8)
+        chunk_pixel_frames = k * 8 + 1
+        print(f">>> Using chunk size {chunk_pixel_frames} for {stage2_width}x{stage2_height} encoding")
         total_pixel_frames_full = full_res_input.shape[2]
 
         full_res_latent_chunks = []
@@ -6086,14 +7317,38 @@ def generate_av_extension(
         )
         stage2_audio_state = noiser(stage2_audio_state, noise_scale=stage2_sigmas[0].item())
 
-        # Run stage 2 denoising loop with masked states
-        final_stage2_video, final_stage2_audio = euler_denoising_loop(
-            sigmas=stage2_sigmas,
-            video_state=stage2_video_state,
-            audio_state=stage2_audio_state,
-            stepper=stepper,
-            denoise_fn=stage2_denoise_fn,
-            latent_norm_fn=latent_norm_fn,
+        # Create retry state for AV-Extension Stage 2
+        av_stage2_retry_state = OOMRetryState(
+            stage="av_extension_stage2",
+            original_blocks=generator.refiner_blocks_in_memory if generator.enable_refiner_block_swap else 0,
+            current_blocks=generator.refiner_blocks_in_memory if generator.enable_refiner_block_swap else 0,
+            min_blocks=1,  # Refiner minimum
+            original_ffn_chunk_size=generator.ffn_chunk_size,
+            original_activation_offload=generator.enable_activation_offload,
+            original_temporal_chunk_size=generator.temporal_chunk_size,
+        )
+
+        def av_stage2_denoising_call(**kwargs):
+            return euler_denoising_loop(**kwargs)
+
+        av_stage2_denoising_kwargs = {
+            'sigmas': stage2_sigmas,
+            'video_state': stage2_video_state,
+            'audio_state': stage2_audio_state,
+            'stepper': stepper,
+            'denoise_fn': stage2_denoise_fn,
+            'latent_norm_fn': latent_norm_fn,
+        }
+
+        # Run stage 2 denoising loop with masked states and OOM retry
+        (final_stage2_video, final_stage2_audio), stage2_block_swap_manager = oom_retry_wrapper(
+            retry_state=av_stage2_retry_state,
+            denoising_fn=av_stage2_denoising_call,
+            transformer=stage2_transformer,
+            generator_instance=generator,
+            block_swap_manager=stage2_block_swap_manager,
+            seed=args.seed,
+            **av_stage2_denoising_kwargs
         )
 
         # Unpatchify results
@@ -6142,6 +7397,62 @@ def generate_av_extension(
     del video_decoder, decoded_video_chunks
     cleanup_memory()
 
+    # =========================================================================
+    # Step 10.5: Replace preserved frames with original pixels (bypass VAE quality loss)
+    # =========================================================================
+    preserve_pixel_frames = int(start_time * output_fps)
+    if preserve_pixel_frames > 0:
+        print(f">>> Replacing {preserve_pixel_frames} preserved frames with original pixels...")
+
+        # Get output resolution from decoded video
+        out_h, out_w = decoded_video.shape[1], decoded_video.shape[2]
+
+        # Load original video frames at output resolution and fps
+        import numpy as np
+        cap_orig = cv2.VideoCapture(original_input_video_path)
+        if cap_orig.isOpened():
+            orig_fps = cap_orig.get(cv2.CAP_PROP_FPS)
+            orig_total = int(cap_orig.get(cv2.CAP_PROP_FRAME_COUNT))
+
+            # Calculate max input frame needed
+            max_in_frame = int((preserve_pixel_frames - 1) * orig_fps / output_fps)
+            max_in_frame = min(max_in_frame, orig_total - 1)
+
+            # Read frames sequentially (much faster than seeking)
+            print(f">>>   Loading {max_in_frame + 1} source frames...")
+            input_frames = []
+            for i in range(max_in_frame + 1):
+                ret, frame = cap_orig.read()
+                if not ret:
+                    break
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+                input_frames.append(frame)
+                if (i + 1) % 100 == 0:
+                    print(f">>>   Loaded {i + 1}/{max_in_frame + 1} frames...")
+            cap_orig.release()
+
+            # Map to output fps (select/duplicate frames as needed)
+            original_frames = []
+            for out_frame_idx in range(preserve_pixel_frames):
+                in_frame_idx = int(out_frame_idx * orig_fps / output_fps)
+                in_frame_idx = min(in_frame_idx, len(input_frames) - 1)
+                if in_frame_idx < len(input_frames):
+                    original_frames.append(input_frames[in_frame_idx])
+
+            del input_frames  # Free memory
+
+            if len(original_frames) > 0:
+                # Convert to tensor [F, H, W, C] as uint8 [0-255] to match decoded video format
+                original_pixels = torch.from_numpy(np.stack(original_frames))  # uint8 from cv2
+
+                # Replace preserved frames
+                num_replace = min(len(original_frames), preserve_pixel_frames, decoded_video.shape[0])
+                decoded_video[:num_replace] = original_pixels[:num_replace]
+                print(f">>> Replaced {num_replace} frames with original quality pixels")
+        else:
+            print(f">>> Warning: Could not open original video for frame preservation")
+
     # Decode audio if present
     decoded_audio = None
     if denoised_audio_latent is not None:
@@ -6155,6 +7466,39 @@ def generate_av_extension(
         )
         del audio_decoder, vocoder
         cleanup_memory()
+
+    # =========================================================================
+    # Step 10.7: Replace preserved audio with original audio (bypass VAE quality loss)
+    # =========================================================================
+    if decoded_audio is not None and audio_waveform is not None and start_time > 0:
+        # Use original sample rate or default to 24000
+        sr = audio_sample_rate if audio_sample_rate is not None else 24000
+        preserve_audio_samples = int(start_time * sr)
+
+        if preserve_audio_samples > 0:
+            print(f">>> Replacing {preserve_audio_samples} preserved audio samples with original...")
+
+            # Get the number of samples to replace (min of original, decoded, and preserve target)
+            orig_samples = audio_waveform.shape[-1] if audio_waveform.dim() > 0 else 0
+            decoded_samples = decoded_audio.shape[-1] if decoded_audio.dim() > 0 else 0
+            num_replace = min(preserve_audio_samples, orig_samples, decoded_samples)
+
+            if num_replace > 0:
+                # Squeeze batch dimension if present (audio_waveform may be [1, C, S])
+                orig_audio = audio_waveform.squeeze(0) if audio_waveform.dim() == 3 else audio_waveform
+
+                # Handle both 1D and 2D audio tensors
+                if decoded_audio.dim() == 1 and orig_audio.dim() == 1:
+                    decoded_audio[:num_replace] = orig_audio[:num_replace]
+                elif decoded_audio.dim() == 2 and orig_audio.dim() == 2:
+                    decoded_audio[:, :num_replace] = orig_audio[:, :num_replace]
+                elif decoded_audio.dim() == 1 and orig_audio.dim() == 2:
+                    # Original is stereo, decoded is mono - use first channel
+                    decoded_audio[:num_replace] = orig_audio[0, :num_replace]
+                elif decoded_audio.dim() == 2 and orig_audio.dim() == 1:
+                    # Original is mono, decoded is stereo - broadcast
+                    decoded_audio[:, :num_replace] = orig_audio[:num_replace].unsqueeze(0)
+                print(f">>> Replaced {num_replace} audio samples with original quality")
 
     print(f">>> Output video shape: {decoded_video.shape}")
     if decoded_audio is not None:
@@ -7054,14 +8398,38 @@ def generate_v2v_join(
         audio_state = dataclass_replace(audio_state, denoise_mask=torch.zeros_like(audio_state.denoise_mask))
         audio_state = noiser(audio_state, noise_scale=1.0)
 
-    # Run denoising loop
-    final_video_state, final_audio_state = euler_denoising_loop(
-        sigmas=sigmas,
-        video_state=video_state,
-        audio_state=audio_state,
-        stepper=stepper,
-        denoise_fn=denoise_fn,
-        latent_norm_fn=latent_norm_fn,
+    # Create retry state for V2V Join Stage 1 (fast defaults)
+    v2v_join_stage1_retry_state = OOMRetryState(
+        stage="v2v_join_stage1",
+        original_blocks=generator.dit_blocks_in_memory if generator.enable_dit_block_swap else 0,
+        current_blocks=generator.dit_blocks_in_memory if generator.enable_dit_block_swap else 0,
+        min_blocks=2,  # DiT minimum
+        original_ffn_chunk_size=None,
+        original_activation_offload=False,
+        original_temporal_chunk_size=0,
+    )
+
+    def v2v_join_denoising_call(**kwargs):
+        return euler_denoising_loop(**kwargs)
+
+    v2v_join_denoising_kwargs = {
+        'sigmas': sigmas,
+        'video_state': video_state,
+        'audio_state': audio_state,
+        'stepper': stepper,
+        'denoise_fn': denoise_fn,
+        'latent_norm_fn': latent_norm_fn,
+    }
+
+    # Run denoising loop with OOM retry
+    (final_video_state, final_audio_state), block_swap_manager = oom_retry_wrapper(
+        retry_state=v2v_join_stage1_retry_state,
+        denoising_fn=v2v_join_denoising_call,
+        transformer=transformer,
+        generator_instance=generator,
+        block_swap_manager=block_swap_manager,
+        seed=args.seed,
+        **v2v_join_denoising_kwargs
     )
 
     # Extract ONLY the generate tokens from final_video_state (matching AV extension pattern)
@@ -7456,14 +8824,38 @@ def generate_v2v_join(
             stage2_audio_state = stage2_audio_tools.create_initial_state(device, dtype, None)
             stage2_audio_state = stage2_noiser(stage2_audio_state, noise_scale=1.0)
 
-        # Run stage 2 denoising
-        final_stage2_video_state, final_stage2_audio = euler_denoising_loop(
-            sigmas=stage2_sigmas,
-            video_state=stage2_video_state,
-            audio_state=stage2_audio_state,
-            stepper=stepper,
-            denoise_fn=stage2_denoise_fn,
-            latent_norm_fn=latent_norm_fn,
+        # Create retry state for V2V Join Stage 2
+        v2v_join_stage2_retry_state = OOMRetryState(
+            stage="v2v_join_stage2",
+            original_blocks=generator.refiner_blocks_in_memory if generator.enable_refiner_block_swap else 0,
+            current_blocks=generator.refiner_blocks_in_memory if generator.enable_refiner_block_swap else 0,
+            min_blocks=1,  # Refiner minimum
+            original_ffn_chunk_size=generator.ffn_chunk_size,
+            original_activation_offload=generator.enable_activation_offload,
+            original_temporal_chunk_size=generator.temporal_chunk_size,
+        )
+
+        def v2v_join_stage2_denoising_call(**kwargs):
+            return euler_denoising_loop(**kwargs)
+
+        v2v_join_stage2_denoising_kwargs = {
+            'sigmas': stage2_sigmas,
+            'video_state': stage2_video_state,
+            'audio_state': stage2_audio_state,
+            'stepper': stepper,
+            'denoise_fn': stage2_denoise_fn,
+            'latent_norm_fn': latent_norm_fn,
+        }
+
+        # Run stage 2 denoising with OOM retry
+        (final_stage2_video_state, final_stage2_audio), stage2_block_swap_manager = oom_retry_wrapper(
+            retry_state=v2v_join_stage2_retry_state,
+            denoising_fn=v2v_join_stage2_denoising_call,
+            transformer=stage2_transformer,
+            generator_instance=generator,
+            block_swap_manager=stage2_block_swap_manager,
+            seed=args.seed,
+            **v2v_join_stage2_denoising_kwargs
         )
 
         final_stage2_video_state = stage2_video_tools.clear_conditioning(final_stage2_video_state)
@@ -8185,6 +9577,7 @@ def sliding_window_generate(
             anchor_interval=args.anchor_interval,
             anchor_strength=args.anchor_strength,
             anchor_decay=args.anchor_decay,
+            anchor_crf=args.anchor_crf,
             audio=args.audio,
             audio_strength=args.audio_strength,
             # STG parameters
@@ -8221,6 +9614,14 @@ def sliding_window_generate(
             depth_stage2=args.depth_stage2,
             # Latent normalization
             latent_norm_fn=latent_norm_fn,
+            # Sampler
+            sampler=args.sampler,
+            stage2_sampler=args.stage2_sampler,
+            # Stage 3 parameters
+            stage3_steps=args.stage3_steps,
+            # Kandinsky scheduler parameters
+            kandinsky_scheduler=args.kandinsky_scheduler,
+            kandinsky_scheduler_scale=args.kandinsky_scheduler_scale,
         )
 
         # Collect video frames from iterator - move to CPU immediately to save GPU memory
@@ -8409,11 +9810,17 @@ def main():
     print(f"FP8: {args.enable_fp8}")
     if args.images:
         print(f"Image conditioning: {len(args.images)} image(s)")
+        for i, img in enumerate(args.images):
+            crf = img[3] if len(img) > 3 else 33
+            if crf != 33:
+                crf_desc = "lossless" if crf == 0 else f"CRF {int(crf)}"
+                print(f"  Image {i+1}: {crf_desc}")
     if args.anchor_interval:
         anchor_src = args.anchor_image if args.anchor_image else "first --image"
         num_anchors = len(range(args.anchor_interval, args.num_frames, args.anchor_interval))
         decay_info = f", decay: {args.anchor_decay}" if args.anchor_decay != "none" else ""
-        print(f"Anchor conditioning: {num_anchors} anchor(s) every {args.anchor_interval} frames (source: {anchor_src}, strength: {args.anchor_strength}{decay_info})")
+        crf_info = f", CRF: {'lossless' if args.anchor_crf == 0 else int(args.anchor_crf)}" if args.anchor_crf != 33 else ""
+        print(f"Anchor conditioning: {num_anchors} anchor(s) every {args.anchor_interval} frames (source: {anchor_src}, strength: {args.anchor_strength}{decay_info}{crf_info})")
     # SVI Pro mode info
     if args.svi_mode or args.extend_video:
         svi_mode_type = "Video Extension" if args.extend_video else "Multi-Clip Generation"
@@ -8449,6 +9856,7 @@ def main():
         gemma_root=args.gemma_root,
         loras=args.loras,
         stage2_loras=args.stage2_loras,
+        stage3_loras=args.stage3_loras,
         fp8transformer=args.enable_fp8,
         offload=args.offload,
         enable_dit_block_swap=args.enable_dit_block_swap,
@@ -8457,6 +9865,8 @@ def main():
         text_encoder_blocks_in_memory=args.text_encoder_blocks_in_memory,
         enable_refiner_block_swap=args.enable_refiner_block_swap,
         refiner_blocks_in_memory=args.refiner_blocks_in_memory,
+        enable_stage3_block_swap=args.enable_stage3_block_swap,
+        stage3_blocks_in_memory=args.stage3_blocks_in_memory,
         enable_activation_offload=args.enable_activation_offload,
         temporal_chunk_size=args.temporal_chunk_size,
         one_stage=args.one_stage,
@@ -8465,6 +9875,8 @@ def main():
         stage2_checkpoint=args.stage2_checkpoint,
         ffn_chunk_size=args.ffn_chunk_size,
         vae_path=args.vae,
+        num_stages=args.num_stages,
+        pipeline_mode=args.pipeline_mode,
     )
 
     # Set up tiling config for VAE
@@ -8701,13 +10113,15 @@ def main():
             refine_strength=args.refine_strength,
             refine_steps=args.refine_steps,
             stage2_steps=args.stage2_steps,
+            stage2_strength=args.stage2_strength,
+            stage3_strength=args.stage3_strength,
             anchor_image=args.anchor_image,
             anchor_interval=args.anchor_interval,
             anchor_strength=args.anchor_strength,
             anchor_decay=args.anchor_decay,
+            anchor_crf=args.anchor_crf,
             audio=args.audio,
             audio_strength=args.audio_strength,
-            # STG parameters
             stg_scale=args.stg_scale,
             stg_blocks=args.stg_blocks,
             stg_mode=args.stg_mode,
@@ -8729,17 +10143,24 @@ def main():
             scheduler_type=getattr(args, 'scheduler', 'ltx2'),
             preview_callback=preview_callback,
             preview_callback_interval=args.preview_interval,
-            # Depth Control (IC-LoRA) parameters
             depth_video=args.depth_video,
             depth_image=args.depth_image,
             estimate_depth=args.estimate_depth,
             depth_strength=args.depth_strength,
             depth_stage2=args.depth_stage2,
-            # Latent normalization (fixes overbaking/audio clipping)
             latent_norm_fn=latent_norm_fn,
-            # V2A mode (freeze video, generate audio)
             v2a_mode=args.v2a_mode,
             v2a_strength=args.v2a_strength,
+            v2v_chunk_frames=args.v2v_chunk_frames,
+            v2v_overlap_frames=args.v2v_overlap_frames,
+            refine_latent_stride=args.refine_latent_stride,
+            v2v_audio_mode=args.v2v_audio_mode,
+            v2v_audio_strength=args.v2v_audio_strength,
+            sampler=args.sampler,
+            stage2_sampler=args.stage2_sampler,
+            stage3_steps=args.stage3_steps,
+            kandinsky_scheduler=args.kandinsky_scheduler,
+            kandinsky_scheduler_scale=args.kandinsky_scheduler_scale,
         )
 
     # Encode and save video
@@ -8777,6 +10198,79 @@ def main():
         ], check=True)
 
         os.unlink(temp_audio_path)
+    elif args.audio_strength == 1.0 and args.audio:
+        # Audio passthrough mode: audio_strength=1.0 means frozen audio
+        # Skip VAE decode (already done above) and concatenate original audio via ffmpeg
+        import subprocess
+        import tempfile
+        import os
+
+        print(">>> Audio Passthrough: Encoding video and concatenating original audio...")
+
+        # First encode video without audio to a temp file
+        temp_video = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
+        temp_video_path = temp_video.name
+        temp_video.close()
+
+        encode_video(
+            video=video,
+            fps=args.frame_rate,
+            audio=None,  # No audio in temp video
+            audio_sample_rate=None,
+            output_path=temp_video_path,
+            video_chunks_number=video_chunks_number,
+        )
+
+        # Use ffmpeg to combine generated video with original audio
+        subprocess.run([
+            'ffmpeg', '-y',
+            '-i', temp_video_path,
+            '-i', args.audio,
+            '-c:v', 'copy',
+            '-c:a', 'aac',
+            '-map', '0:v:0',
+            '-map', '1:a:0',
+            '-shortest',
+            args.output_path
+        ], check=True)
+
+        os.unlink(temp_video_path)
+    elif args.input_video and args.v2v_audio_mode == "preserve":
+        # V2V preserve mode: copy audio from input video
+        import subprocess
+        import tempfile
+        import os
+
+        print(">>> V2V Preserve: Encoding video and copying audio from input video...")
+
+        # First encode video without audio to a temp file
+        temp_video = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
+        temp_video_path = temp_video.name
+        temp_video.close()
+
+        encode_video(
+            video=video,
+            fps=args.frame_rate,
+            audio=None,
+            audio_sample_rate=None,
+            output_path=temp_video_path,
+            video_chunks_number=video_chunks_number,
+        )
+
+        # Copy audio from input video
+        subprocess.run([
+            'ffmpeg', '-y',
+            '-i', temp_video_path,
+            '-i', args.input_video,
+            '-c:v', 'copy',
+            '-c:a', 'aac',
+            '-map', '0:v:0',
+            '-map', '1:a:0?',  # ? makes audio optional (handles videos without audio)
+            '-shortest',
+            args.output_path
+        ], check=True)
+
+        os.unlink(temp_video_path)
     else:
         encode_video(
             video=video,
@@ -8790,9 +10284,19 @@ def main():
     print(f">>> Video saved in {time.time() - encode_start:.1f}s")
 
     # Build and save metadata
+    # Determine pipeline type string
+    if args.refine_only:
+        pipeline_type = "refine-only"
+    elif args.one_stage:
+        pipeline_type = "one-stage"
+    elif args.num_stages == 3:
+        pipeline_type = f"three-stage-{args.pipeline_mode}"
+    else:
+        pipeline_type = "two-stage"
+
     metadata = {
         "model_type": "LTX-2",
-        "pipeline": "refine-only" if args.refine_only else ("one-stage" if args.one_stage else "two-stage"),
+        "pipeline": pipeline_type,
         "distilled_checkpoint": args.distilled_checkpoint,
         "checkpoint_path": args.checkpoint_path,
         "stage2_checkpoint": args.stage2_checkpoint,
@@ -8809,6 +10313,7 @@ def main():
         "stg_mode": args.stg_mode if args.stg_scale > 0 else None,
         "num_inference_steps": args.num_inference_steps,
         "seed": args.seed,
+        "sampler": args.sampler,
         "offload": args.offload,
         "enable_fp8": args.enable_fp8,
         # Separate block swap settings
@@ -8818,21 +10323,47 @@ def main():
         "text_encoder_blocks_in_memory": args.text_encoder_blocks_in_memory if args.enable_text_encoder_block_swap else None,
         "enable_refiner_block_swap": args.enable_refiner_block_swap,
         "refiner_blocks_in_memory": args.refiner_blocks_in_memory if args.enable_refiner_block_swap else None,
-        "images": [(img[0], img[1], img[2]) for img in args.images] if args.images else None,
+        # Memory optimization settings
+        "ffn_chunk_size": args.ffn_chunk_size,
+        "enable_activation_offload": args.enable_activation_offload,
+        "temporal_chunk_size": args.temporal_chunk_size if args.temporal_chunk_size > 0 else None,
+        # Image conditioning (includes CRF in tuple: path, frame_idx, strength, crf)
+        "images": [(img[0], img[1], img[2], img[3] if len(img) > 3 else 33) for img in args.images] if args.images else None,
+        # LoRA settings
         "loras": [(lora.path, lora.strength) for lora in args.loras] if args.loras else None,
+        "stage2_loras": [(lora.path, lora.strength) for lora in args.stage2_loras] if args.stage2_loras else None,
+        "stage3_loras": [(lora.path, lora.strength) for lora in args.stage3_loras] if args.stage3_loras else None,
         "distilled_lora": [(lora.path, lora.strength) for lora in args.distilled_lora] if args.distilled_lora else None,
+        # V2V / Refine settings
         "input_video": args.input_video,
         "refine_strength": args.refine_strength if args.input_video else None,
         "refine_steps": args.refine_steps if args.input_video else None,
+        "v2v_chunk_frames": args.v2v_chunk_frames if args.input_video else None,
+        "v2v_overlap_frames": args.v2v_overlap_frames if args.input_video else None,
+        "refine_latent_stride": args.refine_latent_stride if args.input_video else None,
+        "v2v_audio_mode": args.v2v_audio_mode if args.input_video else None,
+        "v2v_audio_strength": args.v2v_audio_strength if args.input_video and args.v2v_audio_mode == "condition" else None,
+        # Anchor settings
         "anchor_image": args.anchor_image,
         "anchor_interval": args.anchor_interval,
         "anchor_strength": args.anchor_strength if args.anchor_interval else None,
         "anchor_decay": args.anchor_decay if args.anchor_interval and args.anchor_decay != "none" else None,
+        "anchor_crf": args.anchor_crf if args.anchor_interval and args.anchor_crf != 33 else None,
+        # Audio settings
         "disable_audio": args.disable_audio,
         "audio": args.audio,
         "audio_strength": args.audio_strength if args.audio else None,
         "enhance_prompt": args.enhance_prompt,
         "enhanced_prompt": enhanced_prompt,
+        # Latent normalization settings
+        "latent_norm_mode": args.latent_norm if args.latent_norm != "none" else None,
+        "latent_norm_factors": args.latent_norm_factors if args.latent_norm != "none" else None,
+        "latent_norm_target_mean": args.latent_norm_target_mean if args.latent_norm != "none" else None,
+        "latent_norm_target_std": args.latent_norm_target_std if args.latent_norm != "none" else None,
+        "latent_norm_percentile": args.latent_norm_percentile if args.latent_norm != "none" else None,
+        "latent_norm_clip_outliers": args.latent_norm_clip_outliers if args.latent_norm != "none" else None,
+        "latent_norm_video_only": args.latent_norm_video_only if args.latent_norm != "none" else None,
+        "latent_norm_audio_only": args.latent_norm_audio_only if args.latent_norm != "none" else None,
         # SVI Pro metadata
         "svi_mode": args.svi_mode,
         "svi_num_clips": args.num_clips if (args.svi_mode or args.extend_video) else None,

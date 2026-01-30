@@ -14,8 +14,38 @@ import torch
 from torch import nn
 
 from ltx_core.model.transformer.model import LTXModel, X0Model
+from ltx_core.model.transformer.transformer_args import TransformerArgs
 
-from .custom_offloading_utils import ModelOffloader, clean_memory_on_device, weighs_to_device
+from .custom_offloading_utils import ModelOffloader, clean_memory_on_device, weighs_to_device, weights_to_pinned_cpu
+
+
+def _move_transformer_args_to_device(args: TransformerArgs, device: torch.device) -> TransformerArgs:
+    """Move all TransformerArgs tensors to the specified device."""
+    from dataclasses import replace
+
+    def to_device(t):
+        if t is None:
+            return None
+        if t.device == device:
+            return t
+        return t.to(device)
+
+    def pe_to_device(pe):
+        if pe is None:
+            return None
+        return (to_device(pe[0]), to_device(pe[1]))
+
+    return replace(args,
+        x=to_device(args.x),
+        timesteps=to_device(args.timesteps),
+        embedded_timestep=to_device(args.embedded_timestep),
+        context=to_device(args.context),
+        context_mask=to_device(args.context_mask),
+        positional_embeddings=pe_to_device(args.positional_embeddings),
+        cross_positional_embeddings=pe_to_device(args.cross_positional_embeddings),
+        cross_scale_shift_timestep=to_device(args.cross_scale_shift_timestep),
+        cross_gate_timestep=to_device(args.cross_gate_timestep),
+    )
 
 
 def log_memory(label: str) -> None:
@@ -169,6 +199,14 @@ def enable_block_swap_with_activation_offload(
 
         use_temporal_chunking = temporal_chunk_size > 0 and vx_pinned is not None
 
+        if not use_temporal_chunking:
+            video_args_gpu = _move_transformer_args_to_device(video, device) if video is not None else None
+            audio_args_gpu = _move_transformer_args_to_device(audio, device) if audio is not None else None
+            torch.cuda.synchronize(device)
+        else:
+            video_args_gpu = None
+            audio_args_gpu = None
+
         # Track if we have a pending transfer
         pending_transfer = False
 
@@ -211,20 +249,27 @@ def enable_block_swap_with_activation_offload(
                     transfer_stream.synchronize()
                     pending_transfer = False
 
-                # Move activations from pinned CPU to GPU (fast DMA)
+                # Move activations from pinned CPU to GPU
                 if vx_pinned is not None:
-                    vx_gpu = vx_pinned.to(device, non_blocking=True)
+                    vx_gpu = vx_pinned.to(device)
                 else:
                     vx_gpu = None
 
                 if ax_pinned is not None:
-                    ax_gpu = ax_pinned.to(device, non_blocking=True)
+                    ax_gpu = ax_pinned.to(device)
                 else:
                     ax_gpu = None
 
-                # Create video/audio args with GPU activations
-                video_gpu = replace(video, x=vx_gpu) if video is not None else None
-                audio_gpu = replace(audio, x=ax_gpu) if audio is not None else None
+                # Use pre-moved GPU args and replace x with the pinned activation buffer
+                if video_args_gpu is not None:
+                    video_gpu = replace(video_args_gpu, x=vx_gpu) if vx_gpu is not None else video_args_gpu
+                else:
+                    video_gpu = None
+
+                if audio_args_gpu is not None:
+                    audio_gpu = replace(audio_args_gpu, x=ax_gpu) if ax_gpu is not None else audio_args_gpu
+                else:
+                    audio_gpu = None
 
                 if verbose and block_idx % 10 == 0:
                     log_memory(f"Block {block_idx} (before)")
@@ -240,13 +285,11 @@ def enable_block_swap_with_activation_offload(
                 vx_result = video_out.x if video_out is not None else None
                 ax_result = audio_out.x if audio_out is not None else None
 
-                # Start async GPU→CPU transfer on separate stream (overlaps with next block's weight load)
-                with torch.cuda.stream(transfer_stream):
-                    if vx_result is not None:
-                        vx_pinned.copy_(vx_result, non_blocking=True)
-                    if ax_result is not None:
-                        ax_pinned.copy_(ax_result, non_blocking=True)
-                pending_transfer = True
+                # Copy results back to pinned CPU memory
+                if vx_result is not None:
+                    vx_pinned.copy_(vx_result)
+                if ax_result is not None:
+                    ax_pinned.copy_(ax_result)
 
                 # Clean up GPU tensors (can happen while transfer runs)
                 del vx_gpu, ax_gpu, video_gpu, audio_gpu, video_out, audio_out
@@ -280,9 +323,20 @@ def enable_block_swap_with_activation_offload(
         if verbose:
             log_memory("After block loop")
 
-        # Return with final activations
-        video_final = replace(video, x=vx_final) if video is not None else None
-        audio_final = replace(audio, x=ax_final) if audio is not None else None
+        # Return with final activations (use GPU args if available for consistency)
+        if video_args_gpu is not None:
+            video_final = replace(video_args_gpu, x=vx_final)
+        elif video is not None:
+            video_final = replace(video, x=vx_final)
+        else:
+            video_final = None
+
+        if audio_args_gpu is not None:
+            audio_final = replace(audio_args_gpu, x=ax_final)
+        elif audio is not None:
+            audio_final = replace(audio, x=ax_final)
+        else:
+            audio_final = None
 
         return video_final, audio_final
 
@@ -523,16 +577,26 @@ def enable_text_encoder_block_swap(
         from ltx_core.text_encoders.gemma.encoders.base_encoder import _pad_inputs_for_attention_alignment
         model_inputs = _pad_inputs_for_attention_alignment(model_inputs, pad_token_id=pad_token_id)
 
-        with torch.inference_mode(), torch.random.fork_rng(devices=[device]):
-            torch.manual_seed(seed)
-            outputs = text_encoder.model.generate(
-                **model_inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=True,
-                temperature=0.7,
-            )
-            generated_ids = outputs[0][len(model_inputs.input_ids[0]) :]
-            enhanced_prompt = text_encoder.processor.tokenizer.decode(generated_ids, skip_special_tokens=True)
+        # Disable fast swap during generate() - it's incompatible with many forward calls.
+        # Use legacy swap method like mainbranch does.
+        _offloader = text_encoder.model.language_model._block_swap_offloader
+        _was_fast_swap = _offloader.use_fast_swap
+        _offloader.use_fast_swap = False
+
+        try:
+            with torch.inference_mode(), torch.random.fork_rng(devices=[device]):
+                torch.manual_seed(seed)
+                outputs = text_encoder.model.generate(
+                    **model_inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=True,
+                    temperature=0.7,
+                )
+                generated_ids = outputs[0][len(model_inputs.input_ids[0]) :]
+                enhanced_prompt = text_encoder.processor.tokenizer.decode(generated_ids, skip_special_tokens=True)
+        finally:
+            # Restore fast swap for text encoding
+            _offloader.use_fast_swap = _was_fast_swap
 
         return enhanced_prompt
 
