@@ -1485,6 +1485,21 @@ def generate_ltx_video(
     stg_scale: float,
     stg_blocks: str,
     stg_mode: str,
+    # Advanced CFG (MultiModal Guidance)
+    guidance_mode: str,
+    scheduler_type: str,
+    video_cfg_guidance_scale: float,
+    video_stg_scale: float,
+    video_stg_blocks: str,
+    video_rescale_scale: float,
+    a2v_guidance_scale: float,
+    video_skip_step: int,
+    audio_cfg_guidance_scale: float,
+    audio_stg_scale: float,
+    audio_stg_blocks: str,
+    audio_rescale_scale: float,
+    v2a_guidance_scale: float,
+    audio_skip_step: int,
     # Kandinsky scheduler parameters
     kandinsky_scheduler: bool,
     kandinsky_scheduler_scale: float,
@@ -1694,6 +1709,36 @@ def generate_ltx_video(
                     block = block.strip()
                     if block:
                         command.extend(["--stg-blocks", block])
+
+        # Advanced CFG (MultiModal Guidance)
+        if guidance_mode and guidance_mode != "legacy":
+            command.extend(["--guidance-mode", str(guidance_mode)])
+            command.extend(["--video-cfg-guidance-scale", str(float(video_cfg_guidance_scale))])
+            command.extend(["--video-stg-scale", str(float(video_stg_scale))])
+            command.extend(["--video-rescale-scale", str(float(video_rescale_scale))])
+            command.extend(["--a2v-guidance-scale", str(float(a2v_guidance_scale))])
+            command.extend(["--video-skip-step", str(int(video_skip_step))])
+            command.extend(["--audio-cfg-guidance-scale", str(float(audio_cfg_guidance_scale))])
+            command.extend(["--audio-stg-scale", str(float(audio_stg_scale))])
+            command.extend(["--audio-rescale-scale", str(float(audio_rescale_scale))])
+            command.extend(["--v2a-guidance-scale", str(float(v2a_guidance_scale))])
+            command.extend(["--audio-skip-step", str(int(audio_skip_step))])
+            # Video STG blocks (multimodal)
+            if video_stg_blocks and video_stg_blocks.strip():
+                for block in video_stg_blocks.split(","):
+                    block = block.strip()
+                    if block:
+                        command.extend(["--video-stg-blocks", block])
+            # Audio STG blocks (multimodal)
+            if audio_stg_blocks and audio_stg_blocks.strip():
+                for block in audio_stg_blocks.split(","):
+                    block = block.strip()
+                    if block:
+                        command.extend(["--audio-stg-blocks", block])
+
+        # Scheduler type
+        if scheduler_type and scheduler_type != "ltx2":
+            command.extend(["--scheduler", str(scheduler_type)])
 
         # Kandinsky scheduler parameters
         if kandinsky_scheduler:
@@ -2912,9 +2957,101 @@ def create_interface():
                             stg_scale = gr.Slider(minimum=0.0, maximum=2.0, value=0.0, step=0.1, label="STG Scale", info="Spatio-temporal guidance scale (0=disabled)")
                             stg_blocks = gr.Textbox(label="STG Blocks", value="29", info="Comma-separated block indices, e.g., 29 or 20,21,22")
                             stg_mode = gr.Dropdown(label="STG Mode", choices=["stg_av", "stg_v"], value="stg_av", info="stg_av=audio+video, stg_v=video only")
-                        with gr.Row():
-                            kandinsky_scheduler = gr.Checkbox(label="Kandinsky Scheduler", value=False, info="Front-loaded scheduler for better fast motion (recommended: 50+ steps)")
-                            kandinsky_scheduler_scale = gr.Slider(minimum=1.0, maximum=10.0, value=5.0, step=0.5, label="Kandinsky Scale", info="Higher = more motion focus (3-7 recommended)")
+
+                        # Advanced CFG (MultiModal Guidance)
+                        with gr.Accordion("Advanced CFG (MultiModal Guidance)", open=False):
+                            gr.Markdown("""
+                            **MultiModal Guidance Mode:**
+                            Enables separate video/audio guidance controls with advanced features:
+                            - **Rescale Scale**: Variance normalization to prevent oversaturation
+                            - **Modality Scale**: Cross-modal guidance (A2V for video, V2A for audio)
+                            - **Skip Step**: Periodic step skipping for speedup
+                            """)
+                            guidance_mode = gr.Dropdown(
+                                label="Guidance Mode",
+                                choices=["legacy", "multimodal"],
+                                value="legacy",
+                                info="'legacy'=standard CFG+STG, 'multimodal'=separate video/audio control"
+                            )
+                            scheduler_type = gr.Dropdown(
+                                label="Scheduler",
+                                choices=["ltx2", "linear_quadratic", "beta"],
+                                value="ltx2",
+                                info="Sigma schedule type for diffusion sampling"
+                            )
+                            with gr.Row():
+                                kandinsky_scheduler = gr.Checkbox(label="Kandinsky Scheduler", value=False, info="Front-loaded scheduler for better fast motion (recommended: 50+ steps)")
+                                kandinsky_scheduler_scale = gr.Slider(minimum=1.0, maximum=10.0, value=5.0, step=0.5, label="Kandinsky Scale", info="Higher = more motion focus (3-7 recommended)")
+                            with gr.Row():
+                                gr.Markdown("### Video Guidance")
+                            with gr.Row():
+                                video_cfg_guidance_scale = gr.Slider(
+                                    minimum=1.0, maximum=15.0, value=3.0, step=0.5,
+                                    label="Video CFG Scale",
+                                    info="Higher = more prompt adherence"
+                                )
+                                video_stg_scale = gr.Slider(
+                                    minimum=0.0, maximum=2.0, value=1.0, step=0.1,
+                                    label="Video STG Scale",
+                                    info="Spatio-temporal guidance for video"
+                                )
+                            with gr.Row():
+                                video_stg_blocks = gr.Textbox(
+                                    label="Video STG Blocks",
+                                    value="29",
+                                    info="Comma-separated block indices"
+                                )
+                                video_rescale_scale = gr.Slider(
+                                    minimum=0.0, maximum=1.0, value=0.7, step=0.05,
+                                    label="Video Rescale",
+                                    info="Variance normalization (0=off)"
+                                )
+                            with gr.Row():
+                                a2v_guidance_scale = gr.Slider(
+                                    minimum=1.0, maximum=10.0, value=3.0, step=0.5,
+                                    label="A2V Guidance Scale",
+                                    info="Audio-to-Video cross-modal guidance"
+                                )
+                                video_skip_step = gr.Slider(
+                                    minimum=0, maximum=5, value=0, step=1,
+                                    label="Video Skip Step",
+                                    info="Skip every N+1 steps (0=none)"
+                                )
+                            with gr.Row():
+                                gr.Markdown("### Audio Guidance")
+                            with gr.Row():
+                                audio_cfg_guidance_scale = gr.Slider(
+                                    minimum=1.0, maximum=15.0, value=7.0, step=0.5,
+                                    label="Audio CFG Scale",
+                                    info="Higher = more prompt adherence"
+                                )
+                                audio_stg_scale = gr.Slider(
+                                    minimum=0.0, maximum=2.0, value=1.0, step=0.1,
+                                    label="Audio STG Scale",
+                                    info="Spatio-temporal guidance for audio"
+                                )
+                            with gr.Row():
+                                audio_stg_blocks = gr.Textbox(
+                                    label="Audio STG Blocks",
+                                    value="29",
+                                    info="Comma-separated block indices"
+                                )
+                                audio_rescale_scale = gr.Slider(
+                                    minimum=0.0, maximum=1.0, value=0.7, step=0.05,
+                                    label="Audio Rescale",
+                                    info="Variance normalization (0=off)"
+                                )
+                            with gr.Row():
+                                v2a_guidance_scale = gr.Slider(
+                                    minimum=1.0, maximum=10.0, value=3.0, step=0.5,
+                                    label="V2A Guidance Scale",
+                                    info="Video-to-Audio cross-modal guidance"
+                                )
+                                audio_skip_step = gr.Slider(
+                                    minimum=0, maximum=5, value=0, step=1,
+                                    label="Audio Skip Step",
+                                    info="Skip every N+1 steps (0=none)"
+                                )
 
                         # Video Input (V2V / Refine)
                         with gr.Accordion("Video Input (V2V / Refine)", open=False) as v2v_section:
@@ -4324,6 +4461,12 @@ Audio is synchronized with the video extension.
                 mode, pipeline, sampler, stage2_sampler, enable_sliding_window, width, height, num_frames, frame_rate,
                 cfg_guidance_scale, num_inference_steps, stage2_steps, stage2_strength, stage3_strength, seed,
                 stg_scale, stg_blocks, stg_mode,
+                # Advanced CFG (MultiModal Guidance)
+                guidance_mode, scheduler_type,
+                video_cfg_guidance_scale, video_stg_scale, video_stg_blocks, video_rescale_scale,
+                a2v_guidance_scale, video_skip_step,
+                audio_cfg_guidance_scale, audio_stg_scale, audio_stg_blocks, audio_rescale_scale,
+                v2a_guidance_scale, audio_skip_step,
                 kandinsky_scheduler, kandinsky_scheduler_scale,
                 input_image, image_frame_idx, image_strength, image_crf,
                 end_image, end_image_strength, end_image_crf,
@@ -4383,7 +4526,7 @@ Audio is synchronized with the video extension.
         def send_to_generation_handler(metadata, first_frame):
             """Send loaded metadata to generation tab parameters and switch to Generation tab."""
             if not metadata:
-                return [gr.update()] * 46 + ["No metadata loaded - upload a video first"]
+                return [gr.update()] * 58 + ["No metadata loaded - upload a video first"]
 
             # Handle legacy metadata that used single enable_block_swap
             legacy_block_swap = metadata.get("enable_block_swap", True)
@@ -4440,6 +4583,21 @@ Audio is synchronized with the video extension.
                 gr.update(value=metadata.get("stg_scale", 0.0)),  # stg_scale
                 gr.update(value=metadata.get("stg_blocks", "29")),  # stg_blocks
                 gr.update(value=metadata.get("stg_mode", "stg_av") or "stg_av"),  # stg_mode
+                # Advanced CFG (MultiModal Guidance)
+                gr.update(value=metadata.get("guidance_mode", "legacy")),  # guidance_mode
+                gr.update(value=metadata.get("scheduler_type", "ltx2")),  # scheduler_type
+                gr.update(value=metadata.get("video_cfg_guidance_scale", 3.0)),  # video_cfg_guidance_scale
+                gr.update(value=metadata.get("video_stg_scale", 1.0)),  # video_stg_scale
+                gr.update(value=metadata.get("video_stg_blocks", "29")),  # video_stg_blocks
+                gr.update(value=metadata.get("video_rescale_scale", 0.7)),  # video_rescale_scale
+                gr.update(value=metadata.get("a2v_guidance_scale", 3.0)),  # a2v_guidance_scale
+                gr.update(value=metadata.get("video_skip_step", 0)),  # video_skip_step
+                gr.update(value=metadata.get("audio_cfg_guidance_scale", 7.0)),  # audio_cfg_guidance_scale
+                gr.update(value=metadata.get("audio_stg_scale", 1.0)),  # audio_stg_scale
+                gr.update(value=metadata.get("audio_stg_blocks", "29")),  # audio_stg_blocks
+                gr.update(value=metadata.get("audio_rescale_scale", 0.7)),  # audio_rescale_scale
+                gr.update(value=metadata.get("v2a_guidance_scale", 3.0)),  # v2a_guidance_scale
+                gr.update(value=metadata.get("audio_skip_step", 0)),  # audio_skip_step
                 # Kandinsky scheduler parameters
                 gr.update(value=metadata.get("kandinsky_scheduler", False)),  # kandinsky_scheduler
                 gr.update(value=metadata.get("kandinsky_scheduler_scale", 5.0)),  # kandinsky_scheduler_scale
@@ -4522,6 +4680,12 @@ Audio is synchronized with the video extension.
                 cfg_guidance_scale, num_inference_steps, stage2_steps, stage2_strength, stage3_strength, seed,
                 # STG parameters
                 stg_scale, stg_blocks, stg_mode,
+                # Advanced CFG (MultiModal Guidance)
+                guidance_mode, scheduler_type,
+                video_cfg_guidance_scale, video_stg_scale, video_stg_blocks, video_rescale_scale,
+                a2v_guidance_scale, video_skip_step,
+                audio_cfg_guidance_scale, audio_stg_scale, audio_stg_blocks, audio_rescale_scale,
+                v2a_guidance_scale, audio_skip_step,
                 # Kandinsky scheduler parameters
                 kandinsky_scheduler, kandinsky_scheduler_scale,
                 # Image conditioning

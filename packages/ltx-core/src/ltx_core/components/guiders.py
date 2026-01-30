@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 
 import torch
 
@@ -187,6 +188,101 @@ class LegacyStatefulAPGGuider(GuiderProtocol):
 
     def enabled(self) -> bool:
         return self.scale != 0.0
+
+
+@dataclass(frozen=True)
+class MultiModalGuiderParams:
+    """
+    Parameters for the multi-modal guider.
+
+    Attributes:
+        cfg_scale: CFG (Classifier-free guidance) scale controlling how strongly
+            the model adheres to the prompt. 1.0 means no CFG effect.
+        stg_scale: STG (Spatio-Temporal Guidance) scale controls how strongly
+            the model reacts to perturbation. 0.0 means no STG effect.
+        stg_blocks: Which transformer blocks to perturb for STG.
+        rescale_scale: Rescale scale controlling variance normalization after
+            applying guidance. Helps prevent oversaturation. 0.0 means no rescaling.
+        modality_scale: Modality scale controlling cross-modal guidance strength
+            (A2V for video, V2A for audio). 1.0 means no effect.
+        skip_step: Skip guidance every N+1 steps. 0 means no skipping.
+    """
+
+    cfg_scale: float = 1.0
+    stg_scale: float = 0.0
+    stg_blocks: list[int] | None = field(default_factory=list)
+    rescale_scale: float = 0.0
+    modality_scale: float = 1.0
+    skip_step: int = 0
+
+
+@dataclass(frozen=True)
+class MultiModalGuider:
+    """
+    Multi-modal guider combining CFG, STG, modality guidance, and rescaling.
+
+    The guider calculates the final prediction as:
+        pred = cond
+             + (cfg_scale - 1) * (cond - uncond_text)        # CFG
+             + stg_scale * (cond - uncond_perturbed)         # STG
+             + (modality_scale - 1) * (cond - uncond_modality)  # Cross-modal
+
+    Optionally applies variance rescaling to prevent oversaturation.
+    """
+
+    params: MultiModalGuiderParams
+    negative_context: torch.Tensor | None = None
+
+    def calculate(
+        self,
+        cond: torch.Tensor,
+        uncond_text: torch.Tensor | float,
+        uncond_perturbed: torch.Tensor | float,
+        uncond_modality: torch.Tensor | float,
+    ) -> torch.Tensor:
+        """
+        Calculate the guided prediction combining all guidance types.
+
+        Args:
+            cond: Conditioned prediction (positive prompt)
+            uncond_text: Unconditioned prediction (negative prompt) for CFG
+            uncond_perturbed: Perturbed prediction (attention skipped) for STG
+            uncond_modality: Modality-isolated prediction for cross-modal guidance
+
+        Returns:
+            Final guided prediction tensor
+        """
+        pred = (
+            cond
+            + (self.params.cfg_scale - 1) * (cond - uncond_text)
+            + self.params.stg_scale * (cond - uncond_perturbed)
+            + (self.params.modality_scale - 1) * (cond - uncond_modality)
+        )
+
+        if self.params.rescale_scale != 0:
+            factor = cond.std() / pred.std()
+            factor = self.params.rescale_scale * factor + (1 - self.params.rescale_scale)
+            pred = pred * factor
+
+        return pred
+
+    def do_unconditional_generation(self) -> bool:
+        """Returns True if CFG is enabled (cfg_scale != 1.0)."""
+        return not math.isclose(self.params.cfg_scale, 1.0)
+
+    def do_perturbed_generation(self) -> bool:
+        """Returns True if STG is enabled (stg_scale != 0.0)."""
+        return not math.isclose(self.params.stg_scale, 0.0)
+
+    def do_isolated_modality_generation(self) -> bool:
+        """Returns True if modality guidance is enabled (modality_scale != 1.0)."""
+        return not math.isclose(self.params.modality_scale, 1.0)
+
+    def should_skip_step(self, step: int) -> bool:
+        """Returns True if guidance should be skipped at this step."""
+        if self.params.skip_step == 0:
+            return False
+        return step % (self.params.skip_step + 1) != 0
 
 
 def projection_coef(to_project: torch.Tensor, project_onto: torch.Tensor) -> torch.Tensor:
