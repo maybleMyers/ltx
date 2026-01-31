@@ -3185,9 +3185,7 @@ def create_interface():
                         # AV Extension (Time-Based Audio-Video Continuation)
                         with gr.Accordion("AV Extension (Audio-Video Continuation)", open=False):
                             gr.Markdown("""
-**Time-based audio-video continuation** - Extends a video by preserving the beginning and generating new content from a specific time point.
-Unlike SVI Pro (which uses motion latents), this method uses noise masking to preserve the original content exactly while generating seamless continuations.
-Audio is synchronized with the video extension.
+**Time-based audio-video continuation** - Use t2v mode.
                             """)
                             av_extend_video = gr.Video(label="Input Video to Extend", sources=["upload"])
                             with gr.Row():

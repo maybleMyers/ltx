@@ -573,14 +573,15 @@ class OOMRetryState:
                 'description': f"Reducing blocks {self.current_blocks}→{new_blocks} (activation offload only)"
             }
 
-        # Strategy 3: Enable FFN chunking (blocks already at minimum)
+        # Strategy 3: Enable FFN chunking AND temporal chunking together (blocks already at minimum)
+        # Temporal chunking is required to prevent the massive memory spike at Block 0
         if self.current_ffn_chunk_size == 0:
             return {
                 'blocks': self.min_blocks,
                 'ffn_chunk_size': self.initial_ffn_chunk_size,
                 'activation_offload': True,
-                'temporal_chunk_size': 0,
-                'description': f"Enabling FFN chunking ({self.initial_ffn_chunk_size}) with {self.min_blocks} blocks"
+                'temporal_chunk_size': self.initial_temporal_chunk_size,
+                'description': f"Enabling FFN chunking ({self.initial_ffn_chunk_size}) and temporal chunking ({self.initial_temporal_chunk_size}) with {self.min_blocks} blocks"
             }
 
         # Strategy 4: Reduce FFN chunk size
