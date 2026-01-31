@@ -1465,8 +1465,12 @@ def load_video_segment(
     if len(frames) == 0:
         raise RuntimeError(f"No frames loaded from {video_path}")
 
-    # Convert to tensor [F, H, W, C] normalized to 0-1
-    frames_tensor = torch.from_numpy(np.stack(frames)).float() / 255.0
+    # Convert to tensor frame by frame (avoids np.stack large allocation)
+    num_frames = len(frames)
+    frames_tensor = torch.empty((num_frames, height, width, 3), dtype=torch.float32)
+    for i, frame in enumerate(frames):
+        frames_tensor[i] = torch.from_numpy(frame).float() / 255.0
+    del frames  # Free memory early
     frames_tensor = frames_tensor.to(device=device, dtype=dtype)
 
     return frames_tensor, fps
@@ -6205,9 +6209,12 @@ def generate_av_extension(
 
     print(f">>> Loaded {len(input_frames)} frames, resized to {stage1_width}x{stage1_height}")
 
-    # Convert to tensor [F, H, W, C]
-    import numpy as np
-    input_frames_tensor = torch.from_numpy(np.stack(input_frames)).float() / 255.0
+    # Convert to tensor frame by frame (avoids np.stack large allocation)
+    num_input = len(input_frames)
+    input_frames_tensor = torch.empty((num_input, stage1_height, stage1_width, 3), dtype=torch.float32)
+    for i, frame in enumerate(input_frames):
+        input_frames_tensor[i] = torch.from_numpy(frame).float() / 255.0
+    del input_frames  # Free memory early
     input_frames_tensor = input_frames_tensor.to(device=device, dtype=dtype)
 
     # =========================================================================
@@ -6928,9 +6935,12 @@ def generate_av_extension(
 
         print(f">>> Loaded {len(full_res_frames)} frames at {stage2_width}x{stage2_height}")
 
-        # Convert to tensor and encode
-        import numpy as np
-        full_res_tensor = torch.from_numpy(np.stack(full_res_frames)).float() / 255.0
+        # Convert to tensor frame by frame (avoids np.stack large allocation)
+        num_full_res = len(full_res_frames)
+        full_res_tensor = torch.empty((num_full_res, stage2_height, stage2_width, 3), dtype=torch.float32)
+        for i, frame in enumerate(full_res_frames):
+            full_res_tensor[i] = torch.from_numpy(frame).float() / 255.0
+        del full_res_frames  # Free memory early
         full_res_tensor = full_res_tensor.to(device=device, dtype=dtype)
         full_res_input = full_res_tensor.permute(3, 0, 1, 2).unsqueeze(0)  # [1, C, F, H, W]
         full_res_input = full_res_input * 2.0 - 1.0  # Normalize to [-1, 1]
@@ -6998,8 +7008,8 @@ def generate_av_extension(
         print(f">>> Replacing frames 0-{preserve_end_idx} (including transition zone) with original full-res encoding...")
         upscaled_video_latent[:, :, :preserve_end_idx, :, :] = full_res_latent[:, :, :preserve_end_idx, :, :]
 
-        # Cleanup
-        del full_res_frames, full_res_tensor, full_res_input, full_res_latent_chunks, full_res_latent
+        # Cleanup (full_res_frames already deleted after tensor conversion)
+        del full_res_tensor, full_res_input, full_res_latent_chunks, full_res_latent
         cleanup_memory()
 
         # 9B: Load stage 2 transformer with distilled LoRA
@@ -7313,24 +7323,16 @@ def generate_av_extension(
                     print(f">>>   Loaded {i + 1}/{max_in_frame + 1} frames...")
             cap_orig.release()
 
-            # Map to output fps (select/duplicate frames as needed)
-            original_frames = []
-            for out_frame_idx in range(preserve_pixel_frames):
+            # Map to output fps and copy directly to decoded_video (no large allocation)
+            # This avoids np.stack which requires a huge contiguous memory block
+            num_replace = min(preserve_pixel_frames, decoded_video.shape[0], len(input_frames))
+            for out_frame_idx in range(num_replace):
                 in_frame_idx = int(out_frame_idx * orig_fps / output_fps)
                 in_frame_idx = min(in_frame_idx, len(input_frames) - 1)
-                if in_frame_idx < len(input_frames):
-                    original_frames.append(input_frames[in_frame_idx])
+                decoded_video[out_frame_idx] = torch.from_numpy(input_frames[in_frame_idx])
 
             del input_frames  # Free memory
-
-            if len(original_frames) > 0:
-                # Convert to tensor [F, H, W, C] as uint8 [0-255] to match decoded video format
-                original_pixels = torch.from_numpy(np.stack(original_frames))  # uint8 from cv2
-
-                # Replace preserved frames
-                num_replace = min(len(original_frames), preserve_pixel_frames, decoded_video.shape[0])
-                decoded_video[:num_replace] = original_pixels[:num_replace]
-                print(f">>> Replaced {num_replace} frames with original quality pixels")
+            print(f">>> Replaced {num_replace} frames with original quality pixels")
         else:
             print(f">>> Warning: Could not open original video for frame preservation")
 

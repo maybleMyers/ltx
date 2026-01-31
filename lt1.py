@@ -3678,9 +3678,9 @@ def create_interface():
                                 info="Frame interval (e.g., 60). Set to 0 to disable."
                             )
                             svi_anchor_strength = gr.Slider(
-                                minimum=0.0, maximum=1.0, value=0.1, step=0.01,
+                                minimum=0.0, maximum=1.0, value=0.1, step=0.001,
                                 label="Anchor Strength",
-                                info="How strongly to guide toward anchor"
+                                info="How strongly to guide toward anchor small values seem to work best(.01-.05)"
                             )
                             svi_anchor_decay = gr.Dropdown(
                                 label="Anchor Decay",
