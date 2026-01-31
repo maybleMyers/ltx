@@ -7008,8 +7008,8 @@ def generate_av_extension(
         print(f">>> Replacing frames 0-{preserve_end_idx} (including transition zone) with original full-res encoding...")
         upscaled_video_latent[:, :, :preserve_end_idx, :, :] = full_res_latent[:, :, :preserve_end_idx, :, :]
 
-        # Cleanup
-        del full_res_frames, full_res_tensor, full_res_input, full_res_latent_chunks, full_res_latent
+        # Cleanup (full_res_frames already deleted after tensor conversion)
+        del full_res_tensor, full_res_input, full_res_latent_chunks, full_res_latent
         cleanup_memory()
 
         # 9B: Load stage 2 transformer with distilled LoRA
