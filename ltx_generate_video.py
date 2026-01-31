@@ -552,10 +552,21 @@ class OOMRetryState:
         """
         self.attempt += 1
 
+        # Helper: Calculate step size based on current blocks
+        # Reduce more aggressively when block count is high to avoid OOM during reconfiguration
+        def get_block_step(blocks: int, min_target: int) -> int:
+            if blocks > 30:
+                return min(4, blocks - min_target)  # Large steps when very high
+            elif blocks > 15:
+                return min(2, blocks - min_target)  # Medium steps
+            else:
+                return 1  # Fine-grained when close to target
+
         # Strategy 1: Reduce blocks WITHOUT activation offload first
         # This is the least invasive approach - just reduce GPU memory by swapping more blocks
         if not self.activation_offload_enabled and self.current_blocks > self.blocks_with_activation_offload:
-            new_blocks = self.current_blocks - 1
+            step = get_block_step(self.current_blocks, self.blocks_with_activation_offload)
+            new_blocks = max(self.blocks_with_activation_offload, self.current_blocks - step)
             return {
                 'blocks': new_blocks,
                 'ffn_chunk_size': None,
@@ -577,7 +588,8 @@ class OOMRetryState:
         # Strategy 3: Reduce blocks further with activation offload on (no FFN/temporal chunking)
         # Go all the way down to min_blocks before trying chunking
         if self.current_blocks > self.min_blocks and self.current_ffn_chunk_size == 0:
-            new_blocks = self.current_blocks - 1
+            step = get_block_step(self.current_blocks, self.min_blocks)
+            new_blocks = max(self.min_blocks, self.current_blocks - step)
             return {
                 'blocks': new_blocks,
                 'ffn_chunk_size': None,
@@ -680,7 +692,13 @@ Suggested actions:
             print(f">>> OOM in {retry_state.stage}! Retry {retry_state.attempt}: {strategy['description']}")
 
             # Apply strategy: reconfigure blocks, FFN, activation
-            cleanup_memory()
+            # Aggressive cleanup: sync GPU, collect garbage, clear cache
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
 
             # Reconfigure if ANY block swap setting changed
             needs_reconfigure = (
@@ -691,13 +709,35 @@ Suggested actions:
 
             if needs_reconfigure and block_swap_manager:
                 print(f">>> Reconfiguring: blocks={strategy['blocks']}, activation_offload={strategy['activation_offload']}, temporal_chunk={strategy['temporal_chunk_size']}")
-                block_swap_manager, _ = reconfigure_block_swap(
-                    transformer,
-                    new_blocks_in_memory=strategy['blocks'],
-                    device=torch.device(generator_instance.device),
-                    enable_activation_offload=strategy['activation_offload'],
-                    temporal_chunk_size=strategy['temporal_chunk_size'],
-                )
+                try:
+                    block_swap_manager, _ = reconfigure_block_swap(
+                        transformer,
+                        new_blocks_in_memory=strategy['blocks'],
+                        device=torch.device(generator_instance.device),
+                        enable_activation_offload=strategy['activation_offload'],
+                        temporal_chunk_size=strategy['temporal_chunk_size'],
+                    )
+                except (torch.cuda.OutOfMemoryError, torch.OutOfMemoryError, RuntimeError) as reconfig_e:
+                    # Reconfiguration itself failed due to OOM - need more aggressive reduction
+                    if "out of memory" in str(reconfig_e).lower() or "CUDA" in str(reconfig_e):
+                        print(f">>> Reconfiguration OOM! Forcing larger block reduction...")
+                        # Force a much larger reduction by skipping ahead
+                        emergency_blocks = max(retry_state.min_blocks, strategy['blocks'] - 4)
+                        torch.cuda.synchronize()
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                        block_swap_manager, _ = reconfigure_block_swap(
+                            transformer,
+                            new_blocks_in_memory=emergency_blocks,
+                            device=torch.device(generator_instance.device),
+                            enable_activation_offload=True,  # Force activation offload on
+                            temporal_chunk_size=strategy['temporal_chunk_size'],
+                        )
+                        strategy['blocks'] = emergency_blocks
+                        strategy['activation_offload'] = True
+                        print(f">>> Emergency reconfiguration to {emergency_blocks} blocks with activation offload")
+                    else:
+                        raise
 
             # Handle FFN chunking
             if strategy['ffn_chunk_size'] is not None:

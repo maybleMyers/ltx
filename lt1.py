@@ -3882,7 +3882,7 @@ def create_interface():
             # =================================================================
             # Frame Interpolation Tab (GIMM-VFI)
             # =================================================================
-            with gr.Tab("Frame Interpolation", id="interp_tab", visible=False):
+            with gr.Tab("Frame Interpolation", id="interp_tab"):
                 gr.Markdown("### Increase Video FPS using GIMM-VFI\nState-of-the-art frame interpolation for smooth slow motion and higher frame rates.")
 
                 with gr.Row():
@@ -4058,7 +4058,7 @@ def create_interface():
             # =================================================================
             # Extension Tab (Wan2GP-style)
             # =================================================================
-            with gr.Tab("Extension", id="ext_tab"):
+            with gr.Tab("Extension", id="ext_tab", visible=False):
                 with gr.Row():
                     # Left column - Input and settings
                     with gr.Column(scale=1):
