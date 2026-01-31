@@ -3559,7 +3559,7 @@ def create_interface():
             # =================================================================
             # SVI-LTX Tab
             # =================================================================
-            with gr.Tab("SVI-LTX", id="svi_ltx_tab"):
+            with gr.Tab("SVI-LTX", id="svi_ltx_tab", visible=False):
                 gr.Markdown("""
                 ## SVI-LTX (Stable-Video-Infinity for LTX)
                 Generate long, consistent videos by chaining multiple clips. Each clip uses motion latents from the previous clip for smooth transitions.
@@ -3882,7 +3882,7 @@ def create_interface():
             # =================================================================
             # Frame Interpolation Tab (GIMM-VFI)
             # =================================================================
-            with gr.Tab("Frame Interpolation", id="interp_tab"):
+            with gr.Tab("Frame Interpolation", id="interp_tab", visible=False):
                 gr.Markdown("### Increase Video FPS using GIMM-VFI\nState-of-the-art frame interpolation for smooth slow motion and higher frame rates.")
 
                 with gr.Row():

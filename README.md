@@ -125,11 +125,8 @@ ltx/
 
 All model paths in the GUI can be customized. Use the **Save Defaults** button to persist your settings:
 
-| Tab | Button | What Gets Saved |
-|-----|--------|-----------------|
 | Generation | Save Defaults | LTX checkpoint, Gemma path, spatial upscaler, VAE, distilled LoRA, LoRA folder, all generation parameters |
-| SVI-LTX | Save Defaults | Same core model paths plus SVI-specific settings |
-| Extension | Save Defaults | Same core model paths plus extension-specific settings |
+
 
 Settings are saved to `ui_configs/` as JSON files and automatically loaded on startup.
 
