@@ -6154,10 +6154,12 @@ def generate_av_extension(
     # Calculate total output frames
     output_fps = args.frame_rate
     output_frames = int(round(end_time * output_fps))
-    # Ensure output frames is valid (8n+1 format)
-    output_frames = ((output_frames - 1) // 8) * 8 + 1
+    # Ensure output frames is valid (8n+1 format) - round UP to ensure >= requested duration
+    output_frames = ((output_frames + 6) // 8) * 8 + 1
+    # Actual output duration after rounding (for audio sync)
+    actual_output_duration = output_frames / output_fps
 
-    print(f">>> Output: {output_frames} frames at {output_fps} fps ({output_frames / output_fps:.2f}s)")
+    print(f">>> Output: {output_frames} frames at {output_fps} fps ({actual_output_duration:.2f}s)")
 
     # =========================================================================
     # Step 2: Load video frames and resize to target resolution
@@ -6383,9 +6385,10 @@ def generate_av_extension(
     audio_latents_per_second = None
     if audio_latent is not None:
         input_audio_latent_frames = audio_latent.shape[2]
-        input_audio_duration = start_time
-        audio_latents_per_second = input_audio_latent_frames / input_audio_duration
-        output_audio_latent_frames = int(round(end_time * audio_latents_per_second))
+        # Use actual input video duration, not start_time (audio covers full input video)
+        audio_latents_per_second = input_audio_latent_frames / input_duration
+        # Use actual_output_duration (after 8n+1 rounding) to sync audio with video
+        output_audio_latent_frames = int(round(actual_output_duration * audio_latents_per_second))
 
         extended_audio_latent = torch.zeros(
             audio_latent.shape[0],
