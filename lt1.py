@@ -2868,7 +2868,7 @@ def create_interface():
                                 image_crf = gr.Slider(minimum=0, maximum=51, value=33, step=1, label="CRF", info="H.264 compression (0=lossless, 33=default)")
 
                             with gr.Accordion("Anchor Image (periodic guidance)", open=False):
-                                gr.Markdown("Inject the anchor image at regular intervals to guide the video generation.")
+                                gr.Markdown("Inject the anchor image at regular intervals to guide the video generation. Small strength values work best, like .01-.05")
                                 anchor_image = gr.Image(label="Anchor Image (optional, uses Start Image if empty)", type="filepath")
                                 with gr.Row():
                                     anchor_interval = gr.Number(
@@ -2879,7 +2879,7 @@ def create_interface():
                                         info="Frame interval (e.g., 60). Set to 0 to disable."
                                     )
                                     anchor_strength = gr.Slider(
-                                        minimum=0.0, maximum=1.0, value=0.1, step=0.01,
+                                        minimum=0.0, maximum=1.0, value=0.1, step=0.001,
                                         label="Anchor Strength",
                                         info="How strongly to guide toward anchor"
                                     )
@@ -3669,7 +3669,7 @@ def create_interface():
                             svi_random_seed_btn = gr.Button("🎲")
 
                         with gr.Accordion("Anchor Settings", open=False):
-                            gr.Markdown("Inject anchor image at regular intervals to guide video generation.")
+                            gr.Markdown("Inject anchor image at regular intervals to guide video generation. small strength values seem to work best(.01-.05)")
                             svi_anchor_interval = gr.Number(
                                 label="Anchor Interval",
                                 value=0,
