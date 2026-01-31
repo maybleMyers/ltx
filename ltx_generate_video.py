@@ -544,14 +544,27 @@ class OOMRetryState:
         """Returns next retry strategy or None if exhausted.
 
         Strategy order:
-        1. Enable activation offload (if not already)
-        2. Reduce blocks down to 1 with activation offload (no FFN/temporal chunking)
-        3. Enable FFN chunking and reduce chunk size
-        4. Enable temporal chunking and reduce chunk size
+        1. Reduce blocks WITHOUT activation offload first
+        2. Enable activation offload when blocks hit minimum
+        3. Reduce blocks further with activation offload
+        4. Enable FFN chunking and reduce chunk size
+        5. Enable temporal chunking and reduce chunk size
         """
         self.attempt += 1
 
-        # Strategy 1: Enable activation offload first (no FFN/temporal chunking yet)
+        # Strategy 1: Reduce blocks WITHOUT activation offload first
+        # This is the least invasive approach - just reduce GPU memory by swapping more blocks
+        if not self.activation_offload_enabled and self.current_blocks > self.blocks_with_activation_offload:
+            new_blocks = self.current_blocks - 1
+            return {
+                'blocks': new_blocks,
+                'ffn_chunk_size': None,
+                'activation_offload': False,
+                'temporal_chunk_size': 0,
+                'description': f"Reducing blocks {self.current_blocks}→{new_blocks} (no activation offload)"
+            }
+
+        # Strategy 2: Enable activation offload when blocks are low enough
         if not self.activation_offload_enabled:
             return {
                 'blocks': self.current_blocks,
@@ -561,7 +574,7 @@ class OOMRetryState:
                 'description': f"Enabling activation offload with {self.current_blocks} blocks"
             }
 
-        # Strategy 2: Reduce blocks while keeping activation offload on (no FFN/temporal chunking)
+        # Strategy 3: Reduce blocks further with activation offload on (no FFN/temporal chunking)
         # Go all the way down to min_blocks before trying chunking
         if self.current_blocks > self.min_blocks and self.current_ffn_chunk_size == 0:
             new_blocks = self.current_blocks - 1
@@ -570,10 +583,10 @@ class OOMRetryState:
                 'ffn_chunk_size': None,
                 'activation_offload': True,
                 'temporal_chunk_size': 0,
-                'description': f"Reducing blocks {self.current_blocks}→{new_blocks} (activation offload only)"
+                'description': f"Reducing blocks {self.current_blocks}→{new_blocks} (with activation offload)"
             }
 
-        # Strategy 3: Enable FFN chunking AND temporal chunking together (blocks already at minimum)
+        # Strategy 4: Enable FFN chunking AND temporal chunking together (blocks already at minimum)
         # Temporal chunking is required to prevent the massive memory spike at Block 0
         if self.current_ffn_chunk_size == 0:
             return {
@@ -584,7 +597,7 @@ class OOMRetryState:
                 'description': f"Enabling FFN chunking ({self.initial_ffn_chunk_size}) and temporal chunking ({self.initial_temporal_chunk_size}) with {self.min_blocks} blocks"
             }
 
-        # Strategy 4: Reduce FFN chunk size
+        # Strategy 5: Reduce FFN chunk size
         if self.current_ffn_chunk_size > self.min_ffn_chunk_size:
             new_ffn = max(self.current_ffn_chunk_size - self.ffn_chunk_step, self.min_ffn_chunk_size)
             return {
@@ -595,17 +608,7 @@ class OOMRetryState:
                 'description': f"Reducing FFN chunks: {self.current_ffn_chunk_size}→{new_ffn}"
             }
 
-        # Strategy 5: Enable temporal chunking (FFN at minimum)
-        if self.current_temporal_chunk_size == 0:
-            return {
-                'blocks': self.min_blocks,
-                'ffn_chunk_size': self.min_ffn_chunk_size,
-                'activation_offload': True,
-                'temporal_chunk_size': self.initial_temporal_chunk_size,
-                'description': f"Enabling temporal chunking ({self.initial_temporal_chunk_size})"
-            }
-
-        # Strategy 6: Reduce temporal chunk size
+        # Strategy 6: Reduce temporal chunk size (FFN already at minimum)
         if self.current_temporal_chunk_size > self.min_temporal_chunk_size:
             new_temporal = max(self.current_temporal_chunk_size - self.temporal_chunk_step, self.min_temporal_chunk_size)
             return {
@@ -6154,10 +6157,12 @@ def generate_av_extension(
     # Calculate total output frames
     output_fps = args.frame_rate
     output_frames = int(round(end_time * output_fps))
-    # Ensure output frames is valid (8n+1 format)
-    output_frames = ((output_frames - 1) // 8) * 8 + 1
+    # Ensure output frames is valid (8n+1 format) - round UP to ensure >= requested duration
+    output_frames = ((output_frames + 6) // 8) * 8 + 1
+    # Actual output duration after rounding (for audio sync)
+    actual_output_duration = output_frames / output_fps
 
-    print(f">>> Output: {output_frames} frames at {output_fps} fps ({output_frames / output_fps:.2f}s)")
+    print(f">>> Output: {output_frames} frames at {output_fps} fps ({actual_output_duration:.2f}s)")
 
     # =========================================================================
     # Step 2: Load video frames and resize to target resolution
@@ -6383,9 +6388,10 @@ def generate_av_extension(
     audio_latents_per_second = None
     if audio_latent is not None:
         input_audio_latent_frames = audio_latent.shape[2]
-        input_audio_duration = start_time
-        audio_latents_per_second = input_audio_latent_frames / input_audio_duration
-        output_audio_latent_frames = int(round(end_time * audio_latents_per_second))
+        # Use actual input video duration, not start_time (audio covers full input video)
+        audio_latents_per_second = input_audio_latent_frames / input_duration
+        # Use actual_output_duration (after 8n+1 rounding) to sync audio with video
+        output_audio_latent_frames = int(round(actual_output_duration * audio_latents_per_second))
 
         extended_audio_latent = torch.zeros(
             audio_latent.shape[0],

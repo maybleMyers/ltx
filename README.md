@@ -47,7 +47,9 @@ Download from [Lightricks/LTX-2 on HuggingFace](https://huggingface.co/Lightrick
 | gemma-3-12b-it-qat-q4_0-unquantized | [google/gemma-3-12b-it-qat-q4_0-unquantized](https://huggingface.co/google/gemma-3-12b-it-qat-q4_0-unquantized) |
 
 ### Video Frame Interpolation
-
+  
+I have created a repository with all the interpolation files in one place here: https://huggingface.co/maybleMyers/interpolate/tree/main  
+  
 #### GIMM-VFI
 Download from [GSean/GIMM-VFI on HuggingFace](https://huggingface.co/GSean/GIMM-VFI):
 | File | Description |
