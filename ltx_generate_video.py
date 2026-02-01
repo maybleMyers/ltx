@@ -8474,42 +8474,18 @@ def generate_v2v_join(
         print(f">>> Loaded {video1_full_res_frames.shape[0]} frames from video1")
 
         # Convert to encoder format [1, C, F, H, W] and normalize to [-1, 1]
-        video1_full_input = video1_full_res_frames.permute(3, 0, 1, 2).unsqueeze(0) * 2.0 - 1.0
+        # Keep on CPU - encode_video_chunked handles device placement
+        video1_full_input = video1_full_res_frames.permute(3, 0, 1, 2).unsqueeze(0).cpu() * 2.0 - 1.0
         del video1_full_res_frames
 
-        # Encode video1 in chunks
-        encoder_dtype = next(video_encoder.parameters()).dtype
-        chunk_pixel_frames = 65
-        video1_latent_chunks = []
-        chunk_idx_v1 = 0
-
-        with torch.no_grad():
-            for start_f in range(0, video1_full_input.shape[2], chunk_pixel_frames - 1):
-                end_f = min(start_f + chunk_pixel_frames, video1_full_input.shape[2])
-                actual_frames = end_f - start_f
-
-                if actual_frames < 9:
-                    pad_frames = 9 - actual_frames
-                    chunk = video1_full_input[:, :, start_f:end_f, :, :]
-                    last_frame = chunk[:, :, -1:, :, :].expand(-1, -1, pad_frames, -1, -1)
-                    chunk = torch.cat([chunk, last_frame], dim=2)
-                else:
-                    chunk = video1_full_input[:, :, start_f:end_f, :, :]
-
-                chunk_latent = video_encoder(chunk.to(device=device, dtype=encoder_dtype))
-                chunk_latent = chunk_latent.to(dtype=dtype)
-
-                if chunk_idx_v1 > 0 and len(video1_latent_chunks) > 0:
-                    chunk_latent = chunk_latent[:, :, 1:, :, :]
-
-                video1_latent_chunks.append(chunk_latent)
-                chunk_idx_v1 += 1
-
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-        video1_full_latent = torch.cat(video1_latent_chunks, dim=2)
-        del video1_full_input, video1_latent_chunks
+        # Encode video1 using spatial tiling (handles OOM automatically)
+        video1_full_latent = encode_video_chunked(
+            video1_full_input,
+            video_encoder,
+            device=device,
+            dtype=dtype,
+        )
+        del video1_full_input
         print(f">>> Video1 full-res latent: {video1_full_latent.shape}")
 
         # Re-encode video2 preserved frames (gen_end_latent to end)
@@ -8527,40 +8503,18 @@ def generate_v2v_join(
         print(f">>> Loaded {video2_full_res_frames.shape[0]} frames from video2")
 
         # Convert to encoder format [1, C, F, H, W] and normalize to [-1, 1]
-        video2_full_input = video2_full_res_frames.permute(3, 0, 1, 2).unsqueeze(0) * 2.0 - 1.0
+        # Keep on CPU - encode_video_chunked handles device placement
+        video2_full_input = video2_full_res_frames.permute(3, 0, 1, 2).unsqueeze(0).cpu() * 2.0 - 1.0
         del video2_full_res_frames
 
-        # Encode video2 in chunks
-        video2_latent_chunks = []
-        chunk_idx_v2 = 0
-
-        with torch.no_grad():
-            for start_f in range(0, video2_full_input.shape[2], chunk_pixel_frames - 1):
-                end_f = min(start_f + chunk_pixel_frames, video2_full_input.shape[2])
-                actual_frames = end_f - start_f
-
-                if actual_frames < 9:
-                    pad_frames = 9 - actual_frames
-                    chunk = video2_full_input[:, :, start_f:end_f, :, :]
-                    last_frame = chunk[:, :, -1:, :, :].expand(-1, -1, pad_frames, -1, -1)
-                    chunk = torch.cat([chunk, last_frame], dim=2)
-                else:
-                    chunk = video2_full_input[:, :, start_f:end_f, :, :]
-
-                chunk_latent = video_encoder(chunk.to(device=device, dtype=encoder_dtype))
-                chunk_latent = chunk_latent.to(dtype=dtype)
-
-                if chunk_idx_v2 > 0 and len(video2_latent_chunks) > 0:
-                    chunk_latent = chunk_latent[:, :, 1:, :, :]
-
-                video2_latent_chunks.append(chunk_latent)
-                chunk_idx_v2 += 1
-
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-        video2_full_latent = torch.cat(video2_latent_chunks, dim=2)
-        del video2_full_input, video2_latent_chunks
+        # Encode video2 using spatial tiling (handles OOM automatically)
+        video2_full_latent = encode_video_chunked(
+            video2_full_input,
+            video_encoder,
+            device=device,
+            dtype=dtype,
+        )
+        del video2_full_input
         print(f">>> Video2 full-res latent: {video2_full_latent.shape}")
 
         # Replace upsampler output with original full-res encodings for preserved regions
