@@ -1933,12 +1933,15 @@ def encode_depth_conditioning(
             break
         chunk_end = frame_idx + valid_frames
 
-        # Extract chunk and encode
-        chunk = depth_for_encoding[:, :, frame_idx:chunk_end, :, :].to(device=device, dtype=dtype)
-        with torch.no_grad():
-            encoded_chunk = video_encoder(chunk)
+        # Extract chunk and encode using spatial tiling (handles OOM automatically)
+        chunk = depth_for_encoding[:, :, frame_idx:chunk_end, :, :].cpu()
+        encoded_chunk = encode_video_chunked(
+            chunk,
+            video_encoder,
+            device=device,
+            dtype=dtype,
+        )
         del chunk
-        torch.cuda.empty_cache()
 
         # Move to CPU to save memory
         encoded_chunk_cpu = encoded_chunk.cpu()
