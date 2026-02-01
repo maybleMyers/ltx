@@ -2894,6 +2894,13 @@ Examples:
         help="Terminal sigma for partial denoising, enables smooth continuation (default: 0.1).",
     )
     av_ext_group.add_argument(
+        "--av-extend-context",
+        type=float,
+        default=5.0,
+        help="Seconds of context to regenerate before extension point (default: 5.0). "
+             "Only this context + extension are generated; the original video up to context_start is preserved.",
+    )
+    av_ext_group.add_argument(
         "--av-slope-len",
         type=int,
         default=3,
@@ -6120,6 +6127,7 @@ def generate_av_extension(
     end_time: float | None = None,
     extend_steps: int = 8,
     terminal: float = 0.1,
+    context_seconds: float = 5.0,
     slope_len: int = 3,
     skip_stage2: bool = False,
     latent_norm_fn: Callable | None = None,
@@ -6192,17 +6200,33 @@ def generate_av_extension(
     if end_time is None:
         end_time = start_time + 5.0  # Generate 5 seconds by default
 
-    print(f">>> Preserve: 0 - {start_time:.2f}s, Generate: {start_time:.2f} - {end_time:.2f}s")
+    # Calculate context window start - only regenerate this portion, not the whole video
+    context_start_time = max(0, start_time - context_seconds)
+    extension_duration = end_time - start_time
 
-    # Calculate total output frames
+    print(f">>> Context-based extension mode:")
+    print(f">>>   Original video: 0 - {input_duration:.2f}s")
+    print(f">>>   Context window: {context_start_time:.2f} - {start_time:.2f}s ({start_time - context_start_time:.2f}s)")
+    print(f">>>   Extension: {start_time:.2f} - {end_time:.2f}s ({extension_duration:.2f}s)")
+    print(f">>>   Preserve original: 0 - {context_start_time:.2f}s (will be concatenated after generation)")
+
+    # Calculate output frames for the GENERATED portion only (context + extension)
     output_fps = args.frame_rate
-    output_frames = int(round(end_time * output_fps))
-    # Ensure output frames is valid (8n+1 format) - round UP to ensure >= requested duration
-    output_frames = ((output_frames + 6) // 8) * 8 + 1
-    # Actual output duration after rounding (for audio sync)
-    actual_output_duration = output_frames / output_fps
+    generated_duration = end_time - context_start_time  # context + extension
+    generated_frames = int(round(generated_duration * output_fps))
+    # Ensure generated frames is valid (8n+1 format)
+    generated_frames = ((generated_frames + 6) // 8) * 8 + 1
+    actual_generated_duration = generated_frames / output_fps
 
-    print(f">>> Output: {output_frames} frames at {output_fps} fps ({actual_output_duration:.2f}s)")
+    # Total output frames (preserved + generated)
+    preserved_frames = int(round(context_start_time * output_fps))
+    total_output_frames = preserved_frames + generated_frames
+    # Ensure total is 8n+1 format
+    total_output_frames = ((total_output_frames + 6) // 8) * 8 + 1
+    actual_output_duration = total_output_frames / output_fps
+
+    print(f">>> Generated portion: {generated_frames} frames ({actual_generated_duration:.2f}s)")
+    print(f">>> Total output: {total_output_frames} frames at {output_fps} fps ({actual_output_duration:.2f}s)")
 
     # =========================================================================
     # Step 2: Load video frames and resize to target resolution
@@ -6225,15 +6249,19 @@ def generate_av_extension(
     stage1_width = (stage1_width // 32) * 32
     stage1_height = (stage1_height // 32) * 32
 
-    # Load frames from input video
-    # Calculate frames to load (up to start_time + buffer), ensuring 8n+1 format
-    frames_to_load = min(total_frames, int(start_time * input_fps) + 16)
+    # Load frames from input video - ONLY from context_start_time onwards
+    # This is the key optimization: we don't process the entire video, just the context window
+    context_start_frame = int(context_start_time * input_fps)
+    context_end_frame = min(total_frames, int(start_time * input_fps) + 16)
+    frames_to_load = context_end_frame - context_start_frame
     # Round up to nearest 8n+1
     n_frames = max(1, (frames_to_load - 1 + 7) // 8)
     frames_to_load = 8 * n_frames + 1
-    frames_to_load = min(frames_to_load, total_frames)
+    context_end_frame = min(context_start_frame + frames_to_load, total_frames)
+    frames_to_load = context_end_frame - context_start_frame
 
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    print(f">>> Loading context frames {context_start_frame} to {context_end_frame} (skipping first {context_start_frame} frames)")
+    cap.set(cv2.CAP_PROP_POS_FRAMES, context_start_frame)
     input_frames = []
     for _ in range(frames_to_load):
         ret, frame = cap.read()
@@ -6252,7 +6280,7 @@ def generate_av_extension(
         while len(input_frames) < target_loaded:
             input_frames.append(input_frames[-1])
 
-    print(f">>> Loaded {len(input_frames)} frames, resized to {stage1_width}x{stage1_height}")
+    print(f">>> Loaded {len(input_frames)} context frames, resized to {stage1_width}x{stage1_height}")
 
     # Convert to tensor frame by frame (avoids np.stack large allocation)
     num_input = len(input_frames)
@@ -6357,9 +6385,10 @@ def generate_av_extension(
     del input_frames_tensor
     cleanup_memory()
 
-    # Encode audio
+    # Encode audio (only from context_start_time onwards to match video)
     audio_latent = None
     audio_mel_hop_length = None
+    original_audio_waveform = None  # Keep original for final concatenation
     if audio_waveform is not None and not args.disable_audio:
         print(">>> Encoding audio to latent space...")
         audio_encoder = generator.stage_1_model_ledger.audio_encoder()
@@ -6377,10 +6406,20 @@ def generate_av_extension(
         elif audio_waveform.dim() == 2:
             audio_waveform = audio_waveform.unsqueeze(0)
 
+        # Store original full audio for final concatenation
+        original_audio_waveform = audio_waveform.clone()
+
+        # Trim audio to start from context_start_time to match video frames
+        sr = audio_sample_rate or AUDIO_SAMPLE_RATE
+        context_start_sample = int(context_start_time * sr)
+        if context_start_sample > 0 and context_start_sample < audio_waveform.shape[-1]:
+            print(f">>> Trimming audio to start from {context_start_time:.2f}s (sample {context_start_sample})")
+            audio_waveform = audio_waveform[..., context_start_sample:]
+
         # Convert to mel spectrogram
         mel_spectrogram = audio_processor.waveform_to_mel(
             audio_waveform.to(dtype=torch.float32),
-            waveform_sample_rate=audio_sample_rate or AUDIO_SAMPLE_RATE
+            waveform_sample_rate=sr
         )
 
         # Encode to latent
@@ -6399,54 +6438,58 @@ def generate_av_extension(
     cleanup_memory()
 
     # =========================================================================
-    # Step 5: Create empty latents for extended video
+    # Step 5: Create empty latents for generated portion (context + extension)
     # =========================================================================
-    print(">>> Creating extended latent space...")
+    print(">>> Creating latent space for context + extension...")
 
-    # Calculate required latent frames for output
-    output_latent_frames = (output_frames - 1) // time_scale_factor + 1
+    # Calculate required latent frames for the GENERATED portion only
+    # This covers context_start_time to end_time, NOT the full video
+    generated_latent_frames = (generated_frames - 1) // time_scale_factor + 1
 
-    # Create extended video latent (copy original + add space for new content)
+    # Create video latent for context + extension (NOT the full video)
     input_latent_frames = video_latent.shape[2]
     extended_video_latent = torch.zeros(
         video_latent.shape[0],  # batch
         video_latent.shape[1],  # channels
-        output_latent_frames,   # frames
+        generated_latent_frames,   # frames for context + extension only
         video_latent.shape[3],  # height
         video_latent.shape[4],  # width
         device=device,
         dtype=dtype,
     )
 
-    # Copy original latent into the extended latent
-    copy_frames = min(input_latent_frames, output_latent_frames)
+    # Copy context latent into the extended latent
+    copy_frames = min(input_latent_frames, generated_latent_frames)
     extended_video_latent[:, :, :copy_frames, :, :] = video_latent[:, :, :copy_frames, :, :]
 
-    print(f">>> Extended video latent: {extended_video_latent.shape}")
+    print(f">>> Generated portion latent: {extended_video_latent.shape} (context + extension)")
 
     extended_audio_latent = None
     audio_latents_per_second = None
+    # Calculate the context duration for time offset calculations
+    context_duration = start_time - context_start_time
     if audio_latent is not None:
         input_audio_latent_frames = audio_latent.shape[2]
-        # Use actual input video duration, not start_time (audio covers full input video)
-        audio_latents_per_second = input_audio_latent_frames / input_duration
-        # Use actual_output_duration (after 8n+1 rounding) to sync audio with video
-        output_audio_latent_frames = int(round(actual_output_duration * audio_latents_per_second))
+        # Audio covers the context portion we loaded
+        context_audio_duration = (context_end_frame - context_start_frame) / input_fps
+        audio_latents_per_second = input_audio_latent_frames / context_audio_duration
+        # Use actual_generated_duration for the generated portion
+        generated_audio_latent_frames = int(round(actual_generated_duration * audio_latents_per_second))
 
         extended_audio_latent = torch.zeros(
             audio_latent.shape[0],
             audio_latent.shape[1],
-            output_audio_latent_frames,
+            generated_audio_latent_frames,
             audio_latent.shape[3],
             device=device,
             dtype=dtype,
         )
 
         input_audio_frames = audio_latent.shape[2]
-        copy_audio_frames = min(input_audio_frames, output_audio_latent_frames)
+        copy_audio_frames = min(input_audio_frames, generated_audio_latent_frames)
         extended_audio_latent[:, :, :copy_audio_frames, :] = audio_latent[:, :, :copy_audio_frames, :]
 
-        print(f">>> Extended audio latent: {extended_audio_latent.shape}")
+        print(f">>> Generated audio latent: {extended_audio_latent.shape}")
 
     # FREE: Delete original latents (already copied to extended versions)
     del video_latent
@@ -6459,11 +6502,21 @@ def generate_av_extension(
     # =========================================================================
     print(">>> Creating noise masks...")
 
+    # Use RELATIVE times within the context window
+    # The generated portion spans [context_start_time, end_time] in absolute time
+    # But the latents are indexed from 0, so use relative times:
+    # - relative_start = context_duration (the context portion to preserve)
+    # - relative_end = actual_generated_duration (total generated portion)
+    relative_start_time = context_duration  # Time within the generated portion where extension begins
+    relative_end_time = actual_generated_duration  # Total duration of generated portion
+
+    print(f">>> Mask: preserve 0-{relative_start_time:.2f}s, generate {relative_start_time:.2f}-{relative_end_time:.2f}s")
+
     video_mask, audio_mask = create_av_noise_mask(
         video_latent=extended_video_latent,
         audio_latent=extended_audio_latent,
-        start_time=start_time,
-        end_time=end_time,
+        start_time=relative_start_time,  # Use relative time
+        end_time=relative_end_time,       # Use relative time
         video_fps=output_fps,
         time_scale_factor=time_scale_factor,
         sampling_rate=AUDIO_SAMPLE_RATE if extended_audio_latent is not None else None,
@@ -6663,10 +6716,10 @@ def generate_av_extension(
         stg_mode=args.stg_mode,
     )
 
-    # Create output shape
+    # Create output shape for the GENERATED portion (context + extension)
     output_shape = VideoPixelShape(
         batch=1,
-        frames=output_frames,
+        frames=generated_frames,  # Only context + extension, not full video
         height=stage1_height,
         width=stage1_width,
         fps=output_fps,
@@ -6706,18 +6759,18 @@ def generate_av_extension(
     # with their own positions, rather than sharing positions with mixed timesteps.
     # =========================================================================
 
-    # Calculate the split point in latent frames
+    # Calculate the split point in latent frames (using relative time within generated portion)
     video_start_idx = time_to_video_latent_idx(
-        start_time, output_fps, time_scale_factor, extended_video_latent.shape[2]
+        relative_start_time, output_fps, time_scale_factor, extended_video_latent.shape[2]
     )
 
-    # Split the extended latent into reference (preserved) and target (generated)
-    # Reference: frames [0, video_start_idx) - the preserved input video
-    # Target: frames [video_start_idx, total) - the frames to generate
+    # Split the extended latent into reference (context) and target (extension)
+    # Reference: frames [0, video_start_idx) - the context window to preserve
+    # Target: frames [video_start_idx, total) - the extension frames to generate
     reference_latent = extended_video_latent[:, :, :video_start_idx, :, :]
     target_latent = extended_video_latent[:, :, video_start_idx:, :, :]
 
-    print(f">>> V2V-style extension: {reference_latent.shape[2]} reference frames + {target_latent.shape[2]} target frames")
+    print(f">>> V2V-style extension: {reference_latent.shape[2]} context frames + {target_latent.shape[2]} extension frames")
 
     # Create VideoLatentTools for reference and target separately
     ref_pixel_frames = (reference_latent.shape[2] - 1) * time_scale_factor + 1
@@ -6957,19 +7010,23 @@ def generate_av_extension(
         # 1. Re-loading the input video at full (Stage 2) resolution
         # 2. Encoding it to latent space
         # 3. Replacing the upsampler output's preserved frames with the original encoding
-        print(">>> Loading original video at full resolution for preserved frames...")
+        print(">>> Loading original video at full resolution for context preservation...")
 
         stage2_width = stage1_width * 2
         stage2_height = stage1_height * 2
 
         cap_full = cv2.VideoCapture(input_video_path)
-        cap_full.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        # Start from context_start_frame (not 0) since we only generate from context_start_time
+        context_start_frame_full = int(context_start_time * input_fps)
+        cap_full.set(cv2.CAP_PROP_POS_FRAMES, context_start_frame_full)
         full_res_frames = []
-        frames_to_load = min(int(cap_full.get(cv2.CAP_PROP_FRAME_COUNT)), int(start_time * input_fps) + 16)
+        # Load frames from context_start to start_time + buffer
+        frames_to_load = min(int(cap_full.get(cv2.CAP_PROP_FRAME_COUNT)) - context_start_frame_full,
+                             int((start_time - context_start_time) * input_fps) + 16)
         # Round to nearest 8n+1 format for VAE compatibility
         n_frames_full = max(1, (frames_to_load - 1 + 7) // 8)
         frames_to_load = 8 * n_frames_full + 1
-        frames_to_load = min(frames_to_load, int(cap_full.get(cv2.CAP_PROP_FRAME_COUNT)))
+        frames_to_load = min(frames_to_load, int(cap_full.get(cv2.CAP_PROP_FRAME_COUNT)) - context_start_frame_full)
         for _ in range(frames_to_load):
             ret, frame = cap_full.read()
             if not ret:
@@ -6979,7 +7036,7 @@ def generate_av_extension(
             full_res_frames.append(frame)
         cap_full.release()
 
-        print(f">>> Loaded {len(full_res_frames)} frames at {stage2_width}x{stage2_height}")
+        print(f">>> Loaded {len(full_res_frames)} context frames at {stage2_width}x{stage2_height}")
 
         # Convert to tensor frame by frame (avoids np.stack large allocation)
         num_full_res = len(full_res_frames)
@@ -7042,16 +7099,16 @@ def generate_av_extension(
         full_res_latent = torch.cat(full_res_latent_chunks, dim=2)
         print(f">>> Full-res latent shape: {full_res_latent.shape}")
 
-        # Calculate how many latent frames to preserve (same formula as create_av_noise_mask)
-        video_start_idx = time_to_video_latent_idx(
-            start_time, output_fps, time_scale_factor, full_res_latent.shape[2]
+        # Calculate how many latent frames to preserve (using relative time within generated portion)
+        video_start_idx_stage2 = time_to_video_latent_idx(
+            relative_start_time, output_fps, time_scale_factor, full_res_latent.shape[2]
         )
 
-        # Replace preserved frames AND transition zone in upscaled latent with original full-res encoding
+        # Replace context frames AND transition zone in upscaled latent with original full-res encoding
         # Include slope_len extra frames to cover the gradient transition zone where mask < 1.0
         # This ensures clean_latent is correct for partial preservation blending
-        preserve_end_idx = min(video_start_idx + slope_len, full_res_latent.shape[2])
-        print(f">>> Replacing frames 0-{preserve_end_idx} (including transition zone) with original full-res encoding...")
+        preserve_end_idx = min(video_start_idx_stage2 + slope_len, full_res_latent.shape[2])
+        print(f">>> Replacing context frames 0-{preserve_end_idx} (including transition zone) with original full-res encoding...")
         upscaled_video_latent[:, :, :preserve_end_idx, :, :] = full_res_latent[:, :, :preserve_end_idx, :, :]
 
         # Cleanup (full_res_frames already deleted after tensor conversion)
@@ -7163,7 +7220,7 @@ def generate_av_extension(
         # because stage1 dimensions may be rounded to be divisible by 32
         stage2_output_shape = VideoPixelShape(
             batch=1,
-            frames=output_frames,
+            frames=generated_frames,  # Only context + extension, not full video
             height=stage1_height * 2,  # 2x stage 1 height
             width=stage1_width * 2,    # 2x stage 1 width
             fps=output_fps,
@@ -7335,52 +7392,99 @@ def generate_av_extension(
     cleanup_memory()
 
     # =========================================================================
-    # Step 10.5: Replace preserved frames with original pixels (bypass VAE quality loss)
+    # Step 10.5: Concatenate original video + generated portion with blending
     # =========================================================================
-    preserve_pixel_frames = int(start_time * output_fps)
-    if preserve_pixel_frames > 0:
-        print(f">>> Replacing {preserve_pixel_frames} preserved frames with original pixels...")
+    # The decoded_video is only the generated portion (context + extension)
+    # We need to:
+    # 1. Load original video from 0 to context_start_time
+    # 2. Replace context frames in generated portion with original pixels
+    # 3. Blend at the transition point (context_start_time)
+    # 4. Concatenate: original [0, context_start] + generated [context_start, end]
 
-        # Get output resolution from decoded video
-        out_h, out_w = decoded_video.shape[1], decoded_video.shape[2]
+    out_h, out_w = decoded_video.shape[1], decoded_video.shape[2]
+    import numpy as np
 
-        # Load original video frames at output resolution and fps
-        import numpy as np
-        cap_orig = cv2.VideoCapture(original_input_video_path)
-        if cap_orig.isOpened():
-            orig_fps = cap_orig.get(cv2.CAP_PROP_FPS)
-            orig_total = int(cap_orig.get(cv2.CAP_PROP_FRAME_COUNT))
+    # Calculate frame counts
+    context_frames_in_generated = int(round(context_duration * output_fps))  # Context portion within generated
+    preserved_original_frames = int(round(context_start_time * output_fps))  # Original video before context
 
-            # Calculate max input frame needed
-            max_in_frame = int((preserve_pixel_frames - 1) * orig_fps / output_fps)
-            max_in_frame = min(max_in_frame, orig_total - 1)
+    print(f">>> Assembling final video:")
+    print(f">>>   Original video: 0 to {context_start_time:.2f}s ({preserved_original_frames} frames)")
+    print(f">>>   Generated portion: {context_start_time:.2f}s to {context_start_time + actual_generated_duration:.2f}s ({decoded_video.shape[0]} frames)")
+    print(f">>>   Context within generated: {context_frames_in_generated} frames (to be replaced with original)")
 
-            # Read frames sequentially (much faster than seeking)
-            print(f">>>   Loading {max_in_frame + 1} source frames...")
-            input_frames = []
-            for i in range(max_in_frame + 1):
-                ret, frame = cap_orig.read()
-                if not ret:
-                    break
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
-                input_frames.append(frame)
-                if (i + 1) % 100 == 0:
-                    print(f">>>   Loaded {i + 1}/{max_in_frame + 1} frames...")
-            cap_orig.release()
+    cap_orig = cv2.VideoCapture(original_input_video_path)
+    if cap_orig.isOpened():
+        orig_fps = cap_orig.get(cv2.CAP_PROP_FPS)
+        orig_total = int(cap_orig.get(cv2.CAP_PROP_FRAME_COUNT))
 
-            # Map to output fps and copy directly to decoded_video (no large allocation)
-            # This avoids np.stack which requires a huge contiguous memory block
-            num_replace = min(preserve_pixel_frames, decoded_video.shape[0], len(input_frames))
-            for out_frame_idx in range(num_replace):
-                in_frame_idx = int(out_frame_idx * orig_fps / output_fps)
-                in_frame_idx = min(in_frame_idx, len(input_frames) - 1)
-                decoded_video[out_frame_idx] = torch.from_numpy(input_frames[in_frame_idx])
+        # Step 1: Load frames from 0 to start_time for preservation + context replacement
+        max_in_frame = int((preserved_original_frames + context_frames_in_generated) * orig_fps / output_fps)
+        max_in_frame = min(max_in_frame, orig_total - 1)
 
-            del input_frames  # Free memory
-            print(f">>> Replaced {num_replace} frames with original quality pixels")
+        print(f">>>   Loading {max_in_frame + 1} source frames...")
+        orig_video_frames = []
+        for i in range(max_in_frame + 1):
+            ret, frame = cap_orig.read()
+            if not ret:
+                break
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+            orig_video_frames.append(frame)
+            if (i + 1) % 100 == 0:
+                print(f">>>   Loaded {i + 1}/{max_in_frame + 1} frames...")
+        cap_orig.release()
+
+        # Step 2: Create preserved portion tensor (frames before context_start)
+        if preserved_original_frames > 0 and len(orig_video_frames) > 0:
+            preserved_video = torch.empty((preserved_original_frames, out_h, out_w, 3), dtype=torch.uint8)
+            for out_idx in range(preserved_original_frames):
+                in_idx = int(out_idx * orig_fps / output_fps)
+                in_idx = min(in_idx, len(orig_video_frames) - 1)
+                preserved_video[out_idx] = torch.from_numpy(orig_video_frames[in_idx])
+            print(f">>> Created preserved portion: {preserved_video.shape[0]} frames")
         else:
-            print(f">>> Warning: Could not open original video for frame preservation")
+            preserved_video = None
+
+        # Step 3: Replace context frames in generated portion with original pixels
+        if context_frames_in_generated > 0:
+            num_replace = min(context_frames_in_generated, decoded_video.shape[0])
+            for gen_idx in range(num_replace):
+                # Map generated frame index to original frame index
+                abs_time = context_start_time + gen_idx / output_fps
+                orig_frame_idx = int(abs_time * orig_fps)
+                orig_frame_idx = min(orig_frame_idx, len(orig_video_frames) - 1)
+                if orig_frame_idx < len(orig_video_frames):
+                    decoded_video[gen_idx] = torch.from_numpy(orig_video_frames[orig_frame_idx])
+            print(f">>> Replaced {num_replace} context frames with original pixels")
+
+        # Step 4: Apply blending at the transition point (context_start in generated portion)
+        blend_frames = min(8, context_frames_in_generated, decoded_video.shape[0] - context_frames_in_generated)
+        if blend_frames > 0:
+            print(f">>> Applying {blend_frames}-frame blend at transition point...")
+            for i in range(blend_frames):
+                blend_idx = context_frames_in_generated + i
+                if blend_idx < decoded_video.shape[0]:
+                    # Blend weight: 0 at start (full original) to 1 at end (full generated)
+                    alpha = (i + 1) / (blend_frames + 1)
+                    # Get original frame at this position
+                    abs_time = context_start_time + blend_idx / output_fps
+                    orig_frame_idx = int(abs_time * orig_fps)
+                    orig_frame_idx = min(orig_frame_idx, len(orig_video_frames) - 1)
+                    if orig_frame_idx < len(orig_video_frames):
+                        orig_frame = torch.from_numpy(orig_video_frames[orig_frame_idx]).float()
+                        gen_frame = decoded_video[blend_idx].float()
+                        blended = (1 - alpha) * orig_frame + alpha * gen_frame
+                        decoded_video[blend_idx] = blended.to(torch.uint8)
+
+        del orig_video_frames  # Free memory
+
+        # Step 5: Concatenate preserved + generated
+        if preserved_video is not None:
+            decoded_video = torch.cat([preserved_video, decoded_video], dim=0)
+            print(f">>> Final video: {decoded_video.shape[0]} frames ({decoded_video.shape[0] / output_fps:.2f}s)")
+    else:
+        print(f">>> Warning: Could not open original video for concatenation")
 
     # Decode audio if present
     decoded_audio = None
@@ -7397,37 +7501,58 @@ def generate_av_extension(
         cleanup_memory()
 
     # =========================================================================
-    # Step 10.7: Replace preserved audio with original audio (bypass VAE quality loss)
+    # Step 10.7: Concatenate original audio + generated audio with blending
     # =========================================================================
-    if decoded_audio is not None and audio_waveform is not None and start_time > 0:
+    if decoded_audio is not None and original_audio_waveform is not None:
         # Use original sample rate or default to 24000
         sr = audio_sample_rate if audio_sample_rate is not None else 24000
-        preserve_audio_samples = int(start_time * sr)
 
-        if preserve_audio_samples > 0:
-            print(f">>> Replacing {preserve_audio_samples} preserved audio samples with original...")
+        # Squeeze batch dimension if present - use ORIGINAL full audio
+        orig_audio = original_audio_waveform.squeeze(0) if original_audio_waveform.dim() == 3 else original_audio_waveform
 
-            # Get the number of samples to replace (min of original, decoded, and preserve target)
-            orig_samples = audio_waveform.shape[-1] if audio_waveform.dim() > 0 else 0
-            decoded_samples = decoded_audio.shape[-1] if decoded_audio.dim() > 0 else 0
-            num_replace = min(preserve_audio_samples, orig_samples, decoded_samples)
+        # Calculate sample counts
+        context_audio_samples = int(context_duration * sr)  # Context portion in generated audio
+        preserved_audio_samples = int(context_start_time * sr)  # Original audio before context
 
-            if num_replace > 0:
-                # Squeeze batch dimension if present (audio_waveform may be [1, C, S])
-                orig_audio = audio_waveform.squeeze(0) if audio_waveform.dim() == 3 else audio_waveform
+        print(f">>> Assembling final audio:")
+        print(f">>>   Preserved original: {preserved_audio_samples} samples ({context_start_time:.2f}s)")
+        print(f">>>   Context to replace: {context_audio_samples} samples ({context_duration:.2f}s)")
 
-                # Handle both 1D and 2D audio tensors
+        # Step 1: Replace context portion in generated audio with original
+        if context_audio_samples > 0:
+            # Get audio starting from context_start_time
+            context_start_sample = int(context_start_time * sr)
+            num_replace = min(context_audio_samples, decoded_audio.shape[-1])
+            orig_end_sample = min(context_start_sample + num_replace, orig_audio.shape[-1])
+            actual_replace = orig_end_sample - context_start_sample
+
+            if actual_replace > 0:
                 if decoded_audio.dim() == 1 and orig_audio.dim() == 1:
-                    decoded_audio[:num_replace] = orig_audio[:num_replace]
+                    decoded_audio[:actual_replace] = orig_audio[context_start_sample:orig_end_sample]
                 elif decoded_audio.dim() == 2 and orig_audio.dim() == 2:
-                    decoded_audio[:, :num_replace] = orig_audio[:, :num_replace]
+                    decoded_audio[:, :actual_replace] = orig_audio[:, context_start_sample:orig_end_sample]
                 elif decoded_audio.dim() == 1 and orig_audio.dim() == 2:
-                    # Original is stereo, decoded is mono - use first channel
-                    decoded_audio[:num_replace] = orig_audio[0, :num_replace]
+                    decoded_audio[:actual_replace] = orig_audio[0, context_start_sample:orig_end_sample]
                 elif decoded_audio.dim() == 2 and orig_audio.dim() == 1:
-                    # Original is mono, decoded is stereo - broadcast
-                    decoded_audio[:, :num_replace] = orig_audio[:num_replace].unsqueeze(0)
-                print(f">>> Replaced {num_replace} audio samples with original quality")
+                    decoded_audio[:, :actual_replace] = orig_audio[context_start_sample:orig_end_sample].unsqueeze(0)
+                print(f">>> Replaced {actual_replace} context audio samples with original")
+
+        # Step 2: Prepend preserved audio from 0 to context_start_time
+        if preserved_audio_samples > 0:
+            actual_preserved = min(preserved_audio_samples, orig_audio.shape[-1])
+            if decoded_audio.dim() == 1:
+                if orig_audio.dim() == 1:
+                    preserved_audio = orig_audio[:actual_preserved]
+                else:
+                    preserved_audio = orig_audio[0, :actual_preserved]
+                decoded_audio = torch.cat([preserved_audio, decoded_audio], dim=0)
+            else:  # decoded_audio.dim() == 2
+                if orig_audio.dim() == 1:
+                    preserved_audio = orig_audio[:actual_preserved].unsqueeze(0).expand(decoded_audio.shape[0], -1)
+                else:
+                    preserved_audio = orig_audio[:, :actual_preserved]
+                decoded_audio = torch.cat([preserved_audio, decoded_audio], dim=1)
+            print(f">>> Prepended {actual_preserved} original audio samples")
 
     print(f">>> Output video shape: {decoded_video.shape}")
     if decoded_audio is not None:
@@ -9717,10 +9842,11 @@ def main():
         print(f"  Input Video: {args.input_video}")
     # AV Extension mode info
     if args.av_extend_from:
-        print(f"AV Extension Mode: Time-Based Audio-Video Continuation")
+        print(f"AV Extension Mode: Context-Based Audio-Video Continuation")
         print(f"  Input Video: {args.av_extend_from}")
         print(f"  Start Time: {args.av_extend_start_time or 'auto (end of video)'}s")
         print(f"  End Time: {args.av_extend_end_time or 'auto (start + 5s)'}s")
+        print(f"  Context Window: {args.av_extend_context}s (regenerated for smooth continuation)")
         print(f"  Extension Steps: {args.av_extend_steps}")
         print(f"  Terminal Sigma: {args.av_extend_terminal}")
         print(f"  Skip Stage 2: {args.av_no_stage2}")
@@ -9844,6 +9970,7 @@ def main():
             end_time=args.av_extend_end_time,
             extend_steps=args.av_extend_steps,
             terminal=args.av_extend_terminal,
+            context_seconds=args.av_extend_context,
             slope_len=args.av_slope_len,
             skip_stage2=args.av_no_stage2,
             latent_norm_fn=latent_norm_fn,
