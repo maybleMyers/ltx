@@ -2134,8 +2134,9 @@ Examples:
         "--vae",
         type=resolve_path,
         default=None,
-        help="Path to separate VAE weights file (e.g., diffusion_pytorch_model_vae.safetensors). "
-             "If not specified, VAE weights are loaded from the main checkpoint.",
+        help="Path to supplementary checkpoint for VAE components (video VAE, audio VAE, vocoder, text encoder). "
+             "Use this to load full-precision VAE from dev checkpoint when using fp8 main checkpoint. "
+             "If not specified, all components are loaded from the main checkpoint.",
     )
 
     # ==========================================================================

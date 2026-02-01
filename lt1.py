@@ -3391,7 +3391,7 @@ def create_interface():
                             vae_path = gr.Textbox(
                                 label="VAE Path (Optional)",
                                 value="",
-                                info="Path to dev checkpoint for vae use (leave empty to use VAE from main checkpoint)",
+                                info="Path to dev checkpoint for vae use (leave empty to use VAE etc from main checkpoint)",
                                 placeholder="e.g., ./home/mayble/h1111/ltx/weights/ltx-2-19b-dev.safetensors"
                             )
                             with gr.Row():

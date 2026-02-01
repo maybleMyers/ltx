@@ -122,7 +122,8 @@ class ModelLedger:
             )
 
             # Use separate VAE path if provided, otherwise use checkpoint
-            # VAE path should point to a full LTX checkpoint file (e.g., dev checkpoint for better VAE)
+            # VAE path should point to a full LTX checkpoint file (e.g., dev checkpoint)
+            # When provided, it will be used for ALL VAE components (video VAE, audio VAE, vocoder, text encoder)
             vae_model_path = self.vae_path if self.vae_path is not None else self.checkpoint_path
 
             self.vae_decoder_builder = Builder(
@@ -139,30 +140,32 @@ class ModelLedger:
                 registry=self.registry,
             )
 
+            # Audio VAE and vocoder now use vae_model_path when --vae is specified
             self.audio_decoder_builder = Builder(
-                model_path=self.checkpoint_path,
+                model_path=vae_model_path,
                 model_class_configurator=AudioDecoderConfigurator,
                 model_sd_ops=AUDIO_VAE_DECODER_COMFY_KEYS_FILTER,
                 registry=self.registry,
             )
 
             self.audio_encoder_builder = Builder(
-                model_path=self.checkpoint_path,
+                model_path=vae_model_path,
                 model_class_configurator=AudioEncoderConfigurator,
                 model_sd_ops=AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
                 registry=self.registry,
             )
 
             self.vocoder_builder = Builder(
-                model_path=self.checkpoint_path,
+                model_path=vae_model_path,
                 model_class_configurator=VocoderConfigurator,
                 model_sd_ops=VOCODER_COMFY_KEYS_FILTER,
                 registry=self.registry,
             )
 
+            # Text encoder also uses vae_model_path when --vae is specified
             if self.gemma_root_path is not None:
                 self.text_encoder_builder = Builder(
-                    model_path=self.checkpoint_path,
+                    model_path=vae_model_path,
                     model_class_configurator=AVGemmaTextEncoderModelConfigurator,
                     model_sd_ops=AV_GEMMA_TEXT_ENCODER_KEY_OPS,
                     registry=self.registry,
