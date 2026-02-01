@@ -4058,7 +4058,7 @@ def create_interface():
             # =================================================================
             # Extension Tab (Wan2GP-style)
             # =================================================================
-            with gr.Tab("Extension", id="ext_tab", visible=False):
+            with gr.Tab("Extension", id="ext_tab", visible=True):
                 with gr.Row():
                     # Left column - Input and settings
                     with gr.Column(scale=1):
