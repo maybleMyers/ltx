@@ -3869,6 +3869,7 @@ class LTXVideoGeneratorWithOffloading:
                 if has_loras:
                     # Use chunked GPU LoRA application (like stage 2) to avoid slow CPU computation
                     # 1. Create a ledger WITHOUT LoRAs to load base model quickly
+                    # Reuse the same registry to avoid duplicate loading
                     stage_1_ledger_no_lora = ModelLedger(
                         dtype=self.dtype,
                         device=torch.device("cpu"),
@@ -3878,6 +3879,7 @@ class LTXVideoGeneratorWithOffloading:
                         vae_path=self.stage_1_model_ledger.vae_path,
                         loras=(),  # No LoRAs - load base model only
                         fp8transformer=self.stage_1_model_ledger.fp8transformer,
+                        registry=self.stage_1_model_ledger.registry,
                     )
 
                     # 2. Load transformer without LoRAs (fast)
@@ -4700,7 +4702,14 @@ class LTXVideoGeneratorWithOffloading:
         # This avoids the slow CPU-only LoRA application that appears to hang.
         block_swap_manager = None
         if self.enable_refiner_block_swap:
+            # Check if stage 2 uses the same checkpoint as stage 1 to reuse registry
+            # This prevents loading the same weights twice into RAM
+            use_shared_registry = (
+                self._stage_2_checkpoint_path == self.stage_1_model_ledger.checkpoint_path
+            )
+
             # Create ledger WITHOUT LoRAs - loading will be fast
+            # Reuse registry from stage 1 if using same checkpoint to avoid duplicate loading
             stage_2_ledger_no_lora = ModelLedger(
                 dtype=self.dtype,
                 device=torch.device("cpu"),
@@ -4710,6 +4719,7 @@ class LTXVideoGeneratorWithOffloading:
                 vae_path=self._stage_2_vae_path,
                 loras=(),  # No LoRAs - load base model only
                 fp8transformer=self._stage_2_fp8transformer,
+                registry=self.stage_1_model_ledger.registry if use_shared_registry else None,
             )
 
             # Load transformer without LoRAs (fast - just loading weights)
@@ -4814,6 +4824,11 @@ class LTXVideoGeneratorWithOffloading:
                     gc.collect()
         else:
             # Non-block-swap case: load with LoRAs directly to GPU (fast)
+            # Reuse registry from stage 1 if using same checkpoint to avoid duplicate loading
+            use_shared_registry = (
+                self._stage_2_checkpoint_path == self.stage_1_model_ledger.checkpoint_path
+            )
+
             stage_2_ledger = ModelLedger(
                 dtype=self.dtype,
                 device=self.device,
@@ -4823,6 +4838,7 @@ class LTXVideoGeneratorWithOffloading:
                 vae_path=self._stage_2_vae_path,
                 loras=(*self._stage_2_loras, *self._stage_2_distilled_lora) if self._stage_2_distilled_lora else self._stage_2_loras,
                 fp8transformer=self._stage_2_fp8transformer,
+                registry=self.stage_1_model_ledger.registry if use_shared_registry else None,
             )
             transformer = stage_2_ledger.transformer()
 
@@ -5267,6 +5283,11 @@ class LTXVideoGeneratorWithOffloading:
             # Load stage 3 transformer with LoRAs
             block_swap_manager = None
             if self.enable_stage3_block_swap and stage_3_loras_to_apply:
+                # Reuse registry from stage 1 if using same checkpoint to avoid duplicate loading
+                use_shared_registry = (
+                    self._stage_3_checkpoint_path == self.stage_1_model_ledger.checkpoint_path
+                )
+
                 # Create ledger WITHOUT LoRAs - loading will be fast
                 stage_3_ledger_no_lora = ModelLedger(
                     dtype=self.dtype,
@@ -5277,6 +5298,7 @@ class LTXVideoGeneratorWithOffloading:
                     vae_path=self._stage_3_vae_path,
                     loras=(),  # No LoRAs - load base model only
                     fp8transformer=self._stage_3_fp8transformer,
+                    registry=self.stage_1_model_ledger.registry if use_shared_registry else None,
                 )
                 transformer = stage_3_ledger_no_lora.transformer()
 
@@ -5341,6 +5363,11 @@ class LTXVideoGeneratorWithOffloading:
                 # Enable block swap
                 block_swap_manager = enable_block_swap(transformer, self.stage3_blocks_in_memory)
             elif self.enable_stage3_block_swap:
+                # Reuse registry from stage 1 if using same checkpoint to avoid duplicate loading
+                use_shared_registry = (
+                    self._stage_3_checkpoint_path == self.stage_1_model_ledger.checkpoint_path
+                )
+
                 # Block swap without LoRAs
                 stage_3_ledger = ModelLedger(
                     dtype=self.dtype,
@@ -5351,6 +5378,7 @@ class LTXVideoGeneratorWithOffloading:
                     vae_path=self._stage_3_vae_path,
                     loras=(),
                     fp8transformer=self._stage_3_fp8transformer,
+                    registry=self.stage_1_model_ledger.registry if use_shared_registry else None,
                 )
                 transformer = stage_3_ledger.transformer()
 
@@ -5390,6 +5418,11 @@ class LTXVideoGeneratorWithOffloading:
 
                 block_swap_manager = enable_block_swap(transformer, self.stage3_blocks_in_memory)
             else:
+                # Reuse registry from stage 1 if using same checkpoint to avoid duplicate loading
+                use_shared_registry = (
+                    self._stage_3_checkpoint_path == self.stage_1_model_ledger.checkpoint_path
+                )
+
                 # No block swap - load with LoRAs directly to GPU
                 stage_3_ledger = ModelLedger(
                     dtype=self.dtype,
@@ -5400,6 +5433,7 @@ class LTXVideoGeneratorWithOffloading:
                     vae_path=self._stage_3_vae_path,
                     loras=stage_3_loras_to_apply,
                     fp8transformer=self._stage_3_fp8transformer,
+                    registry=self.stage_1_model_ledger.registry if use_shared_registry else None,
                 )
                 transformer = stage_3_ledger.transformer()
 
@@ -6544,6 +6578,7 @@ def generate_av_extension(
 
         if has_loras:
             # Create ledger without LoRAs for fast base model loading
+            # Reuse the same registry to avoid duplicate loading
             stage_1_ledger_no_lora = ModelLedger(
                 dtype=generator.dtype,
                 device=torch.device("cpu"),
@@ -6553,6 +6588,7 @@ def generate_av_extension(
                 vae_path=generator.stage_1_model_ledger.vae_path,
                 loras=(),  # No LoRAs - load base model only
                 fp8transformer=generator.stage_1_model_ledger.fp8transformer,
+                registry=generator.stage_1_model_ledger.registry,
             )
             transformer = stage_1_ledger_no_lora.transformer()
 
@@ -7066,16 +7102,23 @@ def generate_av_extension(
             print(f">>> Loading stage 2 transformer with block swapping ({generator.refiner_blocks_in_memory} blocks in GPU)...", flush=True)
             from ltx_core.loader.sft_loader import SafetensorsStateDictLoader
 
+            # Get checkpoint path for stage 2
+            stage_2_checkpoint = generator.stage_2_model_ledger.checkpoint_path if hasattr(generator.stage_2_model_ledger, 'checkpoint_path') else generator.stage_1_model_ledger.checkpoint_path
+
+            # Reuse registry from stage 1 if using same checkpoint to avoid duplicate loading
+            use_shared_registry = (stage_2_checkpoint == generator.stage_1_model_ledger.checkpoint_path)
+
             # Create ledger without LoRAs for fast base model loading
             stage_2_ledger_no_lora = ModelLedger(
                 dtype=generator.dtype,
                 device=torch.device("cpu"),
-                checkpoint_path=generator.stage_2_model_ledger.checkpoint_path if hasattr(generator.stage_2_model_ledger, 'checkpoint_path') else generator.stage_1_model_ledger.checkpoint_path,
+                checkpoint_path=stage_2_checkpoint,
                 gemma_root_path=generator.stage_2_model_ledger.gemma_root_path if hasattr(generator.stage_2_model_ledger, 'gemma_root_path') else generator.stage_1_model_ledger.gemma_root_path,
                 spatial_upsampler_path=generator.stage_2_model_ledger.spatial_upsampler_path if hasattr(generator.stage_2_model_ledger, 'spatial_upsampler_path') else generator.stage_1_model_ledger.spatial_upsampler_path,
                 vae_path=generator.stage_2_model_ledger.vae_path if hasattr(generator.stage_2_model_ledger, 'vae_path') else generator.stage_1_model_ledger.vae_path,
                 loras=(),  # No LoRAs - load base model only
                 fp8transformer=generator.stage_2_model_ledger.fp8transformer if hasattr(generator.stage_2_model_ledger, 'fp8transformer') else generator.stage_1_model_ledger.fp8transformer,
+                registry=generator.stage_1_model_ledger.registry if use_shared_registry else None,
             )
             stage2_transformer = stage_2_ledger_no_lora.transformer()
 
@@ -7964,6 +8007,7 @@ def generate_v2v_join(
         has_loras = hasattr(generator.stage_1_model_ledger, 'loras') and generator.stage_1_model_ledger.loras
 
         if has_loras:
+            # Reuse the same registry to avoid duplicate loading
             stage_1_ledger_no_lora = ModelLedger(
                 dtype=generator.dtype,
                 device=torch.device("cpu"),
@@ -7973,6 +8017,7 @@ def generate_v2v_join(
                 vae_path=generator.stage_1_model_ledger.vae_path,
                 loras=(),
                 fp8transformer=generator.stage_1_model_ledger.fp8transformer,
+                registry=generator.stage_1_model_ledger.registry,
             )
             transformer = stage_1_ledger_no_lora.transformer()
 
@@ -8544,15 +8589,22 @@ def generate_v2v_join(
         if generator.enable_refiner_block_swap:
             from ltx_core.loader.sft_loader import SafetensorsStateDictLoader
 
+            # Get checkpoint path for stage 2
+            stage_2_checkpoint = generator.stage_2_model_ledger.checkpoint_path if hasattr(generator.stage_2_model_ledger, 'checkpoint_path') else generator.stage_1_model_ledger.checkpoint_path
+
+            # Reuse registry from stage 1 if using same checkpoint to avoid duplicate loading
+            use_shared_registry = (stage_2_checkpoint == generator.stage_1_model_ledger.checkpoint_path)
+
             stage_2_ledger_no_lora = ModelLedger(
                 dtype=generator.dtype,
                 device=torch.device("cpu"),
-                checkpoint_path=generator.stage_2_model_ledger.checkpoint_path if hasattr(generator.stage_2_model_ledger, 'checkpoint_path') else generator.stage_1_model_ledger.checkpoint_path,
+                checkpoint_path=stage_2_checkpoint,
                 gemma_root_path=generator.stage_2_model_ledger.gemma_root_path if hasattr(generator.stage_2_model_ledger, 'gemma_root_path') else generator.stage_1_model_ledger.gemma_root_path,
                 spatial_upsampler_path=generator.stage_2_model_ledger.spatial_upsampler_path if hasattr(generator.stage_2_model_ledger, 'spatial_upsampler_path') else generator.stage_1_model_ledger.spatial_upsampler_path,
                 vae_path=generator.stage_2_model_ledger.vae_path if hasattr(generator.stage_2_model_ledger, 'vae_path') else generator.stage_1_model_ledger.vae_path,
                 loras=(),
                 fp8transformer=generator.stage_2_model_ledger.fp8transformer if hasattr(generator.stage_2_model_ledger, 'fp8transformer') else generator.stage_1_model_ledger.fp8transformer,
+                registry=generator.stage_1_model_ledger.registry if use_shared_registry else None,
             )
             stage2_transformer = stage_2_ledger_no_lora.transformer()
 
