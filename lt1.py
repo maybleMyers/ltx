@@ -1783,7 +1783,7 @@ def generate_ltx_video(
             command.extend(["--refine-strength", str(float(refine_strength))])
 
         # Image conditioning (I2V) - with per-image CRF
-        if mode == "i2v" and input_image:
+        if input_image and mode in ("i2v", "v2v"):
             command.extend(["--image", str(input_image), str(int(image_frame_idx)), str(float(image_strength)), str(int(image_crf))])
 
         # End image conditioning (place at last frame) - with per-image CRF
