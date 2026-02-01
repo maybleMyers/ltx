@@ -131,7 +131,11 @@ def _upcast_and_round(
     return fused_add_round_launch(torch.zeros_like(weight, dtype=dtype), weight, seed)
 
 
-def replace_fwd_with_upcast(layer: torch.nn.Linear, with_stochastic_rounding: bool = False, seed: int = 0) -> None:
+def replace_fwd_with_upcast(
+    layer: torch.nn.Module,
+    with_stochastic_rounding: bool = False,
+    seed: int = 0,
+) -> None:
     """
     Replace linear.forward and rms_norm.forward with a version that:
       - upcasts weight and bias to input's dtype
@@ -140,18 +144,31 @@ def replace_fwd_with_upcast(layer: torch.nn.Linear, with_stochastic_rounding: bo
 
     layer.original_forward = layer.forward
 
-    def new_linear_forward(*args, **_kwargs) -> torch.Tensor:
-        # assume first arg is the input tensor
-        x = args[0]
-        w_up = _upcast_and_round(layer.weight, x.dtype, with_stochastic_rounding, seed)
-        b_up = None
+    if isinstance(layer, torch.nn.Linear):
+        def new_linear_forward(*args, **_kwargs) -> torch.Tensor:
+            # assume first arg is the input tensor
+            x = args[0]
+            w_up = _upcast_and_round(layer.weight, x.dtype, with_stochastic_rounding, seed)
+            b_up = None
 
-        if layer.bias is not None:
-            b_up = _upcast_and_round(layer.bias, x.dtype, with_stochastic_rounding, seed)
+            if layer.bias is not None:
+                b_up = _upcast_and_round(layer.bias, x.dtype, with_stochastic_rounding, seed)
 
-        return torch.nn.functional.linear(x, w_up, b_up)
+            return torch.nn.functional.linear(x, w_up, b_up)
 
-    layer.forward = new_linear_forward
+        layer.forward = new_linear_forward
+        return
+
+    if isinstance(layer, torch.nn.RMSNorm):
+        def new_rms_norm_forward(*args, **_kwargs) -> torch.Tensor:
+            x = args[0]
+            w_up = None
+            if layer.weight is not None:
+                w_up = _upcast_and_round(layer.weight, x.dtype, with_stochastic_rounding, seed)
+            return torch.nn.functional.rms_norm(x, layer.normalized_shape, w_up, layer.eps)
+
+        layer.forward = new_rms_norm_forward
+        return
 
 
 def amend_forward_with_upcast(
@@ -162,7 +179,7 @@ def amend_forward_with_upcast(
     with upcast and optional stochastic rounding.
     """
     for m in model.modules():
-        if isinstance(m, (torch.nn.Linear)):
+        if isinstance(m, (torch.nn.Linear, torch.nn.RMSNorm)):
             replace_fwd_with_upcast(m, with_stochastic_rounding, seed)
     return model
 
