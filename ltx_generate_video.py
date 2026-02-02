@@ -10464,10 +10464,11 @@ def main():
     add_metadata_to_video(args.output_path, metadata)
 
     # Clean up temporary audio-converted files
+    import os as os_module  # Use alias to avoid conflict with local imports above
     for temp_file in temp_audio_converted_files:
         try:
-            if os.path.exists(temp_file):
-                os.unlink(temp_file)
+            if os_module.path.exists(temp_file):
+                os_module.unlink(temp_file)
                 print(f">>> Cleaned up temporary file: {temp_file}")
         except OSError as e:
             print(f">>> Warning: Could not remove temporary file {temp_file}: {e}")
