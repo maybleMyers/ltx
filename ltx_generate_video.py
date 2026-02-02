@@ -3006,6 +3006,172 @@ Examples:
 
 
 # =============================================================================
+# Audio Preprocessing Utilities
+# =============================================================================
+
+def get_audio_sample_rate(video_path: str) -> int | None:
+    """
+    Get the audio sample rate of a video file using ffprobe.
+
+    Args:
+        video_path: Path to the video file
+
+    Returns:
+        Sample rate in Hz, or None if no audio stream found
+    """
+    import subprocess
+    import json
+
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "quiet",
+                "-print_format", "json",
+                "-show_streams",
+                "-select_streams", "a:0",
+                str(video_path)
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+
+        if result.returncode != 0:
+            return None
+
+        data = json.loads(result.stdout)
+        streams = data.get("streams", [])
+
+        if not streams:
+            return None
+
+        return int(streams[0].get("sample_rate", 0)) or None
+
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError) as e:
+        print(f">>> Warning: Could not probe audio sample rate: {e}")
+        return None
+
+
+def convert_video_audio_sample_rate(
+    video_path: str,
+    target_sample_rate: int = 24000,
+) -> str:
+    """
+    Convert video's audio to the target sample rate using ffmpeg.
+
+    Creates a temporary file with the converted audio. The caller is responsible
+    for cleanup if needed.
+
+    Args:
+        video_path: Path to the input video file
+        target_sample_rate: Target audio sample rate (default: 24000 for LTX-2)
+
+    Returns:
+        Path to the converted video file (or original path if conversion not needed)
+    """
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    current_rate = get_audio_sample_rate(video_path)
+
+    if current_rate is None:
+        print(f">>> No audio stream found in {video_path}, skipping audio conversion")
+        return video_path
+
+    if current_rate == target_sample_rate:
+        print(f">>> Audio already at {target_sample_rate}Hz: {video_path}")
+        return video_path
+
+    print(f">>> Converting audio from {current_rate}Hz to {target_sample_rate}Hz: {video_path}")
+
+    # Create temporary file with same extension
+    input_path = Path(video_path)
+    suffix = input_path.suffix or ".mp4"
+
+    # Use a temp file in the same directory to avoid cross-device issues
+    temp_dir = input_path.parent
+    temp_fd, temp_path = tempfile.mkstemp(suffix=suffix, dir=temp_dir, prefix="ltx_audio_converted_")
+    os.close(temp_fd)
+
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",  # Overwrite output
+                "-i", str(video_path),
+                "-c:v", "copy",  # Copy video stream without re-encoding
+                "-af", f"aresample={target_sample_rate}",  # Resample audio
+                "-ar", str(target_sample_rate),  # Set output sample rate
+                str(temp_path)
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300  # 5 minute timeout for long videos
+        )
+
+        if result.returncode != 0:
+            print(f">>> Warning: ffmpeg conversion failed: {result.stderr}")
+            # Clean up temp file on failure
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+            return video_path
+
+        print(f">>> Audio converted successfully: {temp_path}")
+        return temp_path
+
+    except subprocess.TimeoutExpired:
+        print(f">>> Warning: ffmpeg conversion timed out")
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+        return video_path
+    except FileNotFoundError:
+        print(f">>> Warning: ffmpeg not found, cannot convert audio sample rate")
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+        return video_path
+
+
+def preprocess_v2v_join_videos(args) -> list[str]:
+    """
+    Preprocess v2v join videos to ensure audio is at 24000Hz.
+
+    Args:
+        args: Parsed command line arguments
+
+    Returns:
+        List of temporary file paths that should be cleaned up after processing
+    """
+    temp_files = []
+
+    if not (args.v2v_join_video1 and args.v2v_join_video2):
+        return temp_files
+
+    print("=" * 60)
+    print("Preprocessing V2V Join Videos (Audio Sample Rate)")
+    print("=" * 60)
+
+    # Process video1
+    original_video1 = str(args.v2v_join_video1)
+    converted_video1 = convert_video_audio_sample_rate(original_video1, AUDIO_SAMPLE_RATE)
+    if converted_video1 != original_video1:
+        args.v2v_join_video1 = converted_video1
+        temp_files.append(converted_video1)
+
+    # Process video2
+    original_video2 = str(args.v2v_join_video2)
+    converted_video2 = convert_video_audio_sample_rate(original_video2, AUDIO_SAMPLE_RATE)
+    if converted_video2 != original_video2:
+        args.v2v_join_video2 = converted_video2
+        temp_files.append(converted_video2)
+
+    print("=" * 60)
+
+    return temp_files
+
+
+# =============================================================================
 # Memory Management Utilities
 # =============================================================================
 
@@ -9659,6 +9825,9 @@ def main():
             print("Error: --v2a-mode cannot be combined with --refine-only")
             sys.exit(1)
 
+    # Preprocess V2V join videos to ensure audio is at 24000Hz
+    temp_audio_converted_files = preprocess_v2v_join_videos(args)
+
     # Configure logging
     log_level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(level=log_level, format="%(message)s")
@@ -10293,6 +10462,15 @@ def main():
 
     print(">>> Adding metadata to video...")
     add_metadata_to_video(args.output_path, metadata)
+
+    # Clean up temporary audio-converted files
+    for temp_file in temp_audio_converted_files:
+        try:
+            if os.path.exists(temp_file):
+                os.unlink(temp_file)
+                print(f">>> Cleaned up temporary file: {temp_file}")
+        except OSError as e:
+            print(f">>> Warning: Could not remove temporary file {temp_file}: {e}")
 
     print(f">>> Output: {args.output_path}")
     print(">>> Done!")
