@@ -3101,9 +3101,12 @@ def convert_video_audio_sample_rate(
                 "ffmpeg",
                 "-y",  # Overwrite output
                 "-i", str(video_path),
+                "-map", "0:v",  # Explicitly map video stream
+                "-map", "0:a",  # Explicitly map audio stream
                 "-c:v", "copy",  # Copy video stream without re-encoding
-                "-af", f"aresample={target_sample_rate}",  # Resample audio
+                "-c:a", "aac",  # Re-encode audio to AAC (compatible with resampling)
                 "-ar", str(target_sample_rate),  # Set output sample rate
+                "-b:a", "192k",  # Audio bitrate
                 str(temp_path)
             ],
             capture_output=True,
