@@ -3932,8 +3932,8 @@ class LTXVideoGeneratorWithOffloading:
             # Only extract if v2v_audio_mode is "preserve" - for other modes, audio will be
             # regenerated or handled differently
             audio_latent = None
-            if not disable_audio and v2v_audio_mode == "preserve":
-                print(">>> Encoding audio from input video (v2v_audio_mode=preserve)...")
+            if not disable_audio and v2v_audio_mode in ("preserve", "condition"):
+                print(f">>> Encoding audio from input video (v2v_audio_mode={v2v_audio_mode})...")
 
                 # Extract audio waveform from input video
                 waveform, sample_rate = decode_audio_from_file(input_video, self.device)
@@ -3969,7 +3969,15 @@ class LTXVideoGeneratorWithOffloading:
                     audio_latent = audio_encoder(mel_spectrogram.to(dtype=torch.float32))
                     # Convert to bfloat16 for consistency with pipeline
                     audio_latent = audio_latent.to(dtype=dtype)
-
+                    # If conditioning, add to audio_conditionings list
+                    if v2v_audio_mode == "condition":
+                        from ltx_core.conditioning import AudioConditionByLatent
+                        audio_conditionings.append(
+                            AudioConditionByLatent(
+                                latent=audio_latent,
+                                strength=v2v_audio_strength,
+                            )
+                        )
                     # Clean up audio encoder
                     del audio_encoder, audio_processor
                     cleanup_memory()
