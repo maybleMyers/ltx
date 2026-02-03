@@ -2012,36 +2012,7 @@ def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
         description="LTX-2 Video Generation with advanced memory management",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Basic text-to-video generation
-  python ltx_generate_video.py \\
-    --checkpoint-path model.safetensors \\
-    --spatial-upsampler-path upsampler.safetensors \\
-    --distilled-lora distilled.safetensors \\
-    --prompt "A cat playing piano" \\
-    --output-path output.mp4
-
-  # Image-to-video with conditioning
-  python ltx_generate_video.py \\
-    --checkpoint-path model.safetensors \\
-    --spatial-upsampler-path upsampler.safetensors \\
-    --distilled-lora distilled.safetensors \\
-    --prompt "The cat starts playing" \\
-    --image input.jpg 0 0.9 \\
-    --output-path output.mp4
-
-  # Memory-optimized generation with offloading
-  python ltx_generate_video.py \\
-    --checkpoint-path model.safetensors \\
-    --spatial-upsampler-path upsampler.safetensors \\
-    --distilled-lora distilled.safetensors \\
-    --prompt "A beautiful sunset" \\
-    --offload \\
-    --enable-fp8 \\
-    --output-path output.mp4
-        """
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
 
     # ==========================================================================
@@ -4024,6 +3995,7 @@ class LTXVideoGeneratorWithOffloading:
 
         # Initialize V2V initial latent (will be set if input_video is provided for non-refine-only)
         v2v_initial_latent = None
+        v2v_audio_latent = None
 
         if not skip_stage_1:
             print(">>> Stage 1: Loading video encoder and transformer...")
