@@ -401,6 +401,143 @@ def upscale_spandrel(args):
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def upscale_basicvsr(args):
+    """Temporal video upscaling with BasicVSR++."""
+    import torch
+    import numpy as np
+    import cv2
+    from PIL import Image
+    from basicvsr_pp import BasicVSRPlusPlus, load_basicvsr_checkpoint
+
+    print("PROGRESS: Starting BasicVSR++ temporal upscaling...")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float16 if args.half else torch.float32
+
+    # Load model
+    model = BasicVSRPlusPlus(mid_channels=64, num_blocks=7, is_low_res_input=True)
+    load_basicvsr_checkpoint(model, args.model_path)
+    if args.half:
+        model = model.half()
+    model = model.to(device)
+    model.eval()
+    print("PROGRESS: BasicVSR++ model loaded (4x upscaling)")
+
+    # Load RAFT if motion blur enabled
+    raft_model = None
+    if args.motion_blur:
+        print("PROGRESS: Loading RAFT for motion blur...")
+        raft_model = load_raft_model(device)
+
+    # Create temp directories
+    temp_dir = tempfile.mkdtemp(prefix="upscale_bvsr_")
+    input_frames_dir = os.path.join(temp_dir, "input_frames")
+    output_frames_dir = os.path.join(temp_dir, "output_frames")
+    os.makedirs(input_frames_dir, exist_ok=True)
+    os.makedirs(output_frames_dir, exist_ok=True)
+
+    try:
+        # Extract frames
+        print("PROGRESS: Extracting frames...")
+        frame_paths, fps = extract_video_frames(args.input, input_frames_dir)
+        total_frames = len(frame_paths)
+        print(f"PROGRESS: Extracted {total_frames} frames at {fps:.2f} FPS")
+
+        if total_frames < 2:
+            print("ERROR: BasicVSR++ requires at least 2 frames")
+            return 1
+
+        # Load all frames as tensor [1, T, 3, H, W]
+        print("PROGRESS: Loading frames into tensor...")
+        frames = []
+        for p in frame_paths:
+            img = Image.open(p).convert("RGB")
+            arr = np.array(img).astype(np.float32) / 255.0
+            t = torch.from_numpy(arr).permute(2, 0, 1)
+            frames.append(t)
+
+        lqs = torch.stack(frames, dim=0).unsqueeze(0)  # [1, T, 3, H, W]
+        lqs = lqs.to(device, dtype)
+
+        # Process with optional temporal chunking
+        chunk_size = args.temporal_chunk
+        if chunk_size > 0 and total_frames > chunk_size:
+            overlap = min(5, chunk_size // 4)
+            all_outputs = []
+            start = 0
+            while start < total_frames:
+                end = min(start + chunk_size, total_frames)
+                chunk_start = max(0, start - overlap)
+                chunk_end = min(total_frames, end + overlap)
+
+                chunk = lqs[:, chunk_start:chunk_end]
+
+                progress_pct = int((start / total_frames) * 100)
+                print(f"PROGRESS: Processing frames {start + 1}-{end}/{total_frames} ({progress_pct}%)")
+
+                with torch.no_grad():
+                    output = model(chunk)
+
+                # Keep only the non-overlap portion
+                out_start = start - chunk_start
+                out_end = out_start + (end - start)
+                all_outputs.append(output[:, out_start:out_end].cpu())
+
+                start = end
+                torch.cuda.empty_cache()
+
+            output = torch.cat(all_outputs, dim=1)
+        else:
+            print(f"PROGRESS: Processing all {total_frames} frames through BasicVSR++...")
+            with torch.no_grad():
+                output = model(lqs)
+            output = output.cpu()
+
+        # Free model VRAM
+        del model, lqs
+        torch.cuda.empty_cache()
+
+        # Save frames (with optional motion blur)
+        print("PROGRESS: Saving upscaled frames...")
+        prev_upscaled = None
+        for i in range(output.shape[1]):
+            progress_pct = int((i / output.shape[1]) * 100)
+            if i % 10 == 0:
+                print(f"PROGRESS: Saving frame {i + 1}/{output.shape[1]} ({progress_pct}%)")
+
+            upscaled = output[:, i].to(device)
+
+            # Apply motion blur if enabled
+            if args.motion_blur and prev_upscaled is not None and raft_model is not None:
+                prev_float = prev_upscaled.float()
+                curr_float = upscaled.float()
+                flow = estimate_flow(raft_model, prev_float, curr_float, iters=12)
+                upscaled_blurred = apply_motion_blur_flow(
+                    curr_float, flow,
+                    strength=args.blur_strength,
+                    samples=args.blur_samples,
+                )
+                upscaled = upscaled_blurred.to(dtype)
+
+            prev_upscaled = upscaled.clone()
+
+            frame = upscaled[0].cpu().float().numpy().transpose(1, 2, 0)
+            frame = np.clip(frame * 255.0, 0, 255).astype(np.uint8)
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(os.path.join(output_frames_dir, f"{i:05d}.png"), frame_bgr)
+
+        print("PROGRESS: Encoding output video...")
+        frames_to_video(output_frames_dir, args.output, fps,
+                        audio_source=args.input, crf=args.crf)
+
+        print(f"PROGRESS: Done! Upscaled {total_frames} frames at 4x with BasicVSR++")
+        print(f"OUTPUT: {args.output}")
+        return 0
+
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Video Upscaling with Motion Blur")
     parser.add_argument("--input", required=True, help="Input video path")
@@ -422,6 +559,10 @@ def main():
     parser.add_argument("--blur-samples", type=int, default=7,
                         help="Motion blur samples (odd number, 3-15)")
 
+    # BasicVSR++ temporal chunking
+    parser.add_argument("--temporal-chunk", type=int, default=0,
+                        help="Temporal chunk size for BasicVSR++ (0=process all frames at once)")
+
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
 
     args = parser.parse_args()
@@ -436,12 +577,10 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    # Currently only spandrel-based upscaling is implemented
     if args.model_type in ["esrgan", "swinir"]:
         return upscale_spandrel(args)
     elif args.model_type == "basicvsr":
-        print("ERROR: BasicVSR++ not yet implemented")
-        return 1
+        return upscale_basicvsr(args)
     else:
         print(f"ERROR: Unknown model type: {args.model_type}")
         return 1

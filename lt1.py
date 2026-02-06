@@ -591,6 +591,8 @@ UPSCALER_MODELS = {
         "type": "basicvsr",
         "scale": 4,
         "checkpoint": "GIMM-VFI/pretrained_ckpt/basicvsr_plusplus_reds4.pth",
+        "hf_repo": "maybleMyers/interpolate",
+        "hf_filename": "basicvsr_plusplus_reds4.pth",
     },
 }
 
@@ -1350,10 +1352,24 @@ def upscale_video(
     else:
         model_path = os.path.join(script_dir, model_config["checkpoint"])
 
-    # Check if model exists
+    # Check if model exists, auto-download from HuggingFace if available
     if not os.path.exists(model_path):
-        yield None, f"Error: Model not found at {model_path}", 0.0
-        return
+        hf_repo = model_config.get("hf_repo")
+        hf_filename = model_config.get("hf_filename")
+        if hf_repo and hf_filename:
+            yield None, f"Downloading {model_variant} checkpoint from HuggingFace...", 0.03
+            try:
+                from huggingface_hub import hf_hub_download
+                downloaded = hf_hub_download(repo_id=hf_repo, filename=hf_filename)
+                os.makedirs(os.path.dirname(model_path), exist_ok=True)
+                shutil.copy2(downloaded, model_path)
+                yield None, f"Downloaded {model_variant} checkpoint.", 0.05
+            except Exception as e:
+                yield None, f"Error downloading {model_variant}: {e}", 0.0
+                return
+        else:
+            yield None, f"Error: Model not found at {model_path}", 0.0
+            return
 
     # Create output path
     output_dir = os.path.join(script_dir, "outputs", "upscaled")
