@@ -3886,15 +3886,19 @@ class LTXVideoGeneratorWithOffloading:
             v_context_p, a_context_p = context_p
             v_context_n, a_context_n = None, None
 
-        # Offload text encoder
+        # Offload and delete text encoder to free RAM
         print(">>> Releasing text encoder from GPU...")
         if text_encoder_block_swap:
             offload_all_text_encoder_blocks(text_encoder)
             text_encoder_block_swap = None
         else:
             text_encoder.to("cpu")
+        # Explicitly delete and force garbage collection
         del text_encoder
+        gc.collect()  # First pass
+        gc.collect()  # Second pass for circular references
         synchronize_and_cleanup()
+        print(">>> Text encoder deleted from RAM")
 
         # Move text embeddings to CPU - they'll be moved back to GPU when needed for denoising
         # This frees GPU memory during model loading phases
