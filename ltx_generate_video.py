@@ -3432,6 +3432,31 @@ def apply_loras_chunked_gpu(
     print(">>> LoRA application complete")
 
 
+def loras_are_equal(
+    loras1: tuple | list | None,
+    loras2: tuple | list | None,
+) -> bool:
+    """
+    Compare two LoRA configurations for equality.
+
+    Returns True if both have the same LoRAs (path and strength).
+    """
+    if loras1 is None:
+        loras1 = ()
+    if loras2 is None:
+        loras2 = ()
+
+    if len(loras1) != len(loras2):
+        return False
+
+    for l1, l2 in zip(loras1, loras2):
+        # Compare path and strength
+        if l1.path != l2.path or l1.strength != l2.strength:
+            return False
+
+    return True
+
+
 # =============================================================================
 # Chunked Video Encoding
 # =============================================================================
@@ -3886,6 +3911,9 @@ class LTXVideoGeneratorWithOffloading:
         # Initialize audio_latent for use in stage 2
         # Will be set by refine-only mode if encoding audio from input video
         audio_latent = None
+
+        # Initialize transformer reuse variable (set during stage 1 if reusable)
+        stage_1_transformer_for_reuse = None
 
         # =====================================================================
         # Refine-only mode: Skip stage 1 and use input video directly
@@ -4720,25 +4748,56 @@ class LTXVideoGeneratorWithOffloading:
 
             print(f">>> {stage_label} completed in {time.time() - stage1_start:.1f}s", flush=True)
 
-            # Cleanup stage 1 transformer
-            if block_swap_manager:
-                offload_all_blocks(transformer)
-                # Clear offloader references from transformer to break reference cycle
-                if hasattr(transformer, 'velocity_model'):
-                    if hasattr(transformer.velocity_model, '_block_swap_offloader'):
-                        transformer.velocity_model._block_swap_offloader = None
-                    if hasattr(transformer.velocity_model, '_blocks_ref'):
-                        transformer.velocity_model._blocks_ref = None
-                if hasattr(transformer, '_block_swap_offloader'):
-                    transformer._block_swap_offloader = None
-                if hasattr(transformer, '_blocks_ref'):
-                    transformer._blocks_ref = None
-                block_swap_manager = None
-            if self.offload:
-                print(">>> Offloading stage 1 transformer to CPU...")
-            # Set to None instead of del to avoid GC issues
-            transformer = None
-            cleanup_memory()
+            # Check if we can reuse transformer for stage 2
+            # Conditions: same checkpoint AND same LoRAs
+            stage_1_loras = self.stage_1_model_ledger.loras if hasattr(self.stage_1_model_ledger, 'loras') else ()
+            stage_2_all_loras = (*self._stage_2_loras, *self._stage_2_distilled_lora) if self._stage_2_distilled_lora else tuple(self._stage_2_loras)
+            same_checkpoint = (self.stage2_checkpoint is None) or (self._stage_2_checkpoint_path == self.stage_1_model_ledger.checkpoint_path)
+            same_loras = loras_are_equal(stage_1_loras, stage_2_all_loras)
+            can_reuse_transformer = same_checkpoint and same_loras
+
+            if can_reuse_transformer:
+                print(">>> Stage 1 transformer can be reused for stage 2 (same checkpoint and LoRAs)")
+                # Offload blocks but keep transformer for reuse
+                if block_swap_manager:
+                    offload_all_blocks(transformer)
+                    # Clear offloader references
+                    if hasattr(transformer, 'velocity_model'):
+                        if hasattr(transformer.velocity_model, '_block_swap_offloader'):
+                            transformer.velocity_model._block_swap_offloader = None
+                        if hasattr(transformer.velocity_model, '_blocks_ref'):
+                            transformer.velocity_model._blocks_ref = None
+                    if hasattr(transformer, '_block_swap_offloader'):
+                        transformer._block_swap_offloader = None
+                    if hasattr(transformer, '_blocks_ref'):
+                        transformer._blocks_ref = None
+                    block_swap_manager = None
+                # Keep transformer reference for stage 2
+                stage_1_transformer_for_reuse = transformer
+                transformer = None  # Clear local ref but keep stage_1_transformer_for_reuse
+            else:
+                if same_checkpoint:
+                    print(">>> Different LoRAs - will reload transformer for stage 2")
+                else:
+                    print(">>> Different checkpoint - will reload transformer for stage 2")
+                # Cleanup stage 1 transformer completely
+                if block_swap_manager:
+                    offload_all_blocks(transformer)
+                    if hasattr(transformer, 'velocity_model'):
+                        if hasattr(transformer.velocity_model, '_block_swap_offloader'):
+                            transformer.velocity_model._block_swap_offloader = None
+                        if hasattr(transformer.velocity_model, '_blocks_ref'):
+                            transformer.velocity_model._blocks_ref = None
+                    if hasattr(transformer, '_block_swap_offloader'):
+                        transformer._block_swap_offloader = None
+                    if hasattr(transformer, '_blocks_ref'):
+                        transformer._blocks_ref = None
+                    block_swap_manager = None
+                if self.offload:
+                    print(">>> Offloading stage 1 transformer to CPU...")
+                transformer = None
+                stage_1_transformer_for_reuse = None
+                cleanup_memory()
 
             # Move text embeddings to CPU to free GPU memory during upsampling and stage 2 model loading
             v_context_p = v_context_p.cpu()
@@ -4838,161 +4897,239 @@ class LTXVideoGeneratorWithOffloading:
         # =====================================================================
         # Phase 4: Stage 2 - High Resolution Refinement (two-stage only)
         # =====================================================================
-        print(">>> Stage 2: Loading transformer with distilled LoRA...", flush=True)
         stage2_start = time.time()
 
-        # Force complete cleanup before loading stage 2 transformer
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-
-        # For block swapping with LoRAs, we need to:
-        # 1. Load transformer WITHOUT LoRAs to CPU (fast)
-        # 2. Load LoRA state dicts
-        # 3. Apply LoRAs using chunked GPU computation (fast, low memory)
-        # This avoids the slow CPU-only LoRA application that appears to hang.
+        # Check if we can reuse the stage 1 transformer (same checkpoint + same LoRAs)
         block_swap_manager = None
-        if self.enable_refiner_block_swap:
-            # Check if stage 2 uses the same checkpoint as stage 1 to reuse registry
-            # This prevents loading the same weights twice into RAM
-            use_shared_registry = (
-                self._stage_2_checkpoint_path == self.stage_1_model_ledger.checkpoint_path
-            )
+        if stage_1_transformer_for_reuse is not None:
+            print(">>> Stage 2: Reusing transformer from stage 1 (same checkpoint and LoRAs)")
+            transformer = stage_1_transformer_for_reuse
+            stage_1_transformer_for_reuse = None  # Clear reference
 
-            # Create ledger WITHOUT LoRAs - loading will be fast
-            # Reuse registry from stage 1 if using same checkpoint to avoid duplicate loading
-            stage_2_ledger_no_lora = ModelLedger(
-                dtype=self.dtype,
-                device=torch.device("cpu"),
-                checkpoint_path=self._stage_2_checkpoint_path,
-                gemma_root_path=self._stage_2_gemma_root,
-                spatial_upsampler_path=self._stage_2_spatial_upsampler_path,
-                vae_path=self._stage_2_vae_path,
-                loras=(),  # No LoRAs - load base model only
-                fp8transformer=self._stage_2_fp8transformer,
-                registry=self.stage_1_model_ledger.registry if use_shared_registry else None,
-            )
-
-            # Load transformer without LoRAs (fast - just loading weights)
-            print(">>> Loading stage 2 transformer to CPU...", flush=True)
-            transformer = stage_2_ledger_no_lora.transformer()
-
-            # Now apply LoRAs using chunked GPU computation
-            all_loras = (*self._stage_2_loras, *self._stage_2_distilled_lora) if self._stage_2_distilled_lora else self._stage_2_loras
-            if all_loras:
-                print(f">>> Loading {len(all_loras)} LoRA(s)...", flush=True)
-                from ltx_core.loader.sft_loader import SafetensorsStateDictLoader
-                lora_loader = SafetensorsStateDictLoader()
-                lora_state_dicts = []
-                lora_strengths = []
-                for lora in all_loras:
-                    lora_sd = lora_loader.load(lora.path, sd_ops=lora.sd_ops, device=torch.device("cpu"))
-                    lora_state_dicts.append(lora_sd)
-                    lora_strengths.append(lora.strength)
-
-                # Apply LoRAs using chunked GPU computation
-                apply_loras_chunked_gpu(
-                    model=transformer,
-                    lora_state_dicts=lora_state_dicts,
-                    lora_strengths=lora_strengths,
-                    gpu_device=self.device,
-                    dtype=self.dtype,
+            # Reconfigure for stage 2 block swapping if needed
+            if self.enable_refiner_block_swap:
+                print(f">>> Enabling refiner block swapping ({self.refiner_blocks_in_memory} blocks in GPU)...")
+                # Move non-block components to GPU (may already be there from stage 1)
+                transformer.velocity_model.patchify_proj.to(self.device)
+                transformer.velocity_model.adaln_single.to(self.device)
+                transformer.velocity_model.caption_projection.to(self.device)
+                transformer.velocity_model.norm_out.to(self.device)
+                transformer.velocity_model.proj_out.to(self.device)
+                transformer.velocity_model.scale_shift_table = torch.nn.Parameter(
+                    transformer.velocity_model.scale_shift_table.to(self.device)
                 )
+                if hasattr(transformer.velocity_model, "audio_patchify_proj"):
+                    transformer.velocity_model.audio_patchify_proj.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_adaln_single"):
+                    transformer.velocity_model.audio_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_caption_projection"):
+                    transformer.velocity_model.audio_caption_projection.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_norm_out"):
+                    transformer.velocity_model.audio_norm_out.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_proj_out"):
+                    transformer.velocity_model.audio_proj_out.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_scale_shift_table"):
+                    transformer.velocity_model.audio_scale_shift_table = torch.nn.Parameter(
+                        transformer.velocity_model.audio_scale_shift_table.to(self.device)
+                    )
+                if hasattr(transformer.velocity_model, "av_ca_video_scale_shift_adaln_single"):
+                    transformer.velocity_model.av_ca_video_scale_shift_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "av_ca_audio_scale_shift_adaln_single"):
+                    transformer.velocity_model.av_ca_audio_scale_shift_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "av_ca_a2v_gate_adaln_single"):
+                    transformer.velocity_model.av_ca_a2v_gate_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "av_ca_v2a_gate_adaln_single"):
+                    transformer.velocity_model.av_ca_v2a_gate_adaln_single.to(self.device)
 
-                # Clean up LoRA state dicts
-                del lora_state_dicts
-                synchronize_and_cleanup()
+                # Enable block swap for stage 2
+                current_blocks = self.refiner_blocks_in_memory
+                min_blocks = 1
+                while current_blocks >= min_blocks:
+                    try:
+                        if self.enable_activation_offload:
+                            block_swap_manager = enable_block_swap_with_activation_offload(
+                                transformer,
+                                blocks_in_memory=current_blocks,
+                                device=self.device,
+                                verbose=True,
+                                temporal_chunk_size=self.temporal_chunk_size,
+                            )
+                        else:
+                            block_swap_manager = enable_block_swap(
+                                transformer,
+                                blocks_in_memory=current_blocks,
+                                device=self.device,
+                            )
+                        self.refiner_blocks_in_memory = current_blocks
+                        break
+                    except torch.OutOfMemoryError:
+                        current_blocks -= 1
+                        if current_blocks < min_blocks:
+                            print(f">>> OOM Error during block swap setup: Already at minimum blocks ({min_blocks})")
+                            raise
+                        print(f">>> OOM during enable_block_swap! Retrying with {current_blocks} blocks...")
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                            torch.cuda.empty_cache()
+                        gc.collect()
 
-            # For VAE operations later
-            stage_2_ledger = stage_2_ledger_no_lora
+            # Use stage 1 ledger for VAE operations
+            stage_2_ledger = self.stage_1_model_ledger
 
-            # Move non-block components to GPU
-            print(f">>> Enabling refiner block swapping ({self.refiner_blocks_in_memory} blocks in GPU)...")
-            transformer.velocity_model.patchify_proj.to(self.device)
-            transformer.velocity_model.adaln_single.to(self.device)
-            transformer.velocity_model.caption_projection.to(self.device)
-            transformer.velocity_model.norm_out.to(self.device)
-            transformer.velocity_model.proj_out.to(self.device)
-            transformer.velocity_model.scale_shift_table = torch.nn.Parameter(
-                transformer.velocity_model.scale_shift_table.to(self.device)
-            )
-            if hasattr(transformer.velocity_model, "audio_patchify_proj"):
-                transformer.velocity_model.audio_patchify_proj.to(self.device)
-            if hasattr(transformer.velocity_model, "audio_adaln_single"):
-                transformer.velocity_model.audio_adaln_single.to(self.device)
-            if hasattr(transformer.velocity_model, "audio_caption_projection"):
-                transformer.velocity_model.audio_caption_projection.to(self.device)
-            if hasattr(transformer.velocity_model, "audio_norm_out"):
-                transformer.velocity_model.audio_norm_out.to(self.device)
-            if hasattr(transformer.velocity_model, "audio_proj_out"):
-                transformer.velocity_model.audio_proj_out.to(self.device)
-            if hasattr(transformer.velocity_model, "audio_scale_shift_table"):
-                transformer.velocity_model.audio_scale_shift_table = torch.nn.Parameter(
-                    transformer.velocity_model.audio_scale_shift_table.to(self.device)
-                )
-            # Cross-attention adaln components
-            if hasattr(transformer.velocity_model, "av_ca_video_scale_shift_adaln_single"):
-                transformer.velocity_model.av_ca_video_scale_shift_adaln_single.to(self.device)
-            if hasattr(transformer.velocity_model, "av_ca_audio_scale_shift_adaln_single"):
-                transformer.velocity_model.av_ca_audio_scale_shift_adaln_single.to(self.device)
-            if hasattr(transformer.velocity_model, "av_ca_a2v_gate_adaln_single"):
-                transformer.velocity_model.av_ca_a2v_gate_adaln_single.to(self.device)
-            if hasattr(transformer.velocity_model, "av_ca_v2a_gate_adaln_single"):
-                transformer.velocity_model.av_ca_v2a_gate_adaln_single.to(self.device)
-
-            # Try to enable block swap with OOM retry (reduce blocks if needed)
-            current_blocks = self.refiner_blocks_in_memory
-            min_blocks = 1
-            while current_blocks >= min_blocks:
-                try:
-                    # Use activation offload for extreme memory savings (moves activations to CPU between blocks)
-                    if self.enable_activation_offload:
-                        block_swap_manager = enable_block_swap_with_activation_offload(
-                            transformer,
-                            blocks_in_memory=current_blocks,
-                            device=self.device,
-                            verbose=True,
-                            temporal_chunk_size=self.temporal_chunk_size,
-                        )
-                    else:
-                        block_swap_manager = enable_block_swap(
-                            transformer,
-                            blocks_in_memory=current_blocks,
-                            device=self.device,
-                        )
-                    # Update instance variable for later retry logic
-                    self.refiner_blocks_in_memory = current_blocks
-                    break
-                except torch.OutOfMemoryError:
-                    current_blocks -= 1
-                    if current_blocks < min_blocks:
-                        print(f">>> OOM Error during block swap setup: Already at minimum blocks ({min_blocks})")
-                        raise
-                    print(f">>> OOM during enable_block_swap! Retrying with {current_blocks} blocks...")
-                    if torch.cuda.is_available():
-                        torch.cuda.synchronize()
-                        torch.cuda.empty_cache()
-                    gc.collect()
         else:
-            # Non-block-swap case: load with LoRAs directly to GPU (fast)
-            # Reuse registry from stage 1 if using same checkpoint to avoid duplicate loading
-            use_shared_registry = (
-                self._stage_2_checkpoint_path == self.stage_1_model_ledger.checkpoint_path
-            )
+            print(">>> Stage 2: Loading transformer with distilled LoRA...", flush=True)
 
-            stage_2_ledger = ModelLedger(
-                dtype=self.dtype,
-                device=self.device,
-                checkpoint_path=self._stage_2_checkpoint_path,
-                gemma_root_path=self._stage_2_gemma_root,
-                spatial_upsampler_path=self._stage_2_spatial_upsampler_path,
-                vae_path=self._stage_2_vae_path,
-                loras=(*self._stage_2_loras, *self._stage_2_distilled_lora) if self._stage_2_distilled_lora else self._stage_2_loras,
-                fp8transformer=self._stage_2_fp8transformer,
-                registry=self.stage_1_model_ledger.registry if use_shared_registry else None,
-            )
-            transformer = stage_2_ledger.transformer()
+            # Force complete cleanup before loading stage 2 transformer
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+
+            # For block swapping with LoRAs, we need to:
+            # 1. Load transformer WITHOUT LoRAs to CPU (fast)
+            # 2. Load LoRA state dicts
+            # 3. Apply LoRAs using chunked GPU computation (fast, low memory)
+            # This avoids the slow CPU-only LoRA application that appears to hang.
+            if self.enable_refiner_block_swap:
+                # Check if stage 2 uses the same checkpoint as stage 1 to reuse registry
+                # This prevents loading the same weights twice into RAM
+                use_shared_registry = (
+                    self._stage_2_checkpoint_path == self.stage_1_model_ledger.checkpoint_path
+                )
+
+                # Create ledger WITHOUT LoRAs - loading will be fast
+                # Reuse registry from stage 1 if using same checkpoint to avoid duplicate loading
+                stage_2_ledger_no_lora = ModelLedger(
+                    dtype=self.dtype,
+                    device=torch.device("cpu"),
+                    checkpoint_path=self._stage_2_checkpoint_path,
+                    gemma_root_path=self._stage_2_gemma_root,
+                    spatial_upsampler_path=self._stage_2_spatial_upsampler_path,
+                    vae_path=self._stage_2_vae_path,
+                    loras=(),  # No LoRAs - load base model only
+                    fp8transformer=self._stage_2_fp8transformer,
+                    registry=self.stage_1_model_ledger.registry if use_shared_registry else None,
+                )
+
+                # Load transformer without LoRAs (fast - just loading weights)
+                print(">>> Loading stage 2 transformer to CPU...", flush=True)
+                transformer = stage_2_ledger_no_lora.transformer()
+
+                # Now apply LoRAs using chunked GPU computation
+                all_loras = (*self._stage_2_loras, *self._stage_2_distilled_lora) if self._stage_2_distilled_lora else self._stage_2_loras
+                if all_loras:
+                    print(f">>> Loading {len(all_loras)} LoRA(s)...", flush=True)
+                    from ltx_core.loader.sft_loader import SafetensorsStateDictLoader
+                    lora_loader = SafetensorsStateDictLoader()
+                    lora_state_dicts = []
+                    lora_strengths = []
+                    for lora in all_loras:
+                        lora_sd = lora_loader.load(lora.path, sd_ops=lora.sd_ops, device=torch.device("cpu"))
+                        lora_state_dicts.append(lora_sd)
+                        lora_strengths.append(lora.strength)
+
+                    # Apply LoRAs using chunked GPU computation
+                    apply_loras_chunked_gpu(
+                        model=transformer,
+                        lora_state_dicts=lora_state_dicts,
+                        lora_strengths=lora_strengths,
+                        gpu_device=self.device,
+                        dtype=self.dtype,
+                    )
+
+                    # Clean up LoRA state dicts
+                    del lora_state_dicts
+                    synchronize_and_cleanup()
+
+                # For VAE operations later
+                stage_2_ledger = stage_2_ledger_no_lora
+
+                # Move non-block components to GPU
+                print(f">>> Enabling refiner block swapping ({self.refiner_blocks_in_memory} blocks in GPU)...")
+                transformer.velocity_model.patchify_proj.to(self.device)
+                transformer.velocity_model.adaln_single.to(self.device)
+                transformer.velocity_model.caption_projection.to(self.device)
+                transformer.velocity_model.norm_out.to(self.device)
+                transformer.velocity_model.proj_out.to(self.device)
+                transformer.velocity_model.scale_shift_table = torch.nn.Parameter(
+                    transformer.velocity_model.scale_shift_table.to(self.device)
+                )
+                if hasattr(transformer.velocity_model, "audio_patchify_proj"):
+                    transformer.velocity_model.audio_patchify_proj.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_adaln_single"):
+                    transformer.velocity_model.audio_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_caption_projection"):
+                    transformer.velocity_model.audio_caption_projection.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_norm_out"):
+                    transformer.velocity_model.audio_norm_out.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_proj_out"):
+                    transformer.velocity_model.audio_proj_out.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_scale_shift_table"):
+                    transformer.velocity_model.audio_scale_shift_table = torch.nn.Parameter(
+                        transformer.velocity_model.audio_scale_shift_table.to(self.device)
+                    )
+                # Cross-attention adaln components
+                if hasattr(transformer.velocity_model, "av_ca_video_scale_shift_adaln_single"):
+                    transformer.velocity_model.av_ca_video_scale_shift_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "av_ca_audio_scale_shift_adaln_single"):
+                    transformer.velocity_model.av_ca_audio_scale_shift_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "av_ca_a2v_gate_adaln_single"):
+                    transformer.velocity_model.av_ca_a2v_gate_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "av_ca_v2a_gate_adaln_single"):
+                    transformer.velocity_model.av_ca_v2a_gate_adaln_single.to(self.device)
+
+                # Try to enable block swap with OOM retry (reduce blocks if needed)
+                current_blocks = self.refiner_blocks_in_memory
+                min_blocks = 1
+                while current_blocks >= min_blocks:
+                    try:
+                        # Use activation offload for extreme memory savings (moves activations to CPU between blocks)
+                        if self.enable_activation_offload:
+                            block_swap_manager = enable_block_swap_with_activation_offload(
+                                transformer,
+                                blocks_in_memory=current_blocks,
+                                device=self.device,
+                                verbose=True,
+                                temporal_chunk_size=self.temporal_chunk_size,
+                            )
+                        else:
+                            block_swap_manager = enable_block_swap(
+                                transformer,
+                                blocks_in_memory=current_blocks,
+                                device=self.device,
+                            )
+                        # Update instance variable for later retry logic
+                        self.refiner_blocks_in_memory = current_blocks
+                        break
+                    except torch.OutOfMemoryError:
+                        current_blocks -= 1
+                        if current_blocks < min_blocks:
+                            print(f">>> OOM Error during block swap setup: Already at minimum blocks ({min_blocks})")
+                            raise
+                        print(f">>> OOM during enable_block_swap! Retrying with {current_blocks} blocks...")
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                            torch.cuda.empty_cache()
+                        gc.collect()
+            else:
+                # Non-block-swap case: load with LoRAs directly to GPU (fast)
+                # Reuse registry from stage 1 if using same checkpoint to avoid duplicate loading
+                use_shared_registry = (
+                    self._stage_2_checkpoint_path == self.stage_1_model_ledger.checkpoint_path
+                )
+
+                stage_2_ledger = ModelLedger(
+                    dtype=self.dtype,
+                    device=self.device,
+                    checkpoint_path=self._stage_2_checkpoint_path,
+                    gemma_root_path=self._stage_2_gemma_root,
+                    spatial_upsampler_path=self._stage_2_spatial_upsampler_path,
+                    vae_path=self._stage_2_vae_path,
+                    loras=(*self._stage_2_loras, *self._stage_2_distilled_lora) if self._stage_2_distilled_lora else self._stage_2_loras,
+                    fp8transformer=self._stage_2_fp8transformer,
+                    registry=self.stage_1_model_ledger.registry if use_shared_registry else None,
+                )
+                transformer = stage_2_ledger.transformer()
 
         # Enable FFN chunking for stage 2 transformer if configured
         if self.ffn_chunk_size is not None:
