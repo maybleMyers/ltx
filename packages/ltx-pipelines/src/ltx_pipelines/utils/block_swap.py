@@ -761,6 +761,15 @@ def offload_all_text_encoder_blocks(text_encoder) -> None:
     offloader.thread_pool.shutdown(wait=True)
     offloader.futures.clear()
 
+    # Explicitly free pinned memory buffers and CUDA resources
+    for wid in list(offloader.spare_buffers.keys()):
+        offloader.spare_buffers[wid].clear()
+    offloader.spare_buffers.clear()
+    offloader.streams_to_gpu.clear()
+    offloader.streams_to_cpu.clear()
+    offloader.events_gpu_done.clear()
+    offloader.events_cpu_done.clear()
+
     # Synchronize CUDA before moving blocks
     if device.type == "cuda":
         torch.cuda.synchronize()
@@ -790,30 +799,17 @@ def offload_all_text_encoder_blocks(text_encoder) -> None:
     if hasattr(text_encoder, "audio_embeddings_connector"):
         text_encoder.audio_embeddings_connector.to("cpu")
 
-    # Restore original forward if saved
-    if hasattr(gemma_text_model, "_original_forward"):
-        gemma_text_model.forward = gemma_text_model._original_forward
-        del gemma_text_model._original_forward
+    # Delete monkey-patched methods and saved originals (break circular refs)
+    # Don't restore - we're destroying the text encoder, not reusing it
+    for attr in ("_original_forward", "forward", "_block_swap_offloader",
+                 "_blocks_to_swap", "_blocks_ref", "_block_swap_device"):
+        if hasattr(gemma_text_model, attr):
+            delattr(gemma_text_model, attr)
 
-    # Restore original _preprocess_text
-    if hasattr(text_encoder, "_original_preprocess_text"):
-        text_encoder._preprocess_text = text_encoder._original_preprocess_text
-        del text_encoder._original_preprocess_text
-
-    # Restore original _enhance
-    if hasattr(text_encoder, "_original_enhance"):
-        text_encoder._enhance = text_encoder._original_enhance
-        del text_encoder._original_enhance
-
-    # Cleanup attributes
-    if hasattr(gemma_text_model, "_block_swap_offloader"):
-        del gemma_text_model._block_swap_offloader
-    if hasattr(gemma_text_model, "_blocks_to_swap"):
-        del gemma_text_model._blocks_to_swap
-    if hasattr(gemma_text_model, "_blocks_ref"):
-        del gemma_text_model._blocks_ref
-    if hasattr(gemma_text_model, "_block_swap_device"):
-        del gemma_text_model._block_swap_device
+    for attr in ("_preprocess_text", "_original_preprocess_text",
+                 "_enhance", "_original_enhance"):
+        if hasattr(text_encoder, attr) and attr in text_encoder.__dict__:
+            delattr(text_encoder, attr)
 
     # Synchronize again after moves complete
     if device.type == "cuda":
