@@ -19,6 +19,7 @@ import argparse
 import gc
 import logging
 import os
+import psutil
 import sys
 import time
 from collections.abc import Callable, Iterator
@@ -3165,6 +3166,55 @@ def synchronize_and_cleanup():
         torch.cuda.empty_cache()
 
 
+def print_memory_report(label: str = "Memory Report"):
+    """Print detailed VRAM and RAM usage breakdown."""
+    proc = psutil.Process()
+    vm = psutil.virtual_memory()
+
+    rss_gb = proc.memory_info().rss / 1024**3
+    ram_total_gb = vm.total / 1024**3
+    ram_used_gb = vm.used / 1024**3
+    ram_avail_gb = vm.available / 1024**3
+
+    lines = [f">>> [{label}]"]
+    lines.append(f"    RAM  - process RSS: {rss_gb:.2f} GB | "
+                 f"system: {ram_used_gb:.2f}/{ram_total_gb:.2f} GB used, "
+                 f"{ram_avail_gb:.2f} GB available")
+
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        total = torch.cuda.get_device_properties(0).total_mem / 1024**3
+        free = total - reserved
+        lines.append(f"    VRAM - allocated: {allocated:.2f} GB | "
+                     f"reserved: {reserved:.2f} GB | "
+                     f"free: {free:.2f}/{total:.2f} GB")
+
+        # Per-object breakdown of GPU tensors by module origin
+        tensor_sizes = {}
+        for obj in gc.get_objects():
+            try:
+                if torch.is_tensor(obj) and obj.is_cuda:
+                    size_mb = obj.nelement() * obj.element_size() / 1024**2
+                    # Bucket by shape signature for readability
+                    key = f"{tuple(obj.shape)}:{obj.dtype}"
+                    tensor_sizes[key] = tensor_sizes.get(key, 0) + size_mb
+            except Exception:
+                pass
+
+        if tensor_sizes:
+            # Show top 10 largest tensor groups
+            sorted_tensors = sorted(tensor_sizes.items(), key=lambda x: -x[1])[:10]
+            lines.append("    VRAM tensors (top 10):")
+            for key, size_mb in sorted_tensors:
+                if size_mb >= 1.0:
+                    lines.append(f"      {size_mb:>8.1f} MB  {key}")
+        else:
+            lines.append("    VRAM tensors: none")
+
+    print("\n".join(lines), flush=True)
+
+
 def destroy_text_encoder(text_encoder, text_encoder_block_swap=None):
     """Completely destroy the text encoder and free all associated memory."""
     # Phase 1: Clean up block swap if it was enabled
@@ -3188,6 +3238,9 @@ def destroy_text_encoder(text_encoder, text_encoder_block_swap=None):
     gc.collect()
     gc.collect()
     synchronize_and_cleanup()
+
+    # Phase 4: Report memory state after cleanup
+    print_memory_report("After text encoder cleanup")
 
 
 def reconfigure_block_swap(
