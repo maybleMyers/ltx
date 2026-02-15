@@ -3215,16 +3215,50 @@ def print_memory_report(label: str = "Memory Report"):
     print("\n".join(lines), flush=True)
 
 
-def destroy_text_encoder(text_encoder, text_encoder_block_swap=None):
-    """Completely destroy the text encoder and free all associated memory."""
-    # Phase 1: Clean up block swap if it was enabled
-    if text_encoder_block_swap is not None:
-        offload_all_text_encoder_blocks(text_encoder)
+def _cleanup_text_encoder_block_swap(text_encoder):
+    """Tear down block swap resources and break circular refs without moving layers to CPU."""
+    gemma_text_model = text_encoder.model.language_model
+    offloader = getattr(gemma_text_model, "_block_swap_offloader", None)
+    if offloader is None:
+        return
 
-    # Phase 2: Break internal references to help GC
-    # Nullify large sub-models to break any remaining reference chains
+    for idx in range(len(gemma_text_model.layers)):
+        if idx in offloader.futures:
+            offloader._wait_blocks_move(idx)
+
+    offloader.thread_pool.shutdown(wait=True)
+    offloader.futures.clear()
+
+    for wid in list(offloader.spare_buffers.keys()):
+        offloader.spare_buffers[wid].clear()
+    offloader.spare_buffers.clear()
+    offloader.streams_to_gpu.clear()
+    offloader.streams_to_cpu.clear()
+    offloader.events_gpu_done.clear()
+    offloader.events_cpu_done.clear()
+
+    for attr in ("_original_forward", "forward", "_block_swap_offloader",
+                 "_blocks_to_swap", "_blocks_ref", "_block_swap_device"):
+        if hasattr(gemma_text_model, attr):
+            try:
+                delattr(gemma_text_model, attr)
+            except AttributeError:
+                pass
+
+    for attr in ("_preprocess_text", "_original_preprocess_text",
+                 "_enhance", "_original_enhance"):
+        if hasattr(text_encoder, attr) and attr in text_encoder.__dict__:
+            delattr(text_encoder, attr)
+
+
+def destroy_text_encoder(text_encoder, text_encoder_block_swap=None):
+    """Destroy the text encoder and free all associated memory."""
+    print_memory_report("Before text encoder cleanup")
+
+    if text_encoder_block_swap is not None:
+        _cleanup_text_encoder_block_swap(text_encoder)
+
     if hasattr(text_encoder, 'model') and text_encoder.model is not None:
-        text_encoder.model.cpu()
         text_encoder.model = None
     if hasattr(text_encoder, 'tokenizer'):
         text_encoder.tokenizer = None
@@ -3232,15 +3266,10 @@ def destroy_text_encoder(text_encoder, text_encoder_block_swap=None):
         text_encoder.processor = None
     if hasattr(text_encoder, 'feature_extractor_linear'):
         text_encoder.feature_extractor_linear = None
-
-    # Phase 3: Delete and collect
-    del text_encoder
-    gc.collect()
-    gc.collect()
-    synchronize_and_cleanup()
-
-    # Phase 4: Report memory state after cleanup
-    print_memory_report("After text encoder cleanup")
+    if hasattr(text_encoder, 'embeddings_connector'):
+        text_encoder.embeddings_connector = None
+    if hasattr(text_encoder, 'audio_embeddings_connector'):
+        text_encoder.audio_embeddings_connector = None
 
 
 def reconfigure_block_swap(
@@ -3964,11 +3993,14 @@ class LTXVideoGeneratorWithOffloading:
             v_context_p, a_context_p = context_p
             v_context_n, a_context_n = None, None
 
-        # Destroy text encoder to free all RAM
         print(">>> Releasing text encoder from memory...")
         destroy_text_encoder(text_encoder, text_encoder_block_swap)
         text_encoder_block_swap = None
-        print(">>> Text encoder destroyed")
+        del text_encoder
+        gc.collect()
+        gc.collect()
+        synchronize_and_cleanup()
+        print_memory_report("After text encoder cleanup")
 
         # Move text embeddings to CPU - they'll be moved back to GPU when needed for denoising
         # This frees GPU memory during model loading phases
@@ -6916,10 +6948,13 @@ def generate_av_extension(
         v_context_p, a_context_p = context_p
         v_context_n, a_context_n = None, None
 
-    # 7B: Delete text encoder BEFORE loading transformer
     destroy_text_encoder(text_encoder, text_encoder_block_swap)
     text_encoder_block_swap = None
-    cleanup_memory()
+    del text_encoder
+    gc.collect()
+    gc.collect()
+    synchronize_and_cleanup()
+    print_memory_report("After text encoder cleanup")
 
     # 7C: Reload latents to GPU (after text encoder is gone)
     print(">>> Reloading latents to GPU for denoising...")
@@ -8356,7 +8391,11 @@ def generate_v2v_join(
         v_context_n, a_context_n = None, None
 
     destroy_text_encoder(text_encoder)
-    cleanup_memory()
+    del text_encoder
+    gc.collect()
+    gc.collect()
+    synchronize_and_cleanup()
+    print_memory_report("After text encoder cleanup")
 
     # Reload latents to GPU
     video_latent = video_latent.to(device=device, dtype=dtype)
