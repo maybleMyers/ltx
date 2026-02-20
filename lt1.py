@@ -1570,6 +1570,18 @@ def generate_ltx_video(
     user_lora_4: str,
     user_lora_strength_4: float,
     user_lora_stage_4: str,
+    user_lora_5: str,
+    user_lora_strength_5: float,
+    user_lora_stage_5: str,
+    user_lora_6: str,
+    user_lora_strength_6: float,
+    user_lora_stage_6: str,
+    user_lora_7: str,
+    user_lora_strength_7: float,
+    user_lora_stage_7: str,
+    user_lora_8: str,
+    user_lora_strength_8: float,
+    user_lora_stage_8: str,
     # Output
     save_path: str,
     batch_size: int,
@@ -1872,6 +1884,10 @@ def generate_ltx_video(
             (user_lora_2, user_lora_strength_2, user_lora_stage_2),
             (user_lora_3, user_lora_strength_3, user_lora_stage_3),
             (user_lora_4, user_lora_strength_4, user_lora_stage_4),
+            (user_lora_5, user_lora_strength_5, user_lora_stage_5),
+            (user_lora_6, user_lora_strength_6, user_lora_stage_6),
+            (user_lora_7, user_lora_strength_7, user_lora_stage_7),
+            (user_lora_8, user_lora_strength_8, user_lora_stage_8),
         ]
         for user_lora, user_lora_strength, user_lora_stage in lora_configs:
             if user_lora and user_lora != "None" and lora_folder:
@@ -2117,6 +2133,18 @@ def generate_extension_video(
     ext_user_lora_4: str,
     ext_user_lora_strength_4: float,
     ext_user_lora_stage_4: str,
+    ext_user_lora_5: str,
+    ext_user_lora_strength_5: float,
+    ext_user_lora_stage_5: str,
+    ext_user_lora_6: str,
+    ext_user_lora_strength_6: float,
+    ext_user_lora_stage_6: str,
+    ext_user_lora_7: str,
+    ext_user_lora_strength_7: float,
+    ext_user_lora_stage_7: str,
+    ext_user_lora_8: str,
+    ext_user_lora_strength_8: float,
+    ext_user_lora_stage_8: str,
     # Output
     ext_save_path: str,
     # Batching
@@ -2228,6 +2256,10 @@ def generate_extension_video(
             (ext_user_lora_2, ext_user_lora_strength_2, ext_user_lora_stage_2),
             (ext_user_lora_3, ext_user_lora_strength_3, ext_user_lora_stage_3),
             (ext_user_lora_4, ext_user_lora_strength_4, ext_user_lora_stage_4),
+            (ext_user_lora_5, ext_user_lora_strength_5, ext_user_lora_stage_5),
+            (ext_user_lora_6, ext_user_lora_strength_6, ext_user_lora_stage_6),
+            (ext_user_lora_7, ext_user_lora_strength_7, ext_user_lora_stage_7),
+            (ext_user_lora_8, ext_user_lora_strength_8, ext_user_lora_stage_8),
         ]
         for user_lora, user_lora_strength, user_lora_stage in lora_configs:
             if user_lora and user_lora != "None" and ext_lora_folder:
@@ -3268,7 +3300,7 @@ def create_interface():
                                 preview=True,
                                 show_label=True
                             )
-                        # User LoRAs (up to 4)
+                        # User LoRAs (up to 8)
                         with gr.Accordion("User LoRAs (Optional)", open=True):
                             lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
                             lora_refresh_btn = gr.Button("🔄 Refresh", size="sm")
@@ -3339,6 +3371,78 @@ def create_interface():
                                     label="Strength", scale=1
                                 )
                                 user_lora_stage_4 = gr.Dropdown(
+                                    label="Stage",
+                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Stage 3 (Refine)", "All"],
+                                    value="Stage 2 (Refine)",
+                                    scale=1
+                                )
+                            # LoRA 5
+                            with gr.Row():
+                                user_lora_5 = gr.Dropdown(
+                                    label="LoRA 5",
+                                    choices=get_ltx_lora_options("lora"),
+                                    value="None",
+                                    scale=3
+                                )
+                                user_lora_strength_5 = gr.Slider(
+                                    minimum=0.0, maximum=2.0, value=1.0, step=0.1,
+                                    label="Strength", scale=1
+                                )
+                                user_lora_stage_5 = gr.Dropdown(
+                                    label="Stage",
+                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Stage 3 (Refine)", "All"],
+                                    value="Stage 2 (Refine)",
+                                    scale=1
+                                )
+                            # LoRA 6
+                            with gr.Row():
+                                user_lora_6 = gr.Dropdown(
+                                    label="LoRA 6",
+                                    choices=get_ltx_lora_options("lora"),
+                                    value="None",
+                                    scale=3
+                                )
+                                user_lora_strength_6 = gr.Slider(
+                                    minimum=0.0, maximum=2.0, value=1.0, step=0.1,
+                                    label="Strength", scale=1
+                                )
+                                user_lora_stage_6 = gr.Dropdown(
+                                    label="Stage",
+                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Stage 3 (Refine)", "All"],
+                                    value="Stage 2 (Refine)",
+                                    scale=1
+                                )
+                            # LoRA 7
+                            with gr.Row():
+                                user_lora_7 = gr.Dropdown(
+                                    label="LoRA 7",
+                                    choices=get_ltx_lora_options("lora"),
+                                    value="None",
+                                    scale=3
+                                )
+                                user_lora_strength_7 = gr.Slider(
+                                    minimum=0.0, maximum=2.0, value=1.0, step=0.1,
+                                    label="Strength", scale=1
+                                )
+                                user_lora_stage_7 = gr.Dropdown(
+                                    label="Stage",
+                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Stage 3 (Refine)", "All"],
+                                    value="Stage 2 (Refine)",
+                                    scale=1
+                                )
+                            # LoRA 8
+                            with gr.Row():
+                                user_lora_8 = gr.Dropdown(
+                                    label="LoRA 8",
+                                    choices=get_ltx_lora_options("lora"),
+                                    value="None",
+                                    scale=3
+                                )
+                                user_lora_strength_8 = gr.Slider(
+                                    minimum=0.0, maximum=2.0, value=1.0, step=0.1,
+                                    label="Strength", scale=1
+                                )
+                                user_lora_stage_8 = gr.Dropdown(
                                     label="Stage",
                                     choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Stage 3 (Refine)", "All"],
                                     value="Stage 2 (Refine)",
@@ -4225,6 +4329,78 @@ def create_interface():
                                     value="Stage 2 (Refine)",
                                     scale=1
                                 )
+                            # LoRA 5
+                            with gr.Row():
+                                ext_user_lora_5 = gr.Dropdown(
+                                    label="LoRA 5",
+                                    choices=get_ltx_lora_options("lora"),
+                                    value="None",
+                                    scale=3
+                                )
+                                ext_user_lora_strength_5 = gr.Slider(
+                                    minimum=0.0, maximum=2.0, value=1.0, step=0.1,
+                                    label="Strength", scale=1
+                                )
+                                ext_user_lora_stage_5 = gr.Dropdown(
+                                    label="Stage",
+                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Stage 3 (Refine)", "All"],
+                                    value="Stage 2 (Refine)",
+                                    scale=1
+                                )
+                            # LoRA 6
+                            with gr.Row():
+                                ext_user_lora_6 = gr.Dropdown(
+                                    label="LoRA 6",
+                                    choices=get_ltx_lora_options("lora"),
+                                    value="None",
+                                    scale=3
+                                )
+                                ext_user_lora_strength_6 = gr.Slider(
+                                    minimum=0.0, maximum=2.0, value=1.0, step=0.1,
+                                    label="Strength", scale=1
+                                )
+                                ext_user_lora_stage_6 = gr.Dropdown(
+                                    label="Stage",
+                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Stage 3 (Refine)", "All"],
+                                    value="Stage 2 (Refine)",
+                                    scale=1
+                                )
+                            # LoRA 7
+                            with gr.Row():
+                                ext_user_lora_7 = gr.Dropdown(
+                                    label="LoRA 7",
+                                    choices=get_ltx_lora_options("lora"),
+                                    value="None",
+                                    scale=3
+                                )
+                                ext_user_lora_strength_7 = gr.Slider(
+                                    minimum=0.0, maximum=2.0, value=1.0, step=0.1,
+                                    label="Strength", scale=1
+                                )
+                                ext_user_lora_stage_7 = gr.Dropdown(
+                                    label="Stage",
+                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Stage 3 (Refine)", "All"],
+                                    value="Stage 2 (Refine)",
+                                    scale=1
+                                )
+                            # LoRA 8
+                            with gr.Row():
+                                ext_user_lora_8 = gr.Dropdown(
+                                    label="LoRA 8",
+                                    choices=get_ltx_lora_options("lora"),
+                                    value="None",
+                                    scale=3
+                                )
+                                ext_user_lora_strength_8 = gr.Slider(
+                                    minimum=0.0, maximum=2.0, value=1.0, step=0.1,
+                                    label="Strength", scale=1
+                                )
+                                ext_user_lora_stage_8 = gr.Dropdown(
+                                    label="Stage",
+                                    choices=["Stage 1 (Base)", "Stage 2 (Refine)", "Stage 3 (Refine)", "All"],
+                                    value="Stage 2 (Refine)",
+                                    scale=1
+                                )
 
                         # Model settings (copied from main tab)
                         with gr.Accordion("Model Settings", open=True):
@@ -4385,12 +4561,12 @@ def create_interface():
         # LoRA refresh (updates all 4 dropdowns)
         def refresh_all_lora_dropdowns(folder):
             choices = get_ltx_lora_options(folder)
-            return [gr.update(choices=choices) for _ in range(4)]
+            return [gr.update(choices=choices) for _ in range(8)]
 
         lora_refresh_btn.click(
             fn=refresh_all_lora_dropdowns,
             inputs=[lora_folder],
-            outputs=[user_lora_1, user_lora_2, user_lora_3, user_lora_4]
+            outputs=[user_lora_1, user_lora_2, user_lora_3, user_lora_4, user_lora_5, user_lora_6, user_lora_7, user_lora_8]
         )
 
         # Block swap visibility toggles
@@ -4497,6 +4673,10 @@ def create_interface():
                 user_lora_2, user_lora_strength_2, user_lora_stage_2,
                 user_lora_3, user_lora_strength_3, user_lora_stage_3,
                 user_lora_4, user_lora_strength_4, user_lora_stage_4,
+                user_lora_5, user_lora_strength_5, user_lora_stage_5,
+                user_lora_6, user_lora_strength_6, user_lora_stage_6,
+                user_lora_7, user_lora_strength_7, user_lora_stage_7,
+                user_lora_8, user_lora_strength_8, user_lora_stage_8,
                 save_path, batch_size,
                 # Preview Generation
                 enable_preview, preview_interval,
@@ -4916,6 +5096,10 @@ def create_interface():
             user_lora_2, user_lora_strength_2, user_lora_stage_2,
             user_lora_3, user_lora_strength_3, user_lora_stage_3,
             user_lora_4, user_lora_strength_4, user_lora_stage_4,
+            user_lora_5, user_lora_strength_5, user_lora_stage_5,
+            user_lora_6, user_lora_strength_6, user_lora_stage_6,
+            user_lora_7, user_lora_strength_7, user_lora_stage_7,
+            user_lora_8, user_lora_strength_8, user_lora_stage_8,
             # Output
             save_path, batch_size,
             # Scale slider
@@ -4961,6 +5145,10 @@ def create_interface():
             "user_lora_2", "user_lora_strength_2", "user_lora_stage_2",
             "user_lora_3", "user_lora_strength_3", "user_lora_stage_3",
             "user_lora_4", "user_lora_strength_4", "user_lora_stage_4",
+            "user_lora_5", "user_lora_strength_5", "user_lora_stage_5",
+            "user_lora_6", "user_lora_strength_6", "user_lora_stage_6",
+            "user_lora_7", "user_lora_strength_7", "user_lora_stage_7",
+            "user_lora_8", "user_lora_strength_8", "user_lora_stage_8",
             # Output
             "save_path", "batch_size",
             # Scale slider
@@ -5212,6 +5400,10 @@ def create_interface():
             ext_user_lora_2, ext_user_lora_strength_2, ext_user_lora_stage_2,
             ext_user_lora_3, ext_user_lora_strength_3, ext_user_lora_stage_3,
             ext_user_lora_4, ext_user_lora_strength_4, ext_user_lora_stage_4,
+            ext_user_lora_5, ext_user_lora_strength_5, ext_user_lora_stage_5,
+            ext_user_lora_6, ext_user_lora_strength_6, ext_user_lora_stage_6,
+            ext_user_lora_7, ext_user_lora_strength_7, ext_user_lora_stage_7,
+            ext_user_lora_8, ext_user_lora_strength_8, ext_user_lora_stage_8,
             # Output
             ext_save_path,
         ]
@@ -5232,6 +5424,10 @@ def create_interface():
             "ext_user_lora_2", "ext_user_lora_strength_2", "ext_user_lora_stage_2",
             "ext_user_lora_3", "ext_user_lora_strength_3", "ext_user_lora_stage_3",
             "ext_user_lora_4", "ext_user_lora_strength_4", "ext_user_lora_stage_4",
+            "ext_user_lora_5", "ext_user_lora_strength_5", "ext_user_lora_stage_5",
+            "ext_user_lora_6", "ext_user_lora_strength_6", "ext_user_lora_stage_6",
+            "ext_user_lora_7", "ext_user_lora_strength_7", "ext_user_lora_stage_7",
+            "ext_user_lora_8", "ext_user_lora_strength_8", "ext_user_lora_stage_8",
             "ext_save_path",
         ]
 
@@ -5488,12 +5684,12 @@ def create_interface():
         # LoRA refresh (updates all 4 dropdowns)
         def ext_refresh_all_lora_dropdowns(folder):
             choices = get_ltx_lora_options(folder)
-            return [gr.update(choices=choices) for _ in range(4)]
+            return [gr.update(choices=choices) for _ in range(8)]
 
         ext_lora_refresh_btn.click(
             fn=ext_refresh_all_lora_dropdowns,
             inputs=[ext_lora_folder],
-            outputs=[ext_user_lora_1, ext_user_lora_2, ext_user_lora_3, ext_user_lora_4]
+            outputs=[ext_user_lora_1, ext_user_lora_2, ext_user_lora_3, ext_user_lora_4, ext_user_lora_5, ext_user_lora_6, ext_user_lora_7, ext_user_lora_8]
         )
 
         # Block swap visibility toggles
@@ -5543,6 +5739,10 @@ def create_interface():
                 ext_user_lora_2, ext_user_lora_strength_2, ext_user_lora_stage_2,
                 ext_user_lora_3, ext_user_lora_strength_3, ext_user_lora_stage_3,
                 ext_user_lora_4, ext_user_lora_strength_4, ext_user_lora_stage_4,
+                ext_user_lora_5, ext_user_lora_strength_5, ext_user_lora_stage_5,
+                ext_user_lora_6, ext_user_lora_strength_6, ext_user_lora_stage_6,
+                ext_user_lora_7, ext_user_lora_strength_7, ext_user_lora_stage_7,
+                ext_user_lora_8, ext_user_lora_strength_8, ext_user_lora_stage_8,
                 # Output
                 ext_save_path,
                 # Batching
