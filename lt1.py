@@ -4720,7 +4720,7 @@ def create_interface():
         def send_to_generation_handler(metadata, first_frame):
             """Send loaded metadata to generation tab parameters and switch to Generation tab."""
             if not metadata:
-                return [gr.update()] * 58 + ["No metadata loaded - upload a video first"]
+                return [gr.update()] * 85 + ["No metadata loaded - upload a video first"]
 
             # Handle legacy metadata that used single enable_block_swap
             legacy_block_swap = metadata.get("enable_block_swap", True)
@@ -4751,6 +4751,50 @@ def create_interface():
                 mode = "i2v"
             elif metadata.get("input_video"):
                 mode = "v2v"
+
+            # Reconstruct LoRA slots from metadata
+            # Backend saves: loras=[(path, strength)], stage2_loras=[(path, strength)], stage3_loras=[(path, strength)]
+            # UI expects: dropdown filename, strength slider, stage dropdown per slot
+            lora_slots = []  # list of (filename, strength, stage)
+            lora_map = {}  # filename -> {stages: set(), strength: float}
+            for stage_key, stage_label in [("loras", "Stage 1 (Base)"), ("stage2_loras", "Stage 2 (Refine)"), ("stage3_loras", "Stage 3 (Refine)")]:
+                for path, strength in (metadata.get(stage_key) or []):
+                    fname = os.path.basename(path)
+                    if fname not in lora_map:
+                        lora_map[fname] = {"stages": set(), "strength": strength}
+                    lora_map[fname]["stages"].add(stage_label)
+                    # Use the max strength if same LoRA appears in multiple stages
+                    lora_map[fname]["strength"] = max(lora_map[fname]["strength"], strength)
+
+            for fname, info in lora_map.items():
+                stages = info["stages"]
+                if stages == {"Stage 1 (Base)", "Stage 2 (Refine)", "Stage 3 (Refine)"}:
+                    stage = "All"
+                elif len(stages) == 1:
+                    stage = next(iter(stages))
+                else:
+                    # Multiple but not all stages - add separate entries per stage
+                    for s in sorted(stages):
+                        lora_slots.append((fname, info["strength"], s))
+                    continue
+                lora_slots.append((fname, info["strength"], stage))
+
+            # Pad to 8 slots
+            while len(lora_slots) < 8:
+                lora_slots.append(("None", 1.0, "Stage 2 (Refine)"))
+            lora_slots = lora_slots[:8]
+
+            # Build LoRA dropdown choices from current lora folder
+            lora_choices = get_ltx_lora_options("lora")
+
+            # Build LoRA updates (24 values: 8 × dropdown, strength, stage)
+            lora_updates = []
+            for fname, strength, stage in lora_slots:
+                if fname not in lora_choices:
+                    fname = "None"
+                lora_updates.append(gr.update(choices=lora_choices, value=fname))
+                lora_updates.append(gr.update(value=strength))
+                lora_updates.append(gr.update(value=stage))
 
             # Return updates for all generation parameters
             # NOTE: Model paths (checkpoint_path, gemma_root, spatial_upsampler_path,
@@ -4827,6 +4871,7 @@ def create_interface():
                 gr.update(value=metadata.get("refiner_blocks_in_memory", 22) or 22),  # refiner_blocks_in_memory
                 # Distilled settings (NOT model paths)
                 gr.update(value=metadata.get("distilled_checkpoint", False)),  # distilled_checkpoint
+            ] + lora_updates + [
                 # NOTE: stage2_checkpoint path is NOT restored - keep user's current setting
                 "Parameters sent to Generation tab (model paths unchanged)"  # status
             ]
@@ -4898,6 +4943,15 @@ def create_interface():
                 enable_refiner_block_swap, refiner_blocks_in_memory,
                 # Distilled settings
                 distilled_checkpoint,
+                # User LoRAs (8 × dropdown, strength, stage)
+                user_lora_1, user_lora_strength_1, user_lora_stage_1,
+                user_lora_2, user_lora_strength_2, user_lora_stage_2,
+                user_lora_3, user_lora_strength_3, user_lora_stage_3,
+                user_lora_4, user_lora_strength_4, user_lora_stage_4,
+                user_lora_5, user_lora_strength_5, user_lora_stage_5,
+                user_lora_6, user_lora_strength_6, user_lora_stage_6,
+                user_lora_7, user_lora_strength_7, user_lora_stage_7,
+                user_lora_8, user_lora_strength_8, user_lora_stage_8,
                 info_status
             ]
         )
