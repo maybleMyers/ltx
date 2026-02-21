@@ -72,12 +72,13 @@ class TensorParallelFeedForward(torch.nn.Module):
         dtype = dtype or torch.bfloat16  # Default to bfloat16 for LTX models
 
         # GPU:0 handles first half of inner_dim
-        self.proj_in_0 = torch.nn.Linear(dim, half_inner, device=self.device0, dtype=dtype)
-        self.proj_out_0 = torch.nn.Linear(half_inner, dim_out, device=self.device0, dtype=dtype)
+        # Note: device placement is handled after weight copying in from_feed_forward()
+        self.proj_in_0 = torch.nn.Linear(dim, half_inner, dtype=dtype)
+        self.proj_out_0 = torch.nn.Linear(half_inner, dim_out, dtype=dtype)
 
         # GPU:1 handles second half of inner_dim
-        self.proj_in_1 = torch.nn.Linear(dim, half_inner, device=self.device1, dtype=dtype)
-        self.proj_out_1 = torch.nn.Linear(half_inner, dim_out, device=self.device1, dtype=dtype)
+        self.proj_in_1 = torch.nn.Linear(dim, half_inner, dtype=dtype)
+        self.proj_out_1 = torch.nn.Linear(half_inner, dim_out, dtype=dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x is expected on device0
@@ -158,18 +159,25 @@ class TensorParallelFeedForward(torch.nn.Module):
             # First projection (dim -> inner_dim): split output dim
             # Original weight shape: (inner_dim, dim)
             # Original bias shape: (inner_dim,)
-            tp_ff.proj_in_0.weight.copy_(proj_in.proj.weight[:half_inner].to(device0))
-            tp_ff.proj_in_0.bias.copy_(proj_in.proj.bias[:half_inner].to(device0))
-            tp_ff.proj_in_1.weight.copy_(proj_in.proj.weight[half_inner:].to(device1))
-            tp_ff.proj_in_1.bias.copy_(proj_in.proj.bias[half_inner:].to(device1))
+            tp_ff.proj_in_0.weight.copy_(proj_in.proj.weight[:half_inner])
+            tp_ff.proj_in_0.bias.copy_(proj_in.proj.bias[:half_inner])
+            tp_ff.proj_in_1.weight.copy_(proj_in.proj.weight[half_inner:])
+            tp_ff.proj_in_1.bias.copy_(proj_in.proj.bias[half_inner:])
 
             # Second projection (inner_dim -> dim_out): split input dim
             # Original weight shape: (dim_out, inner_dim)
             # Original bias shape: (dim_out,)
-            tp_ff.proj_out_0.weight.copy_(proj_out.weight[:, :half_inner].to(device0))
-            tp_ff.proj_out_1.weight.copy_(proj_out.weight[:, half_inner:].to(device1))
+            tp_ff.proj_out_0.weight.copy_(proj_out.weight[:, :half_inner])
+            tp_ff.proj_out_1.weight.copy_(proj_out.weight[:, half_inner:])
             # Bias: split equally since we're summing the outputs
-            tp_ff.proj_out_0.bias.copy_((proj_out.bias / 2).to(device0))
-            tp_ff.proj_out_1.bias.copy_((proj_out.bias / 2).to(device1))
+            tp_ff.proj_out_0.bias.copy_(proj_out.bias / 2)
+            tp_ff.proj_out_1.bias.copy_(proj_out.bias / 2)
+
+        # Explicitly move submodules to their target devices
+        # (Linear creation with device= doesn't always work correctly with copy_)
+        tp_ff.proj_in_0 = tp_ff.proj_in_0.to(device0)
+        tp_ff.proj_out_0 = tp_ff.proj_out_0.to(device0)
+        tp_ff.proj_in_1 = tp_ff.proj_in_1.to(device1)
+        tp_ff.proj_out_1 = tp_ff.proj_out_1.to(device1)
 
         return tp_ff
