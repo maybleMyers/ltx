@@ -19,6 +19,7 @@ import argparse
 import gc
 import logging
 import os
+import psutil
 import sys
 import time
 from collections.abc import Callable, Iterator
@@ -1933,12 +1934,15 @@ def encode_depth_conditioning(
             break
         chunk_end = frame_idx + valid_frames
 
-        # Extract chunk and encode
-        chunk = depth_for_encoding[:, :, frame_idx:chunk_end, :, :].to(device=device, dtype=dtype)
-        with torch.no_grad():
-            encoded_chunk = video_encoder(chunk)
+        # Extract chunk and encode using spatial tiling (handles OOM automatically)
+        chunk = depth_for_encoding[:, :, frame_idx:chunk_end, :, :].cpu()
+        encoded_chunk = encode_video_chunked(
+            chunk,
+            video_encoder,
+            device=device,
+            dtype=dtype,
+        )
         del chunk
-        torch.cuda.empty_cache()
 
         # Move to CPU to save memory
         encoded_chunk_cpu = encoded_chunk.cpu()
@@ -2009,36 +2013,7 @@ def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
         description="LTX-2 Video Generation with advanced memory management",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Basic text-to-video generation
-  python ltx_generate_video.py \\
-    --checkpoint-path model.safetensors \\
-    --spatial-upsampler-path upsampler.safetensors \\
-    --distilled-lora distilled.safetensors \\
-    --prompt "A cat playing piano" \\
-    --output-path output.mp4
-
-  # Image-to-video with conditioning
-  python ltx_generate_video.py \\
-    --checkpoint-path model.safetensors \\
-    --spatial-upsampler-path upsampler.safetensors \\
-    --distilled-lora distilled.safetensors \\
-    --prompt "The cat starts playing" \\
-    --image input.jpg 0 0.9 \\
-    --output-path output.mp4
-
-  # Memory-optimized generation with offloading
-  python ltx_generate_video.py \\
-    --checkpoint-path model.safetensors \\
-    --spatial-upsampler-path upsampler.safetensors \\
-    --distilled-lora distilled.safetensors \\
-    --prompt "A beautiful sunset" \\
-    --offload \\
-    --enable-fp8 \\
-    --output-path output.mp4
-        """
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
 
     # ==========================================================================
@@ -3003,6 +2978,175 @@ Examples:
 
 
 # =============================================================================
+# Audio Preprocessing Utilities
+# =============================================================================
+
+def get_audio_sample_rate(video_path: str) -> int | None:
+    """
+    Get the audio sample rate of a video file using ffprobe.
+
+    Args:
+        video_path: Path to the video file
+
+    Returns:
+        Sample rate in Hz, or None if no audio stream found
+    """
+    import subprocess
+    import json
+
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "quiet",
+                "-print_format", "json",
+                "-show_streams",
+                "-select_streams", "a:0",
+                str(video_path)
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+
+        if result.returncode != 0:
+            return None
+
+        data = json.loads(result.stdout)
+        streams = data.get("streams", [])
+
+        if not streams:
+            return None
+
+        return int(streams[0].get("sample_rate", 0)) or None
+
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError) as e:
+        print(f">>> Warning: Could not probe audio sample rate: {e}")
+        return None
+
+
+def convert_video_audio_sample_rate(
+    video_path: str,
+    target_sample_rate: int = 24000,
+) -> str:
+    """
+    Convert video's audio to the target sample rate using ffmpeg.
+
+    Creates a temporary file with the converted audio. The caller is responsible
+    for cleanup if needed.
+
+    Args:
+        video_path: Path to the input video file
+        target_sample_rate: Target audio sample rate (default: 24000 for LTX-2)
+
+    Returns:
+        Path to the converted video file (or original path if conversion not needed)
+    """
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    current_rate = get_audio_sample_rate(video_path)
+
+    if current_rate is None:
+        print(f">>> No audio stream found in {video_path}, skipping audio conversion")
+        return video_path
+
+    if current_rate == target_sample_rate:
+        print(f">>> Audio already at {target_sample_rate}Hz: {video_path}")
+        return video_path
+
+    print(f">>> Converting audio from {current_rate}Hz to {target_sample_rate}Hz: {video_path}")
+
+    # Create temporary file with same extension
+    input_path = Path(video_path)
+    suffix = input_path.suffix or ".mp4"
+
+    # Use a temp file in the same directory to avoid cross-device issues
+    temp_dir = input_path.parent
+    temp_fd, temp_path = tempfile.mkstemp(suffix=suffix, dir=temp_dir, prefix="ltx_audio_converted_")
+    os.close(temp_fd)
+
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",  # Overwrite output
+                "-i", str(video_path),
+                "-map", "0:v",  # Explicitly map video stream
+                "-map", "0:a",  # Explicitly map audio stream
+                "-c:v", "copy",  # Copy video stream without re-encoding
+                "-c:a", "aac",  # Re-encode audio to AAC (compatible with resampling)
+                "-ar", str(target_sample_rate),  # Set output sample rate
+                "-b:a", "192k",  # Audio bitrate
+                str(temp_path)
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300  # 5 minute timeout for long videos
+        )
+
+        if result.returncode != 0:
+            print(f">>> Warning: ffmpeg conversion failed: {result.stderr}")
+            # Clean up temp file on failure
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+            return video_path
+
+        print(f">>> Audio converted successfully: {temp_path}")
+        return temp_path
+
+    except subprocess.TimeoutExpired:
+        print(f">>> Warning: ffmpeg conversion timed out")
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+        return video_path
+    except FileNotFoundError:
+        print(f">>> Warning: ffmpeg not found, cannot convert audio sample rate")
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+        return video_path
+
+
+def preprocess_v2v_join_videos(args) -> list[str]:
+    """
+    Preprocess v2v join videos to ensure audio is at 24000Hz.
+
+    Args:
+        args: Parsed command line arguments
+
+    Returns:
+        List of temporary file paths that should be cleaned up after processing
+    """
+    temp_files = []
+
+    if not (args.v2v_join_video1 and args.v2v_join_video2):
+        return temp_files
+
+    print("=" * 60)
+    print("Preprocessing V2V Join Videos (Audio Sample Rate)")
+    print("=" * 60)
+
+    # Process video1
+    original_video1 = str(args.v2v_join_video1)
+    converted_video1 = convert_video_audio_sample_rate(original_video1, AUDIO_SAMPLE_RATE)
+    if converted_video1 != original_video1:
+        args.v2v_join_video1 = converted_video1
+        temp_files.append(converted_video1)
+
+    # Process video2
+    original_video2 = str(args.v2v_join_video2)
+    converted_video2 = convert_video_audio_sample_rate(original_video2, AUDIO_SAMPLE_RATE)
+    if converted_video2 != original_video2:
+        args.v2v_join_video2 = converted_video2
+        temp_files.append(converted_video2)
+
+    print("=" * 60)
+
+    return temp_files
+
+
+# =============================================================================
 # Memory Management Utilities
 # =============================================================================
 
@@ -3020,6 +3164,112 @@ def synchronize_and_cleanup():
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+def print_memory_report(label: str = "Memory Report"):
+    """Print detailed VRAM and RAM usage breakdown."""
+    proc = psutil.Process()
+    vm = psutil.virtual_memory()
+
+    rss_gb = proc.memory_info().rss / 1024**3
+    ram_total_gb = vm.total / 1024**3
+    ram_used_gb = vm.used / 1024**3
+    ram_avail_gb = vm.available / 1024**3
+
+    lines = [f">>> [{label}]"]
+    lines.append(f"    RAM  - process RSS: {rss_gb:.2f} GB | "
+                 f"system: {ram_used_gb:.2f}/{ram_total_gb:.2f} GB used, "
+                 f"{ram_avail_gb:.2f} GB available")
+
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        free = total - reserved
+        lines.append(f"    VRAM - allocated: {allocated:.2f} GB | "
+                     f"reserved: {reserved:.2f} GB | "
+                     f"free: {free:.2f}/{total:.2f} GB")
+
+        # Per-object breakdown of GPU tensors by module origin
+        tensor_sizes = {}
+        for obj in gc.get_objects():
+            try:
+                if torch.is_tensor(obj) and obj.is_cuda:
+                    size_mb = obj.nelement() * obj.element_size() / 1024**2
+                    # Bucket by shape signature for readability
+                    key = f"{tuple(obj.shape)}:{obj.dtype}"
+                    tensor_sizes[key] = tensor_sizes.get(key, 0) + size_mb
+            except Exception:
+                pass
+
+        if tensor_sizes:
+            # Show top 10 largest tensor groups
+            sorted_tensors = sorted(tensor_sizes.items(), key=lambda x: -x[1])[:10]
+            lines.append("    VRAM tensors (top 10):")
+            for key, size_mb in sorted_tensors:
+                if size_mb >= 1.0:
+                    lines.append(f"      {size_mb:>8.1f} MB  {key}")
+        else:
+            lines.append("    VRAM tensors: none")
+
+    print("\n".join(lines), flush=True)
+
+
+def _cleanup_text_encoder_block_swap(text_encoder):
+    """Tear down block swap resources and break circular refs without moving layers to CPU."""
+    gemma_text_model = text_encoder.model.language_model
+    offloader = getattr(gemma_text_model, "_block_swap_offloader", None)
+    if offloader is None:
+        return
+
+    for idx in range(len(gemma_text_model.layers)):
+        if idx in offloader.futures:
+            offloader._wait_blocks_move(idx)
+
+    offloader.thread_pool.shutdown(wait=True)
+    offloader.futures.clear()
+
+    for wid in list(offloader.spare_buffers.keys()):
+        offloader.spare_buffers[wid].clear()
+    offloader.spare_buffers.clear()
+    offloader.streams_to_gpu.clear()
+    offloader.streams_to_cpu.clear()
+    offloader.events_gpu_done.clear()
+    offloader.events_cpu_done.clear()
+
+    for attr in ("_original_forward", "forward", "_block_swap_offloader",
+                 "_blocks_to_swap", "_blocks_ref", "_block_swap_device"):
+        if hasattr(gemma_text_model, attr):
+            try:
+                delattr(gemma_text_model, attr)
+            except AttributeError:
+                pass
+
+    for attr in ("_preprocess_text", "_original_preprocess_text",
+                 "_enhance", "_original_enhance"):
+        if hasattr(text_encoder, attr) and attr in text_encoder.__dict__:
+            delattr(text_encoder, attr)
+
+
+def destroy_text_encoder(text_encoder, text_encoder_block_swap=None):
+    """Destroy the text encoder and free all associated memory."""
+    print_memory_report("Before text encoder cleanup")
+
+    if text_encoder_block_swap is not None:
+        _cleanup_text_encoder_block_swap(text_encoder)
+
+    if hasattr(text_encoder, 'model') and text_encoder.model is not None:
+        text_encoder.model = None
+    if hasattr(text_encoder, 'tokenizer'):
+        text_encoder.tokenizer = None
+    if hasattr(text_encoder, 'processor'):
+        text_encoder.processor = None
+    if hasattr(text_encoder, 'feature_extractor_linear'):
+        text_encoder.feature_extractor_linear = None
+    if hasattr(text_encoder, 'embeddings_connector'):
+        text_encoder.embeddings_connector = None
+    if hasattr(text_encoder, 'audio_embeddings_connector'):
+        text_encoder.audio_embeddings_connector = None
 
 
 def reconfigure_block_swap(
@@ -3287,6 +3537,31 @@ def apply_loras_chunked_gpu(
     gc.collect()
 
     print(">>> LoRA application complete")
+
+
+def loras_are_equal(
+    loras1: tuple | list | None,
+    loras2: tuple | list | None,
+) -> bool:
+    """
+    Compare two LoRA configurations for equality.
+
+    Returns True if both have the same LoRAs (path and strength).
+    """
+    if loras1 is None:
+        loras1 = ()
+    if loras2 is None:
+        loras2 = ()
+
+    if len(loras1) != len(loras2):
+        return False
+
+    for l1, l2 in zip(loras1, loras2):
+        # Compare path and strength
+        if l1.path != l2.path or l1.strength != l2.strength:
+            return False
+
+    return True
 
 
 # =============================================================================
@@ -3718,15 +3993,14 @@ class LTXVideoGeneratorWithOffloading:
             v_context_p, a_context_p = context_p
             v_context_n, a_context_n = None, None
 
-        # Offload text encoder
-        print(">>> Releasing text encoder from GPU...")
-        if text_encoder_block_swap:
-            offload_all_text_encoder_blocks(text_encoder)
-            text_encoder_block_swap = None
-        else:
-            text_encoder.to("cpu")
+        print(">>> Releasing text encoder from memory...")
+        destroy_text_encoder(text_encoder, text_encoder_block_swap)
+        text_encoder_block_swap = None
         del text_encoder
+        gc.collect()
+        gc.collect()
         synchronize_and_cleanup()
+        print_memory_report("After text encoder cleanup")
 
         # Move text embeddings to CPU - they'll be moved back to GPU when needed for denoising
         # This frees GPU memory during model loading phases
@@ -3743,6 +4017,9 @@ class LTXVideoGeneratorWithOffloading:
         # Initialize audio_latent for use in stage 2
         # Will be set by refine-only mode if encoding audio from input video
         audio_latent = None
+
+        # Initialize transformer reuse variable (set during stage 1 if reusable)
+        stage_1_transformer_for_reuse = None
 
         # =====================================================================
         # Refine-only mode: Skip stage 1 and use input video directly
@@ -3789,8 +4066,8 @@ class LTXVideoGeneratorWithOffloading:
             # Only extract if v2v_audio_mode is "preserve" - for other modes, audio will be
             # regenerated or handled differently
             audio_latent = None
-            if not disable_audio and v2v_audio_mode == "preserve":
-                print(">>> Encoding audio from input video (v2v_audio_mode=preserve)...")
+            if not disable_audio and v2v_audio_mode in ("preserve", "condition"):
+                print(f">>> Encoding audio from input video (v2v_audio_mode={v2v_audio_mode})...")
 
                 # Extract audio waveform from input video
                 waveform, sample_rate = decode_audio_from_file(input_video, self.device)
@@ -3826,7 +4103,15 @@ class LTXVideoGeneratorWithOffloading:
                     audio_latent = audio_encoder(mel_spectrogram.to(dtype=torch.float32))
                     # Convert to bfloat16 for consistency with pipeline
                     audio_latent = audio_latent.to(dtype=dtype)
-
+                    # If conditioning, add to audio_conditionings list
+                    if v2v_audio_mode == "condition":
+                        from ltx_core.conditioning import AudioConditionByLatent
+                        audio_conditionings.append(
+                            AudioConditionByLatent(
+                                latent=audio_latent,
+                                strength=v2v_audio_strength,
+                            )
+                        )
                     # Clean up audio encoder
                     del audio_encoder, audio_processor
                     cleanup_memory()
@@ -3852,6 +4137,7 @@ class LTXVideoGeneratorWithOffloading:
 
         # Initialize V2V initial latent (will be set if input_video is provided for non-refine-only)
         v2v_initial_latent = None
+        v2v_audio_latent = None
 
         if not skip_stage_1:
             print(">>> Stage 1: Loading video encoder and transformer...")
@@ -4568,25 +4854,56 @@ class LTXVideoGeneratorWithOffloading:
 
             print(f">>> {stage_label} completed in {time.time() - stage1_start:.1f}s", flush=True)
 
-            # Cleanup stage 1 transformer
-            if block_swap_manager:
-                offload_all_blocks(transformer)
-                # Clear offloader references from transformer to break reference cycle
-                if hasattr(transformer, 'velocity_model'):
-                    if hasattr(transformer.velocity_model, '_block_swap_offloader'):
-                        transformer.velocity_model._block_swap_offloader = None
-                    if hasattr(transformer.velocity_model, '_blocks_ref'):
-                        transformer.velocity_model._blocks_ref = None
-                if hasattr(transformer, '_block_swap_offloader'):
-                    transformer._block_swap_offloader = None
-                if hasattr(transformer, '_blocks_ref'):
-                    transformer._blocks_ref = None
-                block_swap_manager = None
-            if self.offload:
-                print(">>> Offloading stage 1 transformer to CPU...")
-            # Set to None instead of del to avoid GC issues
-            transformer = None
-            cleanup_memory()
+            # Check if we can reuse transformer for stage 2
+            # Conditions: same checkpoint AND same LoRAs
+            stage_1_loras = self.stage_1_model_ledger.loras if hasattr(self.stage_1_model_ledger, 'loras') else ()
+            stage_2_all_loras = (*self._stage_2_loras, *self._stage_2_distilled_lora) if self._stage_2_distilled_lora else tuple(self._stage_2_loras)
+            same_checkpoint = (self.stage2_checkpoint is None) or (self._stage_2_checkpoint_path == self.stage_1_model_ledger.checkpoint_path)
+            same_loras = loras_are_equal(stage_1_loras, stage_2_all_loras)
+            can_reuse_transformer = same_checkpoint and same_loras
+
+            if can_reuse_transformer:
+                print(">>> Stage 1 transformer can be reused for stage 2 (same checkpoint and LoRAs)")
+                # Offload blocks but keep transformer for reuse
+                if block_swap_manager:
+                    offload_all_blocks(transformer)
+                    # Clear offloader references
+                    if hasattr(transformer, 'velocity_model'):
+                        if hasattr(transformer.velocity_model, '_block_swap_offloader'):
+                            transformer.velocity_model._block_swap_offloader = None
+                        if hasattr(transformer.velocity_model, '_blocks_ref'):
+                            transformer.velocity_model._blocks_ref = None
+                    if hasattr(transformer, '_block_swap_offloader'):
+                        transformer._block_swap_offloader = None
+                    if hasattr(transformer, '_blocks_ref'):
+                        transformer._blocks_ref = None
+                    block_swap_manager = None
+                # Keep transformer reference for stage 2
+                stage_1_transformer_for_reuse = transformer
+                transformer = None  # Clear local ref but keep stage_1_transformer_for_reuse
+            else:
+                if same_checkpoint:
+                    print(">>> Different LoRAs - will reload transformer for stage 2")
+                else:
+                    print(">>> Different checkpoint - will reload transformer for stage 2")
+                # Cleanup stage 1 transformer completely
+                if block_swap_manager:
+                    offload_all_blocks(transformer)
+                    if hasattr(transformer, 'velocity_model'):
+                        if hasattr(transformer.velocity_model, '_block_swap_offloader'):
+                            transformer.velocity_model._block_swap_offloader = None
+                        if hasattr(transformer.velocity_model, '_blocks_ref'):
+                            transformer.velocity_model._blocks_ref = None
+                    if hasattr(transformer, '_block_swap_offloader'):
+                        transformer._block_swap_offloader = None
+                    if hasattr(transformer, '_blocks_ref'):
+                        transformer._blocks_ref = None
+                    block_swap_manager = None
+                if self.offload:
+                    print(">>> Offloading stage 1 transformer to CPU...")
+                transformer = None
+                stage_1_transformer_for_reuse = None
+                cleanup_memory()
 
             # Move text embeddings to CPU to free GPU memory during upsampling and stage 2 model loading
             v_context_p = v_context_p.cpu()
@@ -4686,161 +5003,239 @@ class LTXVideoGeneratorWithOffloading:
         # =====================================================================
         # Phase 4: Stage 2 - High Resolution Refinement (two-stage only)
         # =====================================================================
-        print(">>> Stage 2: Loading transformer with distilled LoRA...", flush=True)
         stage2_start = time.time()
 
-        # Force complete cleanup before loading stage 2 transformer
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-
-        # For block swapping with LoRAs, we need to:
-        # 1. Load transformer WITHOUT LoRAs to CPU (fast)
-        # 2. Load LoRA state dicts
-        # 3. Apply LoRAs using chunked GPU computation (fast, low memory)
-        # This avoids the slow CPU-only LoRA application that appears to hang.
+        # Check if we can reuse the stage 1 transformer (same checkpoint + same LoRAs)
         block_swap_manager = None
-        if self.enable_refiner_block_swap:
-            # Check if stage 2 uses the same checkpoint as stage 1 to reuse registry
-            # This prevents loading the same weights twice into RAM
-            use_shared_registry = (
-                self._stage_2_checkpoint_path == self.stage_1_model_ledger.checkpoint_path
-            )
+        if stage_1_transformer_for_reuse is not None:
+            print(">>> Stage 2: Reusing transformer from stage 1 (same checkpoint and LoRAs)")
+            transformer = stage_1_transformer_for_reuse
+            stage_1_transformer_for_reuse = None  # Clear reference
 
-            # Create ledger WITHOUT LoRAs - loading will be fast
-            # Reuse registry from stage 1 if using same checkpoint to avoid duplicate loading
-            stage_2_ledger_no_lora = ModelLedger(
-                dtype=self.dtype,
-                device=torch.device("cpu"),
-                checkpoint_path=self._stage_2_checkpoint_path,
-                gemma_root_path=self._stage_2_gemma_root,
-                spatial_upsampler_path=self._stage_2_spatial_upsampler_path,
-                vae_path=self._stage_2_vae_path,
-                loras=(),  # No LoRAs - load base model only
-                fp8transformer=self._stage_2_fp8transformer,
-                registry=self.stage_1_model_ledger.registry if use_shared_registry else None,
-            )
-
-            # Load transformer without LoRAs (fast - just loading weights)
-            print(">>> Loading stage 2 transformer to CPU...", flush=True)
-            transformer = stage_2_ledger_no_lora.transformer()
-
-            # Now apply LoRAs using chunked GPU computation
-            all_loras = (*self._stage_2_loras, *self._stage_2_distilled_lora) if self._stage_2_distilled_lora else self._stage_2_loras
-            if all_loras:
-                print(f">>> Loading {len(all_loras)} LoRA(s)...", flush=True)
-                from ltx_core.loader.sft_loader import SafetensorsStateDictLoader
-                lora_loader = SafetensorsStateDictLoader()
-                lora_state_dicts = []
-                lora_strengths = []
-                for lora in all_loras:
-                    lora_sd = lora_loader.load(lora.path, sd_ops=lora.sd_ops, device=torch.device("cpu"))
-                    lora_state_dicts.append(lora_sd)
-                    lora_strengths.append(lora.strength)
-
-                # Apply LoRAs using chunked GPU computation
-                apply_loras_chunked_gpu(
-                    model=transformer,
-                    lora_state_dicts=lora_state_dicts,
-                    lora_strengths=lora_strengths,
-                    gpu_device=self.device,
-                    dtype=self.dtype,
+            # Reconfigure for stage 2 block swapping if needed
+            if self.enable_refiner_block_swap:
+                print(f">>> Enabling refiner block swapping ({self.refiner_blocks_in_memory} blocks in GPU)...")
+                # Move non-block components to GPU (may already be there from stage 1)
+                transformer.velocity_model.patchify_proj.to(self.device)
+                transformer.velocity_model.adaln_single.to(self.device)
+                transformer.velocity_model.caption_projection.to(self.device)
+                transformer.velocity_model.norm_out.to(self.device)
+                transformer.velocity_model.proj_out.to(self.device)
+                transformer.velocity_model.scale_shift_table = torch.nn.Parameter(
+                    transformer.velocity_model.scale_shift_table.to(self.device)
                 )
+                if hasattr(transformer.velocity_model, "audio_patchify_proj"):
+                    transformer.velocity_model.audio_patchify_proj.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_adaln_single"):
+                    transformer.velocity_model.audio_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_caption_projection"):
+                    transformer.velocity_model.audio_caption_projection.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_norm_out"):
+                    transformer.velocity_model.audio_norm_out.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_proj_out"):
+                    transformer.velocity_model.audio_proj_out.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_scale_shift_table"):
+                    transformer.velocity_model.audio_scale_shift_table = torch.nn.Parameter(
+                        transformer.velocity_model.audio_scale_shift_table.to(self.device)
+                    )
+                if hasattr(transformer.velocity_model, "av_ca_video_scale_shift_adaln_single"):
+                    transformer.velocity_model.av_ca_video_scale_shift_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "av_ca_audio_scale_shift_adaln_single"):
+                    transformer.velocity_model.av_ca_audio_scale_shift_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "av_ca_a2v_gate_adaln_single"):
+                    transformer.velocity_model.av_ca_a2v_gate_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "av_ca_v2a_gate_adaln_single"):
+                    transformer.velocity_model.av_ca_v2a_gate_adaln_single.to(self.device)
 
-                # Clean up LoRA state dicts
-                del lora_state_dicts
-                synchronize_and_cleanup()
+                # Enable block swap for stage 2
+                current_blocks = self.refiner_blocks_in_memory
+                min_blocks = 1
+                while current_blocks >= min_blocks:
+                    try:
+                        if self.enable_activation_offload:
+                            block_swap_manager = enable_block_swap_with_activation_offload(
+                                transformer,
+                                blocks_in_memory=current_blocks,
+                                device=self.device,
+                                verbose=True,
+                                temporal_chunk_size=self.temporal_chunk_size,
+                            )
+                        else:
+                            block_swap_manager = enable_block_swap(
+                                transformer,
+                                blocks_in_memory=current_blocks,
+                                device=self.device,
+                            )
+                        self.refiner_blocks_in_memory = current_blocks
+                        break
+                    except torch.OutOfMemoryError:
+                        current_blocks -= 1
+                        if current_blocks < min_blocks:
+                            print(f">>> OOM Error during block swap setup: Already at minimum blocks ({min_blocks})")
+                            raise
+                        print(f">>> OOM during enable_block_swap! Retrying with {current_blocks} blocks...")
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                            torch.cuda.empty_cache()
+                        gc.collect()
 
-            # For VAE operations later
-            stage_2_ledger = stage_2_ledger_no_lora
+            # Use stage 1 ledger for VAE operations
+            stage_2_ledger = self.stage_1_model_ledger
 
-            # Move non-block components to GPU
-            print(f">>> Enabling refiner block swapping ({self.refiner_blocks_in_memory} blocks in GPU)...")
-            transformer.velocity_model.patchify_proj.to(self.device)
-            transformer.velocity_model.adaln_single.to(self.device)
-            transformer.velocity_model.caption_projection.to(self.device)
-            transformer.velocity_model.norm_out.to(self.device)
-            transformer.velocity_model.proj_out.to(self.device)
-            transformer.velocity_model.scale_shift_table = torch.nn.Parameter(
-                transformer.velocity_model.scale_shift_table.to(self.device)
-            )
-            if hasattr(transformer.velocity_model, "audio_patchify_proj"):
-                transformer.velocity_model.audio_patchify_proj.to(self.device)
-            if hasattr(transformer.velocity_model, "audio_adaln_single"):
-                transformer.velocity_model.audio_adaln_single.to(self.device)
-            if hasattr(transformer.velocity_model, "audio_caption_projection"):
-                transformer.velocity_model.audio_caption_projection.to(self.device)
-            if hasattr(transformer.velocity_model, "audio_norm_out"):
-                transformer.velocity_model.audio_norm_out.to(self.device)
-            if hasattr(transformer.velocity_model, "audio_proj_out"):
-                transformer.velocity_model.audio_proj_out.to(self.device)
-            if hasattr(transformer.velocity_model, "audio_scale_shift_table"):
-                transformer.velocity_model.audio_scale_shift_table = torch.nn.Parameter(
-                    transformer.velocity_model.audio_scale_shift_table.to(self.device)
-                )
-            # Cross-attention adaln components
-            if hasattr(transformer.velocity_model, "av_ca_video_scale_shift_adaln_single"):
-                transformer.velocity_model.av_ca_video_scale_shift_adaln_single.to(self.device)
-            if hasattr(transformer.velocity_model, "av_ca_audio_scale_shift_adaln_single"):
-                transformer.velocity_model.av_ca_audio_scale_shift_adaln_single.to(self.device)
-            if hasattr(transformer.velocity_model, "av_ca_a2v_gate_adaln_single"):
-                transformer.velocity_model.av_ca_a2v_gate_adaln_single.to(self.device)
-            if hasattr(transformer.velocity_model, "av_ca_v2a_gate_adaln_single"):
-                transformer.velocity_model.av_ca_v2a_gate_adaln_single.to(self.device)
-
-            # Try to enable block swap with OOM retry (reduce blocks if needed)
-            current_blocks = self.refiner_blocks_in_memory
-            min_blocks = 1
-            while current_blocks >= min_blocks:
-                try:
-                    # Use activation offload for extreme memory savings (moves activations to CPU between blocks)
-                    if self.enable_activation_offload:
-                        block_swap_manager = enable_block_swap_with_activation_offload(
-                            transformer,
-                            blocks_in_memory=current_blocks,
-                            device=self.device,
-                            verbose=True,
-                            temporal_chunk_size=self.temporal_chunk_size,
-                        )
-                    else:
-                        block_swap_manager = enable_block_swap(
-                            transformer,
-                            blocks_in_memory=current_blocks,
-                            device=self.device,
-                        )
-                    # Update instance variable for later retry logic
-                    self.refiner_blocks_in_memory = current_blocks
-                    break
-                except torch.OutOfMemoryError:
-                    current_blocks -= 1
-                    if current_blocks < min_blocks:
-                        print(f">>> OOM Error during block swap setup: Already at minimum blocks ({min_blocks})")
-                        raise
-                    print(f">>> OOM during enable_block_swap! Retrying with {current_blocks} blocks...")
-                    if torch.cuda.is_available():
-                        torch.cuda.synchronize()
-                        torch.cuda.empty_cache()
-                    gc.collect()
         else:
-            # Non-block-swap case: load with LoRAs directly to GPU (fast)
-            # Reuse registry from stage 1 if using same checkpoint to avoid duplicate loading
-            use_shared_registry = (
-                self._stage_2_checkpoint_path == self.stage_1_model_ledger.checkpoint_path
-            )
+            print(">>> Stage 2: Loading transformer with distilled LoRA...", flush=True)
 
-            stage_2_ledger = ModelLedger(
-                dtype=self.dtype,
-                device=self.device,
-                checkpoint_path=self._stage_2_checkpoint_path,
-                gemma_root_path=self._stage_2_gemma_root,
-                spatial_upsampler_path=self._stage_2_spatial_upsampler_path,
-                vae_path=self._stage_2_vae_path,
-                loras=(*self._stage_2_loras, *self._stage_2_distilled_lora) if self._stage_2_distilled_lora else self._stage_2_loras,
-                fp8transformer=self._stage_2_fp8transformer,
-                registry=self.stage_1_model_ledger.registry if use_shared_registry else None,
-            )
-            transformer = stage_2_ledger.transformer()
+            # Force complete cleanup before loading stage 2 transformer
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+
+            # For block swapping with LoRAs, we need to:
+            # 1. Load transformer WITHOUT LoRAs to CPU (fast)
+            # 2. Load LoRA state dicts
+            # 3. Apply LoRAs using chunked GPU computation (fast, low memory)
+            # This avoids the slow CPU-only LoRA application that appears to hang.
+            if self.enable_refiner_block_swap:
+                # Check if stage 2 uses the same checkpoint as stage 1 to reuse registry
+                # This prevents loading the same weights twice into RAM
+                use_shared_registry = (
+                    self._stage_2_checkpoint_path == self.stage_1_model_ledger.checkpoint_path
+                )
+
+                # Create ledger WITHOUT LoRAs - loading will be fast
+                # Reuse registry from stage 1 if using same checkpoint to avoid duplicate loading
+                stage_2_ledger_no_lora = ModelLedger(
+                    dtype=self.dtype,
+                    device=torch.device("cpu"),
+                    checkpoint_path=self._stage_2_checkpoint_path,
+                    gemma_root_path=self._stage_2_gemma_root,
+                    spatial_upsampler_path=self._stage_2_spatial_upsampler_path,
+                    vae_path=self._stage_2_vae_path,
+                    loras=(),  # No LoRAs - load base model only
+                    fp8transformer=self._stage_2_fp8transformer,
+                    registry=self.stage_1_model_ledger.registry if use_shared_registry else None,
+                )
+
+                # Load transformer without LoRAs (fast - just loading weights)
+                print(">>> Loading stage 2 transformer to CPU...", flush=True)
+                transformer = stage_2_ledger_no_lora.transformer()
+
+                # Now apply LoRAs using chunked GPU computation
+                all_loras = (*self._stage_2_loras, *self._stage_2_distilled_lora) if self._stage_2_distilled_lora else self._stage_2_loras
+                if all_loras:
+                    print(f">>> Loading {len(all_loras)} LoRA(s)...", flush=True)
+                    from ltx_core.loader.sft_loader import SafetensorsStateDictLoader
+                    lora_loader = SafetensorsStateDictLoader()
+                    lora_state_dicts = []
+                    lora_strengths = []
+                    for lora in all_loras:
+                        lora_sd = lora_loader.load(lora.path, sd_ops=lora.sd_ops, device=torch.device("cpu"))
+                        lora_state_dicts.append(lora_sd)
+                        lora_strengths.append(lora.strength)
+
+                    # Apply LoRAs using chunked GPU computation
+                    apply_loras_chunked_gpu(
+                        model=transformer,
+                        lora_state_dicts=lora_state_dicts,
+                        lora_strengths=lora_strengths,
+                        gpu_device=self.device,
+                        dtype=self.dtype,
+                    )
+
+                    # Clean up LoRA state dicts
+                    del lora_state_dicts
+                    synchronize_and_cleanup()
+
+                # For VAE operations later
+                stage_2_ledger = stage_2_ledger_no_lora
+
+                # Move non-block components to GPU
+                print(f">>> Enabling refiner block swapping ({self.refiner_blocks_in_memory} blocks in GPU)...")
+                transformer.velocity_model.patchify_proj.to(self.device)
+                transformer.velocity_model.adaln_single.to(self.device)
+                transformer.velocity_model.caption_projection.to(self.device)
+                transformer.velocity_model.norm_out.to(self.device)
+                transformer.velocity_model.proj_out.to(self.device)
+                transformer.velocity_model.scale_shift_table = torch.nn.Parameter(
+                    transformer.velocity_model.scale_shift_table.to(self.device)
+                )
+                if hasattr(transformer.velocity_model, "audio_patchify_proj"):
+                    transformer.velocity_model.audio_patchify_proj.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_adaln_single"):
+                    transformer.velocity_model.audio_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_caption_projection"):
+                    transformer.velocity_model.audio_caption_projection.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_norm_out"):
+                    transformer.velocity_model.audio_norm_out.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_proj_out"):
+                    transformer.velocity_model.audio_proj_out.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_scale_shift_table"):
+                    transformer.velocity_model.audio_scale_shift_table = torch.nn.Parameter(
+                        transformer.velocity_model.audio_scale_shift_table.to(self.device)
+                    )
+                # Cross-attention adaln components
+                if hasattr(transformer.velocity_model, "av_ca_video_scale_shift_adaln_single"):
+                    transformer.velocity_model.av_ca_video_scale_shift_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "av_ca_audio_scale_shift_adaln_single"):
+                    transformer.velocity_model.av_ca_audio_scale_shift_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "av_ca_a2v_gate_adaln_single"):
+                    transformer.velocity_model.av_ca_a2v_gate_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "av_ca_v2a_gate_adaln_single"):
+                    transformer.velocity_model.av_ca_v2a_gate_adaln_single.to(self.device)
+
+                # Try to enable block swap with OOM retry (reduce blocks if needed)
+                current_blocks = self.refiner_blocks_in_memory
+                min_blocks = 1
+                while current_blocks >= min_blocks:
+                    try:
+                        # Use activation offload for extreme memory savings (moves activations to CPU between blocks)
+                        if self.enable_activation_offload:
+                            block_swap_manager = enable_block_swap_with_activation_offload(
+                                transformer,
+                                blocks_in_memory=current_blocks,
+                                device=self.device,
+                                verbose=True,
+                                temporal_chunk_size=self.temporal_chunk_size,
+                            )
+                        else:
+                            block_swap_manager = enable_block_swap(
+                                transformer,
+                                blocks_in_memory=current_blocks,
+                                device=self.device,
+                            )
+                        # Update instance variable for later retry logic
+                        self.refiner_blocks_in_memory = current_blocks
+                        break
+                    except torch.OutOfMemoryError:
+                        current_blocks -= 1
+                        if current_blocks < min_blocks:
+                            print(f">>> OOM Error during block swap setup: Already at minimum blocks ({min_blocks})")
+                            raise
+                        print(f">>> OOM during enable_block_swap! Retrying with {current_blocks} blocks...")
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                            torch.cuda.empty_cache()
+                        gc.collect()
+            else:
+                # Non-block-swap case: load with LoRAs directly to GPU (fast)
+                # Reuse registry from stage 1 if using same checkpoint to avoid duplicate loading
+                use_shared_registry = (
+                    self._stage_2_checkpoint_path == self.stage_1_model_ledger.checkpoint_path
+                )
+
+                stage_2_ledger = ModelLedger(
+                    dtype=self.dtype,
+                    device=self.device,
+                    checkpoint_path=self._stage_2_checkpoint_path,
+                    gemma_root_path=self._stage_2_gemma_root,
+                    spatial_upsampler_path=self._stage_2_spatial_upsampler_path,
+                    vae_path=self._stage_2_vae_path,
+                    loras=(*self._stage_2_loras, *self._stage_2_distilled_lora) if self._stage_2_distilled_lora else self._stage_2_loras,
+                    fp8transformer=self._stage_2_fp8transformer,
+                    registry=self.stage_1_model_ledger.registry if use_shared_registry else None,
+                )
+                transformer = stage_2_ledger.transformer()
 
         # Enable FFN chunking for stage 2 transformer if configured
         if self.ffn_chunk_size is not None:
@@ -6553,9 +6948,13 @@ def generate_av_extension(
         v_context_p, a_context_p = context_p
         v_context_n, a_context_n = None, None
 
-    # 7B: Delete text encoder BEFORE loading transformer
+    destroy_text_encoder(text_encoder, text_encoder_block_swap)
+    text_encoder_block_swap = None
     del text_encoder
-    cleanup_memory()
+    gc.collect()
+    gc.collect()
+    synchronize_and_cleanup()
+    print_memory_report("After text encoder cleanup")
 
     # 7C: Reload latents to GPU (after text encoder is gone)
     print(">>> Reloading latents to GPU for denoising...")
@@ -7991,8 +8390,12 @@ def generate_v2v_join(
         v_context_p, a_context_p = context_p
         v_context_n, a_context_n = None, None
 
+    destroy_text_encoder(text_encoder)
     del text_encoder
-    cleanup_memory()
+    gc.collect()
+    gc.collect()
+    synchronize_and_cleanup()
+    print_memory_report("After text encoder cleanup")
 
     # Reload latents to GPU
     video_latent = video_latent.to(device=device, dtype=dtype)
@@ -8474,42 +8877,18 @@ def generate_v2v_join(
         print(f">>> Loaded {video1_full_res_frames.shape[0]} frames from video1")
 
         # Convert to encoder format [1, C, F, H, W] and normalize to [-1, 1]
-        video1_full_input = video1_full_res_frames.permute(3, 0, 1, 2).unsqueeze(0) * 2.0 - 1.0
+        # Keep on CPU - encode_video_chunked handles device placement
+        video1_full_input = video1_full_res_frames.permute(3, 0, 1, 2).unsqueeze(0).cpu() * 2.0 - 1.0
         del video1_full_res_frames
 
-        # Encode video1 in chunks
-        encoder_dtype = next(video_encoder.parameters()).dtype
-        chunk_pixel_frames = 65
-        video1_latent_chunks = []
-        chunk_idx_v1 = 0
-
-        with torch.no_grad():
-            for start_f in range(0, video1_full_input.shape[2], chunk_pixel_frames - 1):
-                end_f = min(start_f + chunk_pixel_frames, video1_full_input.shape[2])
-                actual_frames = end_f - start_f
-
-                if actual_frames < 9:
-                    pad_frames = 9 - actual_frames
-                    chunk = video1_full_input[:, :, start_f:end_f, :, :]
-                    last_frame = chunk[:, :, -1:, :, :].expand(-1, -1, pad_frames, -1, -1)
-                    chunk = torch.cat([chunk, last_frame], dim=2)
-                else:
-                    chunk = video1_full_input[:, :, start_f:end_f, :, :]
-
-                chunk_latent = video_encoder(chunk.to(device=device, dtype=encoder_dtype))
-                chunk_latent = chunk_latent.to(dtype=dtype)
-
-                if chunk_idx_v1 > 0 and len(video1_latent_chunks) > 0:
-                    chunk_latent = chunk_latent[:, :, 1:, :, :]
-
-                video1_latent_chunks.append(chunk_latent)
-                chunk_idx_v1 += 1
-
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-        video1_full_latent = torch.cat(video1_latent_chunks, dim=2)
-        del video1_full_input, video1_latent_chunks
+        # Encode video1 using spatial tiling (handles OOM automatically)
+        video1_full_latent = encode_video_chunked(
+            video1_full_input,
+            video_encoder,
+            device=device,
+            dtype=dtype,
+        )
+        del video1_full_input
         print(f">>> Video1 full-res latent: {video1_full_latent.shape}")
 
         # Re-encode video2 preserved frames (gen_end_latent to end)
@@ -8527,40 +8906,18 @@ def generate_v2v_join(
         print(f">>> Loaded {video2_full_res_frames.shape[0]} frames from video2")
 
         # Convert to encoder format [1, C, F, H, W] and normalize to [-1, 1]
-        video2_full_input = video2_full_res_frames.permute(3, 0, 1, 2).unsqueeze(0) * 2.0 - 1.0
+        # Keep on CPU - encode_video_chunked handles device placement
+        video2_full_input = video2_full_res_frames.permute(3, 0, 1, 2).unsqueeze(0).cpu() * 2.0 - 1.0
         del video2_full_res_frames
 
-        # Encode video2 in chunks
-        video2_latent_chunks = []
-        chunk_idx_v2 = 0
-
-        with torch.no_grad():
-            for start_f in range(0, video2_full_input.shape[2], chunk_pixel_frames - 1):
-                end_f = min(start_f + chunk_pixel_frames, video2_full_input.shape[2])
-                actual_frames = end_f - start_f
-
-                if actual_frames < 9:
-                    pad_frames = 9 - actual_frames
-                    chunk = video2_full_input[:, :, start_f:end_f, :, :]
-                    last_frame = chunk[:, :, -1:, :, :].expand(-1, -1, pad_frames, -1, -1)
-                    chunk = torch.cat([chunk, last_frame], dim=2)
-                else:
-                    chunk = video2_full_input[:, :, start_f:end_f, :, :]
-
-                chunk_latent = video_encoder(chunk.to(device=device, dtype=encoder_dtype))
-                chunk_latent = chunk_latent.to(dtype=dtype)
-
-                if chunk_idx_v2 > 0 and len(video2_latent_chunks) > 0:
-                    chunk_latent = chunk_latent[:, :, 1:, :, :]
-
-                video2_latent_chunks.append(chunk_latent)
-                chunk_idx_v2 += 1
-
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-        video2_full_latent = torch.cat(video2_latent_chunks, dim=2)
-        del video2_full_input, video2_latent_chunks
+        # Encode video2 using spatial tiling (handles OOM automatically)
+        video2_full_latent = encode_video_chunked(
+            video2_full_input,
+            video_encoder,
+            device=device,
+            dtype=dtype,
+        )
+        del video2_full_input
         print(f">>> Video2 full-res latent: {video2_full_latent.shape}")
 
         # Replace upsampler output with original full-res encodings for preserved regions
@@ -9702,6 +10059,9 @@ def main():
             print("Error: --v2a-mode cannot be combined with --refine-only")
             sys.exit(1)
 
+    # Preprocess V2V join videos to ensure audio is at 24000Hz
+    temp_audio_converted_files = preprocess_v2v_join_videos(args)
+
     # Configure logging
     log_level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(level=log_level, format="%(message)s")
@@ -10336,6 +10696,16 @@ def main():
 
     print(">>> Adding metadata to video...")
     add_metadata_to_video(args.output_path, metadata)
+
+    # Clean up temporary audio-converted files
+    import os as os_module  # Use alias to avoid conflict with local imports above
+    for temp_file in temp_audio_converted_files:
+        try:
+            if os_module.path.exists(temp_file):
+                os_module.unlink(temp_file)
+                print(f">>> Cleaned up temporary file: {temp_file}")
+        except OSError as e:
+            print(f">>> Warning: Could not remove temporary file {temp_file}: {e}")
 
     print(f">>> Output: {args.output_path}")
     print(">>> Done!")
