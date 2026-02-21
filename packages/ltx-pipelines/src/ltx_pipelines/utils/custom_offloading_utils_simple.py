@@ -39,8 +39,22 @@ def swap_weight_devices_cuda(device: torch.device, layer_to_cpu: nn.Module, laye
     Swap weights between two layers, moving layer_to_cpu's weights to CPU and layer_to_cuda's weights to GPU.
     Uses buffer reuse for large weight tensors to minimize GPU memory allocation.
     Also handles biases and other parameters with simple device transfers.
+
+    Respects modules that define _get_device_restricted_modules() - these modules
+    will not have their parameters swapped (used by TensorParallelFeedForward to keep
+    device1 modules on the secondary GPU permanently).
     """
     assert layer_to_cpu.__class__ == layer_to_cuda.__class__
+
+    # Collect restricted modules from both layers
+    restricted_cpu = set()
+    restricted_cuda = set()
+    for module in layer_to_cpu.modules():
+        if hasattr(module, '_get_device_restricted_modules'):
+            restricted_cpu.update(module._get_device_restricted_modules())
+    for module in layer_to_cuda.modules():
+        if hasattr(module, '_get_device_restricted_modules'):
+            restricted_cuda.update(module._get_device_restricted_modules())
 
     weight_swap_jobs = []
     other_param_jobs = []  # For biases and other non-weight parameters
@@ -49,6 +63,10 @@ def swap_weight_devices_cuda(device: torch.device, layer_to_cpu: nn.Module, laye
     for module_to_cuda_name, module_to_cuda in layer_to_cuda.named_modules():
         module_to_cpu = modules_to_cpu.get(module_to_cuda_name, None)
         if module_to_cpu is None:
+            continue
+
+        # Skip restricted modules (e.g., device1 parts of tensor-parallel FFN)
+        if module_to_cpu in restricted_cpu or module_to_cuda in restricted_cuda:
             continue
 
         # Handle weight parameter with buffer reuse
@@ -133,8 +151,21 @@ def swap_weight_devices_no_cuda(device: torch.device, layer_to_cpu: nn.Module, l
 
 
 def weighs_to_device(layer: nn.Module, device: torch.device):
-    """Move all parameters (weights, biases, and any other parameters) to the specified device."""
+    """Move all parameters (weights, biases, and any other parameters) to the specified device.
+
+    Respects modules that define _get_device_restricted_modules() - these modules
+    will not have their parameters moved (used by TensorParallelFeedForward to keep
+    device1 modules on the secondary GPU).
+    """
+    # Collect restricted modules (e.g., device1 parts of tensor-parallel FFN)
+    restricted = set()
     for module in layer.modules():
+        if hasattr(module, '_get_device_restricted_modules'):
+            restricted.update(module._get_device_restricted_modules())
+
+    for module in layer.modules():
+        if module in restricted:
+            continue
         # Move all named parameters, not just weights
         for param_name, param in list(module.named_parameters(recurse=False)):
             if param is not None:
