@@ -60,6 +60,7 @@ class TensorParallelFeedForward(torch.nn.Module):
         mult: int = 4,
         device0: torch.device = None,
         device1: torch.device = None,
+        dtype: torch.dtype = None,
     ):
         super().__init__()
         inner_dim = int(dim * mult)
@@ -68,14 +69,15 @@ class TensorParallelFeedForward(torch.nn.Module):
         self.device0 = device0 or torch.device("cuda:0")
         self.device1 = device1 or torch.device("cuda:1")
         self.half_inner = half_inner
+        dtype = dtype or torch.bfloat16  # Default to bfloat16 for LTX models
 
         # GPU:0 handles first half of inner_dim
-        self.proj_in_0 = torch.nn.Linear(dim, half_inner, device=self.device0)
-        self.proj_out_0 = torch.nn.Linear(half_inner, dim_out, device=self.device0)
+        self.proj_in_0 = torch.nn.Linear(dim, half_inner, device=self.device0, dtype=dtype)
+        self.proj_out_0 = torch.nn.Linear(half_inner, dim_out, device=self.device0, dtype=dtype)
 
         # GPU:1 handles second half of inner_dim
-        self.proj_in_1 = torch.nn.Linear(dim, half_inner, device=self.device1)
-        self.proj_out_1 = torch.nn.Linear(half_inner, dim_out, device=self.device1)
+        self.proj_in_1 = torch.nn.Linear(dim, half_inner, device=self.device1, dtype=dtype)
+        self.proj_out_1 = torch.nn.Linear(half_inner, dim_out, device=self.device1, dtype=dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x is expected on device0
@@ -137,7 +139,7 @@ class TensorParallelFeedForward(torch.nn.Module):
         Returns:
             New TensorParallelFeedForward with copied weights
         """
-        # Extract dimensions from existing module
+        # Extract dimensions and dtype from existing module
         proj_in = ff.net[0]  # GELUApprox
         proj_out = ff.net[2]  # Linear
 
@@ -146,9 +148,10 @@ class TensorParallelFeedForward(torch.nn.Module):
         inner_dim = proj_in.proj.out_features
         mult = inner_dim // dim
         half_inner = inner_dim // 2
+        dtype = proj_in.proj.weight.dtype  # Preserve original dtype
 
-        # Create new module (initializes with random weights)
-        tp_ff = cls(dim, dim_out, mult, device0, device1)
+        # Create new module with correct dtype
+        tp_ff = cls(dim, dim_out, mult, device0, device1, dtype=dtype)
 
         # Copy weights from original, splitting inner_dim
         with torch.no_grad():
