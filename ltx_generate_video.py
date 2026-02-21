@@ -57,6 +57,7 @@ from ltx_pipelines.utils.block_swap import (
     offload_all_blocks,
     enable_text_encoder_block_swap,
     offload_all_text_encoder_blocks,
+    enable_tensor_parallel_ffn,
 )
 from ltx_pipelines.utils.custom_offloading_utils import clean_memory_on_device
 from ltx_pipelines.utils.constants import (
@@ -717,6 +718,7 @@ Suggested actions:
                         device=torch.device(generator_instance.device),
                         enable_activation_offload=strategy['activation_offload'],
                         temporal_chunk_size=strategy['temporal_chunk_size'],
+                        activation_device=getattr(generator_instance, 'activation_offload_device', 'cpu'),
                     )
                 except (torch.cuda.OutOfMemoryError, torch.OutOfMemoryError, RuntimeError) as reconfig_e:
                     # Reconfiguration itself failed due to OOM - need more aggressive reduction
@@ -733,6 +735,7 @@ Suggested actions:
                             device=torch.device(generator_instance.device),
                             enable_activation_offload=True,  # Force activation offload on
                             temporal_chunk_size=strategy['temporal_chunk_size'],
+                            activation_device=getattr(generator_instance, 'activation_offload_device', 'cpu'),
                         )
                         strategy['blocks'] = emergency_blocks
                         strategy['activation_offload'] = True
@@ -766,6 +769,48 @@ Suggested actions:
 # =============================================================================
 # Helper Functions
 # =============================================================================
+
+def apply_decode_noise_mixing(
+    latent: torch.Tensor,
+    decode_timestep: float,
+    decode_noise_scale: float | None,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """
+    Apply timestep-conditioned noise mixing to latents before VAE decoding.
+
+    This technique from diffusers can improve sharpness and reduce artifacts
+    by mixing a small amount of noise into the latents at decode time.
+
+    Args:
+        latent: Video latent tensor [C, F, H, W] or [B, C, F, H, W]
+        decode_timestep: Timestep value (0.0-1.0). 0.0 disables mixing.
+        decode_noise_scale: Noise interpolation factor. If None, uses decode_timestep.
+        generator: Optional torch Generator for reproducible noise.
+
+    Returns:
+        Latent tensor with noise mixed in (same shape as input).
+    """
+    if decode_timestep == 0.0:
+        return latent
+
+    noise_scale = decode_noise_scale if decode_noise_scale is not None else decode_timestep
+    if noise_scale == 0.0:
+        return latent
+
+    # Generate noise matching latent shape
+    noise = torch.randn(
+        latent.shape,
+        device=latent.device,
+        dtype=latent.dtype,
+        generator=generator,
+    )
+
+    # Mix: (1 - scale) * latent + scale * noise
+    mixed_latent = (1.0 - noise_scale) * latent + noise_scale * noise
+
+    return mixed_latent
+
 
 def build_anchor_image_tuples(
     anchor_image: str | None,
@@ -2547,6 +2592,20 @@ def parse_args() -> argparse.Namespace:
              "Requires --enable-activation-offload. Maintains full attention context "
              "by streaming K/V from CPU. Much slower but uses minimal GPU memory.",
     )
+    # Dual-GPU options
+    mem_group.add_argument(
+        "--enable-tensor-parallel-ffn",
+        action="store_true",
+        help="Split FFN across two GPUs to halve peak memory. "
+             "Eliminates need for FFN chunking. Requires dual GPU setup.",
+    )
+    mem_group.add_argument(
+        "--activation-offload-device",
+        type=str,
+        default="cpu",
+        help="Device for storing activations between blocks. "
+             "'cpu' (default) or 'cuda:1' (faster with dual GPU).",
+    )
 
     # ==========================================================================
     # Audio Control
@@ -2734,6 +2793,21 @@ def parse_args() -> argparse.Namespace:
         "--verbose",
         action="store_true",
         help="Enable verbose logging.",
+    )
+    adv_group.add_argument(
+        "--decode-timestep",
+        type=float,
+        default=0.0,
+        help="Timestep for conditioned VAE decoding (0.0-1.0). Mixes noise into latents "
+             "before decoding to improve sharpness. 0.0 disables (default). "
+             "Recommended: 0.03-0.05 for subtle improvement.",
+    )
+    adv_group.add_argument(
+        "--decode-noise-scale",
+        type=float,
+        default=None,
+        help="Noise mixing factor for conditioned VAE decode. If not specified, "
+             "uses --decode-timestep value. Lower values = less noise mixed in.",
     )
 
     # ==========================================================================
@@ -3278,6 +3352,7 @@ def reconfigure_block_swap(
     device: torch.device,
     enable_activation_offload: bool = False,
     temporal_chunk_size: int = 0,
+    activation_device: torch.device | str = "cpu",
 ) -> tuple:
     """
     Reconfigure block swapping with fewer blocks in GPU after an OOM.
@@ -3371,6 +3446,7 @@ def reconfigure_block_swap(
             transformer,
             blocks_in_memory=new_blocks_in_memory,
             device=device,
+            activation_device=activation_device,
             verbose=True,
             temporal_chunk_size=temporal_chunk_size,
         )
@@ -3746,6 +3822,10 @@ class LTXVideoGeneratorWithOffloading:
         stage3_blocks_in_memory: int = 22,
         enable_activation_offload: bool = False,
         temporal_chunk_size: int = 0,
+        # Dual-GPU options
+        enable_tensor_parallel_ffn: bool = False,
+        auxiliary_device: str | torch.device | None = None,
+        activation_offload_device: str | torch.device = "cpu",
         one_stage: bool = False,
         refine_only: bool = False,
         distilled_checkpoint: bool = False,
@@ -3771,6 +3851,24 @@ class LTXVideoGeneratorWithOffloading:
         self.stage3_blocks_in_memory = stage3_blocks_in_memory if enable_stage3_block_swap else refiner_blocks_in_memory
         self.enable_activation_offload = enable_activation_offload
         self.temporal_chunk_size = temporal_chunk_size
+        # Dual-GPU settings
+        self.enable_tensor_parallel_ffn = enable_tensor_parallel_ffn
+        # Auto-detect auxiliary device if not specified
+        if auxiliary_device is None and torch.cuda.device_count() >= 2:
+            self.auxiliary_device = torch.device("cuda:1")
+        elif auxiliary_device is not None:
+            self.auxiliary_device = torch.device(auxiliary_device) if isinstance(auxiliary_device, str) else auxiliary_device
+        else:
+            self.auxiliary_device = None
+        # Activation offload device
+        if activation_offload_device == "auto":
+            self.activation_offload_device = self.auxiliary_device if self.auxiliary_device else torch.device("cpu")
+        else:
+            self.activation_offload_device = torch.device(activation_offload_device) if isinstance(activation_offload_device, str) else activation_offload_device
+        # Disable tensor parallel if no second GPU
+        if self.enable_tensor_parallel_ffn and self.auxiliary_device is None:
+            print("[Warning] enable_tensor_parallel_ffn=True but no second GPU available. Disabling.")
+            self.enable_tensor_parallel_ffn = False
         self.one_stage = one_stage
         self.refine_only = refine_only
         self.distilled_checkpoint = distilled_checkpoint
@@ -3918,6 +4016,9 @@ class LTXVideoGeneratorWithOffloading:
         # Kandinsky scheduler parameters
         kandinsky_scheduler: bool = False,
         kandinsky_scheduler_scale: float = 5.0,
+        # Timestep-conditioned VAE decode (quality improvement)
+        decode_timestep: float = 0.0,
+        decode_noise_scale: float | None = None,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor | None, str | None]:
         """
         Generate video with optional audio.
@@ -4238,6 +4339,15 @@ class LTXVideoGeneratorWithOffloading:
                 if hasattr(transformer.velocity_model, "av_ca_v2a_gate_adaln_single"):
                     transformer.velocity_model.av_ca_v2a_gate_adaln_single.to(self.device)
 
+                # Enable tensor-parallel FFN if dual GPU available (Stage 1)
+                if self.enable_tensor_parallel_ffn and self.auxiliary_device is not None:
+                    print(f">>> Enabling tensor-parallel FFN ({self.device} + {self.auxiliary_device})...")
+                    enable_tensor_parallel_ffn(
+                        transformer,
+                        device0=self.device,
+                        device1=self.auxiliary_device,
+                    )
+
                 # Try to enable block swap with OOM retry (reduce blocks if needed)
                 # Stage 1 uses fast defaults - activation offload/chunking only enabled via OOM retry
                 current_blocks = self.dit_blocks_in_memory
@@ -4252,6 +4362,7 @@ class LTXVideoGeneratorWithOffloading:
                                 transformer,
                                 blocks_in_memory=current_blocks,
                                 device=self.device,
+                                activation_device=self.activation_offload_device,
                                 verbose=True,
                                 temporal_chunk_size=0,
                             )
@@ -4926,10 +5037,18 @@ class LTXVideoGeneratorWithOffloading:
                     print(">>> Decoding video...")
                     decode_start = time.time()
 
+                    # Apply timestep-conditioned noise mixing if enabled
+                    decode_latent = video_state.latent
+                    if decode_timestep > 0.0:
+                        print(f">>> Applying decode noise mixing (timestep={decode_timestep}, scale={decode_noise_scale})")
+                        decode_latent = apply_decode_noise_mixing(
+                            decode_latent, decode_timestep, decode_noise_scale, generator
+                        )
+
                     video_decoder = self.stage_1_model_ledger.video_decoder()
                     decoded_video_chunks = []
                     for chunk in vae_decode_video(
-                        video_state.latent,
+                        decode_latent,
                         video_decoder,
                         tiling_config,
                     ):
@@ -5057,6 +5176,7 @@ class LTXVideoGeneratorWithOffloading:
                                 transformer,
                                 blocks_in_memory=current_blocks,
                                 device=self.device,
+                                activation_device=self.activation_offload_device,
                                 verbose=True,
                                 temporal_chunk_size=self.temporal_chunk_size,
                             )
@@ -5195,6 +5315,7 @@ class LTXVideoGeneratorWithOffloading:
                                 transformer,
                                 blocks_in_memory=current_blocks,
                                 device=self.device,
+                                activation_device=self.activation_offload_device,
                                 verbose=True,
                                 temporal_chunk_size=self.temporal_chunk_size,
                             )
@@ -6020,10 +6141,18 @@ class LTXVideoGeneratorWithOffloading:
             print(">>> Decoding video...")
             decode_start = time.time()
 
+            # Apply timestep-conditioned noise mixing if enabled
+            decode_latent = video_state.latent
+            if decode_timestep > 0.0:
+                print(f">>> Applying decode noise mixing (timestep={decode_timestep}, scale={decode_noise_scale})")
+                decode_latent = apply_decode_noise_mixing(
+                    decode_latent, decode_timestep, decode_noise_scale, generator
+                )
+
             video_decoder = self.stage_2_model_ledger.video_decoder()
             decoded_video_chunks = []
             for chunk in vae_decode_video(
-                video_state.latent,
+                decode_latent,
                 video_decoder,
                 tiling_config,
             ):
@@ -6234,6 +6363,9 @@ def generate_svi_multi_clip(
                 # Kandinsky scheduler parameters
                 kandinsky_scheduler=args.kandinsky_scheduler,
                 kandinsky_scheduler_scale=args.kandinsky_scheduler_scale,
+                # Timestep-conditioned VAE decode
+                decode_timestep=args.decode_timestep,
+                decode_noise_scale=args.decode_noise_scale,
             )
 
             # Collect video frames from iterator - move to CPU immediately to save GPU memory
@@ -7058,6 +7190,7 @@ def generate_av_extension(
                 transformer,
                 blocks_in_memory=generator.dit_blocks_in_memory,
                 device=device,
+                activation_device=getattr(generator, 'activation_offload_device', 'cpu'),
                 verbose=True,
                 temporal_chunk_size=getattr(generator, 'temporal_chunk_size', 0),
             )
@@ -7581,6 +7714,7 @@ def generate_av_extension(
                     stage2_transformer,
                     blocks_in_memory=generator.refiner_blocks_in_memory,
                     device=device,
+                    activation_device=getattr(generator, 'activation_offload_device', 'cpu'),
                     verbose=True,
                     temporal_chunk_size=getattr(generator, 'temporal_chunk_size', 0),
                 )
@@ -7762,11 +7896,21 @@ def generate_av_extension(
     else:
         video_decoder = generator.stage_1_model_ledger.video_decoder()
 
+    # Apply timestep-conditioned noise mixing if enabled
+    decode_latent = denoised_video_latent
+    decode_timestep = getattr(args, 'decode_timestep', 0.0)
+    decode_noise_scale = getattr(args, 'decode_noise_scale', None)
+    if decode_timestep > 0.0:
+        print(f">>> Applying decode noise mixing (timestep={decode_timestep}, scale={decode_noise_scale})")
+        decode_latent = apply_decode_noise_mixing(
+            decode_latent, decode_timestep, decode_noise_scale, None
+        )
+
     tiling_config = TilingConfig.default()
     # Collect decoded chunks on CPU immediately to save GPU memory during tiled decoding
     decoded_video_chunks = []
     for chunk in vae_decode_video(
-        denoised_video_latent,  # Pass directly, decoder handles dtype
+        decode_latent,  # Pass directly, decoder handles dtype
         video_decoder,
         tiling_config,
     ):
@@ -8488,6 +8632,7 @@ def generate_v2v_join(
                 transformer,
                 blocks_in_memory=generator.dit_blocks_in_memory,
                 device=device,
+                activation_device=getattr(generator, 'activation_offload_device', 'cpu'),
                 verbose=True,
                 temporal_chunk_size=getattr(generator, 'temporal_chunk_size', 0),
             )
@@ -9024,6 +9169,7 @@ def generate_v2v_join(
                     stage2_transformer,
                     blocks_in_memory=generator.refiner_blocks_in_memory,
                     device=device,
+                    activation_device=getattr(generator, 'activation_offload_device', 'cpu'),
                     verbose=True,
                     temporal_chunk_size=getattr(generator, 'temporal_chunk_size', 0),
                 )
@@ -9213,9 +9359,19 @@ def generate_v2v_join(
     video_decoder = generator.stage_1_model_ledger.video_decoder() if generator.one_stage else generator.stage_2_model_ledger.video_decoder()
     tiling_config = TilingConfig.default()
 
+    # Apply timestep-conditioned noise mixing if enabled
+    decode_latent = denoised_video_latent
+    decode_timestep = getattr(args, 'decode_timestep', 0.0)
+    decode_noise_scale = getattr(args, 'decode_noise_scale', None)
+    if decode_timestep > 0.0:
+        print(f">>> Applying decode noise mixing (timestep={decode_timestep}, scale={decode_noise_scale})")
+        decode_latent = apply_decode_noise_mixing(
+            decode_latent, decode_timestep, decode_noise_scale, None
+        )
+
     decoded_video_chunks = []
     for chunk in vae_decode_video(
-        denoised_video_latent,
+        decode_latent,
         video_decoder,
         tiling_config,
     ):
@@ -9912,6 +10068,9 @@ def sliding_window_generate(
             # Kandinsky scheduler parameters
             kandinsky_scheduler=args.kandinsky_scheduler,
             kandinsky_scheduler_scale=args.kandinsky_scheduler_scale,
+            # Timestep-conditioned VAE decode
+            decode_timestep=args.decode_timestep,
+            decode_noise_scale=args.decode_noise_scale,
         )
 
         # Collect video frames from iterator - move to CPU immediately to save GPU memory
@@ -10162,6 +10321,8 @@ def main():
         stage3_blocks_in_memory=args.stage3_blocks_in_memory,
         enable_activation_offload=args.enable_activation_offload,
         temporal_chunk_size=args.temporal_chunk_size,
+        enable_tensor_parallel_ffn=args.enable_tensor_parallel_ffn,
+        activation_offload_device=args.activation_offload_device,
         one_stage=args.one_stage,
         refine_only=args.refine_only,
         distilled_checkpoint=args.distilled_checkpoint,
@@ -10438,6 +10599,8 @@ def main():
             stage3_steps=args.stage3_steps,
             kandinsky_scheduler=args.kandinsky_scheduler,
             kandinsky_scheduler_scale=args.kandinsky_scheduler_scale,
+            decode_timestep=args.decode_timestep,
+            decode_noise_scale=args.decode_noise_scale,
         )
 
     # Encode and save video

@@ -1556,6 +1556,9 @@ def generate_ltx_video(
     ffn_chunk_size: int,
     enable_activation_offload: bool,
     temporal_chunk_size: int,
+    # Dual-GPU options
+    enable_tensor_parallel_ffn: bool,
+    activation_offload_device: str,
     # LoRA
     lora_folder: str,
     user_lora_1: str,
@@ -1632,6 +1635,9 @@ def generate_ltx_video(
     v2v_join_transition_time: float,
     v2v_join_steps: int,
     v2v_join_terminal: float,
+    # Timestep-conditioned VAE decode
+    decode_timestep: float,
+    decode_noise_scale: float,
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     """
     Generate video using LTX-2 pipeline.
@@ -1878,6 +1884,12 @@ def generate_ltx_video(
             command.extend(["--v2v-join-steps", str(int(v2v_join_steps))])
             command.extend(["--v2v-join-terminal", str(float(v2v_join_terminal))])
 
+        # Timestep-conditioned VAE decode (quality improvement)
+        if decode_timestep > 0.0:
+            command.extend(["--decode-timestep", str(float(decode_timestep))])
+            if decode_noise_scale is not None and decode_noise_scale > 0.0:
+                command.extend(["--decode-noise-scale", str(float(decode_noise_scale))])
+
         # User LoRAs - apply to selected stage(s)
         lora_configs = [
             (user_lora_1, user_lora_strength_1, user_lora_stage_1),
@@ -1944,6 +1956,11 @@ def generate_ltx_video(
             command.append("--enable-activation-offload")
         if temporal_chunk_size and int(temporal_chunk_size) > 0:
             command.extend(["--temporal-chunk-size", str(int(temporal_chunk_size))])
+        # Dual-GPU options
+        if enable_tensor_parallel_ffn:
+            command.append("--enable-tensor-parallel-ffn")
+        if activation_offload_device and activation_offload_device != "cpu":
+            command.extend(["--activation-offload-device", str(activation_offload_device)])
 
         # Preview generation
         unique_preview_suffix = f"ltx_{run_id}"
@@ -2449,6 +2466,9 @@ def generate_svi_ltx_video(
     ffn_chunk_size: int,
     enable_activation_offload: bool,
     temporal_chunk_size: int,
+    # Dual-GPU options
+    enable_tensor_parallel_ffn: bool,
+    activation_offload_device: str,
     # LoRA
     lora_folder: str,
     user_lora: str,
@@ -2604,6 +2624,15 @@ def generate_svi_ltx_video(
             command.extend(["--refiner-blocks-in-memory", str(int(refiner_blocks_in_memory))])
         if ffn_chunk_size and int(ffn_chunk_size) > 0:
             command.extend(["--ffn-chunk-size", str(int(ffn_chunk_size))])
+        if enable_activation_offload:
+            command.append("--enable-activation-offload")
+        if temporal_chunk_size and int(temporal_chunk_size) > 0:
+            command.extend(["--temporal-chunk-size", str(int(temporal_chunk_size))])
+        # Dual-GPU options
+        if enable_tensor_parallel_ffn:
+            command.append("--enable-tensor-parallel-ffn")
+        if activation_offload_device and activation_offload_device != "cpu":
+            command.extend(["--activation-offload-device", str(activation_offload_device)])
 
         # User LoRA
         if user_lora and user_lora != "None" and lora_folder:
@@ -3477,6 +3506,14 @@ def create_interface():
                                     info="Process video in chunks (0 = disabled, try 400000 for very long videos)"
                                 )
                             with gr.Row():
+                                enable_tensor_parallel_ffn = gr.Checkbox(label="Tensor Parallel FFN", value=False, info="Split FFN across 2 GPUs (requires dual GPU)")
+                                activation_offload_device = gr.Dropdown(
+                                    choices=["cpu", "cuda:1"],
+                                    value="cpu",
+                                    label="Activation Offload Device",
+                                    info="Where to store activations (cuda:1 faster if dual GPU)"
+                                )
+                            with gr.Row():
                                 disable_audio = gr.Checkbox(label="Disable Audio", value=False, info="Generate video only (no audio)")
                                 enhance_prompt = gr.Checkbox(label="Enhance Prompt", value=False, info="Use Gemma to improve prompt")
                             with gr.Row():
@@ -3579,6 +3616,31 @@ def create_interface():
                                     label="Audio Only",
                                     value=False,
                                     info="Apply to audio latents only"
+                                )
+
+                        # Timestep-Conditioned VAE Decode
+                        with gr.Accordion("VAE Decode Quality", open=False):
+                            gr.Markdown("""
+                            **Timestep-conditioned VAE decoding** can improve sharpness by mixing
+                            a small amount of noise into latents before decoding.
+                            Set to 0.0 to disable (default). Try 0.03-0.05 for subtle improvement.
+                            """)
+                            with gr.Row():
+                                decode_timestep = gr.Slider(
+                                    minimum=0.0,
+                                    maximum=0.2,
+                                    step=0.01,
+                                    value=0.0,
+                                    label="Decode Timestep",
+                                    info="0.0 = disabled, 0.03-0.05 recommended for sharper output"
+                                )
+                                decode_noise_scale = gr.Slider(
+                                    minimum=0.0,
+                                    maximum=0.2,
+                                    step=0.01,
+                                    value=0.0,
+                                    label="Decode Noise Scale",
+                                    info="If 0, uses Decode Timestep value"
                                 )
 
                         # V2A Mode (Video-to-Audio)
@@ -3893,6 +3955,14 @@ def create_interface():
                             minimum=0, maximum=500000, value=0, step=50000,
                             label="Temporal Chunk Size",
                             info="Process video in chunks (0 = disabled)"
+                        )
+                    with gr.Row():
+                        svi_enable_tensor_parallel_ffn = gr.Checkbox(label="Tensor Parallel FFN", value=False, info="Split FFN across 2 GPUs (requires dual GPU)")
+                        svi_activation_offload_device = gr.Dropdown(
+                            choices=["cpu", "cuda:1"],
+                            value="cpu",
+                            label="Activation Offload Device",
+                            info="Where to store activations (cuda:1 faster if dual GPU)"
                         )
                     with gr.Row():
                         svi_disable_audio = gr.Checkbox(label="Disable Audio", value=False, info="Skip audio generation")
@@ -4668,6 +4738,7 @@ def create_interface():
                 enable_text_encoder_block_swap, text_encoder_blocks_in_memory,
                 enable_refiner_block_swap, refiner_blocks_in_memory,
                 ffn_chunk_size, enable_activation_offload, temporal_chunk_size,
+                enable_tensor_parallel_ffn, activation_offload_device,
                 lora_folder,
                 user_lora_1, user_lora_strength_1, user_lora_stage_1,
                 user_lora_2, user_lora_strength_2, user_lora_stage_2,
@@ -4704,6 +4775,8 @@ def create_interface():
                 v2v_join_preserve1, v2v_join_preserve2,
                 v2v_join_transition_time,
                 v2v_join_steps, v2v_join_terminal,
+                # VAE Decode Quality
+                decode_timestep, decode_noise_scale,
             ],
             outputs=[output_gallery, preview_gallery, status_text, progress_text]
         )
@@ -4872,6 +4945,9 @@ def create_interface():
                 # Distilled settings (NOT model paths)
                 gr.update(value=metadata.get("distilled_checkpoint", False)),  # distilled_checkpoint
             ] + lora_updates + [
+                # VAE Decode Quality
+                gr.update(value=metadata.get("decode_timestep", 0.0)),  # decode_timestep
+                gr.update(value=metadata.get("decode_noise_scale", 0.0)),  # decode_noise_scale
                 # NOTE: stage2_checkpoint path is NOT restored - keep user's current setting
                 "Parameters sent to Generation tab (model paths unchanged)"  # status
             ]
@@ -4952,6 +5028,8 @@ def create_interface():
                 user_lora_6, user_lora_strength_6, user_lora_stage_6,
                 user_lora_7, user_lora_strength_7, user_lora_stage_7,
                 user_lora_8, user_lora_strength_8, user_lora_stage_8,
+                # VAE Decode Quality
+                decode_timestep, decode_noise_scale,
                 info_status
             ]
         )
@@ -5018,6 +5096,7 @@ def create_interface():
                 svi_enable_text_encoder_block_swap, svi_text_encoder_blocks_in_memory,
                 svi_enable_refiner_block_swap, svi_refiner_blocks_in_memory,
                 svi_ffn_chunk_size, svi_enable_activation_offload, svi_temporal_chunk_size,
+                svi_enable_tensor_parallel_ffn, svi_activation_offload_device,
                 # LoRA
                 svi_lora_folder, svi_lora_dropdown, svi_lora_strength,
                 # Output
@@ -5144,6 +5223,7 @@ def create_interface():
             enable_text_encoder_block_swap, text_encoder_blocks_in_memory,
             enable_refiner_block_swap, refiner_blocks_in_memory,
             ffn_chunk_size, enable_activation_offload, temporal_chunk_size,
+            enable_tensor_parallel_ffn, activation_offload_device,
             # LoRAs
             lora_folder,
             user_lora_1, user_lora_strength_1, user_lora_stage_1,
@@ -5165,6 +5245,8 @@ def create_interface():
             v2v_join_preserve1, v2v_join_preserve2,
             v2v_join_transition_time,
             v2v_join_steps, v2v_join_terminal,
+            # VAE Decode Quality
+            decode_timestep, decode_noise_scale,
         ]
 
         lt1_ui_default_keys = [
@@ -5193,6 +5275,7 @@ def create_interface():
             "enable_text_encoder_block_swap", "text_encoder_blocks_in_memory",
             "enable_refiner_block_swap", "refiner_blocks_in_memory",
             "ffn_chunk_size", "enable_activation_offload", "temporal_chunk_size",
+            "enable_tensor_parallel_ffn", "activation_offload_device",
             # LoRAs
             "lora_folder",
             "user_lora_1", "user_lora_strength_1", "user_lora_stage_1",
@@ -5214,6 +5297,8 @@ def create_interface():
             "v2v_join_preserve1", "v2v_join_preserve2",
             "v2v_join_transition_time",
             "v2v_join_steps", "v2v_join_terminal",
+            # VAE Decode Quality
+            "decode_timestep", "decode_noise_scale",
         ]
 
         def save_lt1_defaults(*values):
@@ -5315,6 +5400,7 @@ def create_interface():
             svi_enable_text_encoder_block_swap, svi_text_encoder_blocks_in_memory,
             svi_enable_refiner_block_swap, svi_refiner_blocks_in_memory,
             svi_ffn_chunk_size, svi_enable_activation_offload, svi_temporal_chunk_size,
+            svi_enable_tensor_parallel_ffn, svi_activation_offload_device,
             # LoRA
             svi_lora_folder, svi_lora_dropdown, svi_lora_strength,
             # Output
@@ -5347,6 +5433,7 @@ def create_interface():
             "svi_enable_text_encoder_block_swap", "svi_text_encoder_blocks_in_memory",
             "svi_enable_refiner_block_swap", "svi_refiner_blocks_in_memory",
             "svi_ffn_chunk_size", "svi_enable_activation_offload", "svi_temporal_chunk_size",
+            "svi_enable_tensor_parallel_ffn", "svi_activation_offload_device",
             # LoRA
             "svi_lora_folder", "svi_lora_dropdown", "svi_lora_strength",
             # Output

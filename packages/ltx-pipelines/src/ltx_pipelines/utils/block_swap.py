@@ -87,6 +87,7 @@ def enable_block_swap_with_activation_offload(
     model: X0Model | LTXModel,
     blocks_in_memory: int = 1,
     device: torch.device | str = "cuda",
+    activation_device: torch.device | str = "cpu",
     verbose: bool = False,
     temporal_chunk_size: int = 0,
     use_pinned_weights: bool = True,
@@ -95,16 +96,19 @@ def enable_block_swap_with_activation_offload(
     Enable block swapping WITH activation offloading for extreme memory savings.
 
     Unlike regular block swapping which only moves weights to CPU, this also
-    moves activations (vx, ax) to CPU between blocks. This allows processing
+    moves activations (vx, ax) between blocks. This allows processing
     arbitrarily long sequences that wouldn't fit in VRAM otherwise.
 
-    Trade-off: ~10-20x slower due to CPU-GPU transfers per block, but uses
+    Trade-off: Slower due to device transfers per block, but uses
     minimal GPU memory regardless of sequence length.
 
     Args:
         model: X0Model (wraps LTXModel) or LTXModel directly.
         blocks_in_memory: Number of transformer blocks to keep in GPU (default: 1).
-        device: Target GPU device.
+        device: Target GPU device for computation.
+        activation_device: Device to store activations between blocks. Can be:
+            - "cpu": Use pinned CPU memory (slower but saves all GPU memory)
+            - "cuda:1": Use second GPU (faster, requires dual GPU setup)
         verbose: If True, log memory at each block.
         temporal_chunk_size: If > 0, process video in chunks of this many tokens.
             This allows processing very long videos by streaming K/V from CPU.
@@ -123,6 +127,8 @@ def enable_block_swap_with_activation_offload(
         ltx_model = model
 
     device = torch.device(device) if isinstance(device, str) else device
+    act_device = torch.device(activation_device) if isinstance(activation_device, str) else activation_device
+    use_gpu_activation_buffer = act_device.type == 'cuda'
     num_blocks = len(ltx_model.transformer_blocks)
     blocks_to_swap = num_blocks - blocks_in_memory
 
@@ -150,11 +156,15 @@ def enable_block_swap_with_activation_offload(
     ltx_model._blocks_ref = blocks
     ltx_model._activation_offload_verbose = verbose
     ltx_model._temporal_chunk_size = temporal_chunk_size
+    ltx_model._activation_device = act_device
+    ltx_model._use_gpu_activation_buffer = use_gpu_activation_buffer
     if isinstance(model, X0Model):
         model._block_swap_offloader = offloader
         model._blocks_to_swap = blocks_to_swap
         model._blocks_ref = blocks
         model._temporal_chunk_size = temporal_chunk_size
+        model._activation_device = act_device
+        model._use_gpu_activation_buffer = use_gpu_activation_buffer
 
     # Prepare block positions: first (num_blocks - blocks_to_swap) on GPU, rest on CPU
     offloader.prepare_block_devices_before_forward(blocks)
@@ -166,30 +176,45 @@ def enable_block_swap_with_activation_offload(
     def block_swap_process_transformer_blocks_with_activation_offload(self, video, audio, perturbations):
         """Process transformer blocks with block AND activation offloading.
 
-        Uses pinned CPU memory and async CUDA streams for faster transfers.
+        Supports both CPU (pinned memory) and GPU (second device) for activation storage.
+        GPU activation buffer is faster but requires dual GPU setup.
         """
         offloader = self._block_swap_offloader
         blocks = self._blocks_ref
         verbose = getattr(self, '_activation_offload_verbose', False)
         temporal_chunk_size = getattr(self, '_temporal_chunk_size', 0)
         device = offloader.device
+        act_device = getattr(self, '_activation_device', torch.device('cpu'))
+        use_gpu_buffer = getattr(self, '_use_gpu_activation_buffer', False)
 
         # Extract initial activations
         vx_initial = video.x if video is not None and video.x is not None else None
         ax_initial = audio.x if audio is not None and audio.x is not None else None
 
-        # Allocate pinned CPU buffers for faster DMA transfers
+        # Allocate activation buffers on the specified device
         if vx_initial is not None:
-            vx_pinned = torch.empty_like(vx_initial, device='cpu', pin_memory=True)
-            vx_pinned.copy_(vx_initial.cpu() if vx_initial.is_cuda else vx_initial)
+            if use_gpu_buffer:
+                # Fast path: GPU buffer (e.g., cuda:1)
+                vx_buffer = torch.empty_like(vx_initial, device=act_device)
+                vx_buffer.copy_(vx_initial.to(act_device) if vx_initial.device != act_device else vx_initial)
+            else:
+                # Slow path: pinned CPU memory
+                vx_buffer = torch.empty_like(vx_initial, device='cpu', pin_memory=True)
+                vx_buffer.copy_(vx_initial.cpu() if vx_initial.is_cuda else vx_initial)
         else:
-            vx_pinned = None
+            vx_buffer = None
 
         if ax_initial is not None:
-            ax_pinned = torch.empty_like(ax_initial, device='cpu', pin_memory=True)
-            ax_pinned.copy_(ax_initial.cpu() if ax_initial.is_cuda else ax_initial)
+            if use_gpu_buffer:
+                # Fast path: GPU buffer (e.g., cuda:1)
+                ax_buffer = torch.empty_like(ax_initial, device=act_device)
+                ax_buffer.copy_(ax_initial.to(act_device) if ax_initial.device != act_device else ax_initial)
+            else:
+                # Slow path: pinned CPU memory
+                ax_buffer = torch.empty_like(ax_initial, device='cpu', pin_memory=True)
+                ax_buffer.copy_(ax_initial.cpu() if ax_initial.is_cuda else ax_initial)
         else:
-            ax_pinned = None
+            ax_buffer = None
 
         # Create dedicated stream for GPU→CPU transfers (overlaps with compute)
         transfer_stream = torch.cuda.Stream(device=device)
@@ -197,7 +222,7 @@ def enable_block_swap_with_activation_offload(
         if verbose:
             log_memory("Before block loop")
 
-        use_temporal_chunking = temporal_chunk_size > 0 and vx_pinned is not None
+        use_temporal_chunking = temporal_chunk_size > 0 and vx_buffer is not None
 
         if not use_temporal_chunking:
             video_args_gpu = _move_transformer_args_to_device(video, device) if video is not None else None
@@ -221,8 +246,8 @@ def enable_block_swap_with_activation_offload(
                     pending_transfer = False
 
                 # Use temporal chunking - keeps vx/ax on CPU, processes in chunks
-                video_cpu = replace(video, x=vx_pinned) if video is not None else None
-                audio_cpu = replace(audio, x=ax_pinned) if audio is not None else None
+                video_cpu = replace(video, x=vx_buffer) if video is not None else None
+                audio_cpu = replace(audio, x=ax_buffer) if audio is not None else None
 
                 if verbose and block_idx % 10 == 0:
                     log_memory(f"Block {block_idx} (before, chunked)")
@@ -236,11 +261,11 @@ def enable_block_swap_with_activation_offload(
                     device=device,
                 )
 
-                # Copy results to pinned buffers
+                # Copy results to activation buffers
                 if video_out is not None and video_out.x is not None:
-                    vx_pinned.copy_(video_out.x)
+                    vx_buffer.copy_(video_out.x)
                 if audio_out is not None and audio_out.x is not None:
-                    ax_pinned.copy_(audio_out.x)
+                    ax_buffer.copy_(audio_out.x)
 
                 del video_cpu, audio_cpu, video_out, audio_out
             else:
@@ -249,18 +274,18 @@ def enable_block_swap_with_activation_offload(
                     transfer_stream.synchronize()
                     pending_transfer = False
 
-                # Move activations from pinned CPU to GPU
-                if vx_pinned is not None:
-                    vx_gpu = vx_pinned.to(device)
+                # Move activations from buffer to compute device
+                if vx_buffer is not None:
+                    vx_gpu = vx_buffer.to(device, non_blocking=use_gpu_buffer)
                 else:
                     vx_gpu = None
 
-                if ax_pinned is not None:
-                    ax_gpu = ax_pinned.to(device)
+                if ax_buffer is not None:
+                    ax_gpu = ax_buffer.to(device, non_blocking=use_gpu_buffer)
                 else:
                     ax_gpu = None
 
-                # Use pre-moved GPU args and replace x with the pinned activation buffer
+                # Use pre-moved GPU args and replace x with the activation buffer
                 if video_args_gpu is not None:
                     video_gpu = replace(video_args_gpu, x=vx_gpu) if vx_gpu is not None else video_args_gpu
                 else:
@@ -285,11 +310,11 @@ def enable_block_swap_with_activation_offload(
                 vx_result = video_out.x if video_out is not None else None
                 ax_result = audio_out.x if audio_out is not None else None
 
-                # Copy results back to pinned CPU memory
+                # Copy results back to activation buffer
                 if vx_result is not None:
-                    vx_pinned.copy_(vx_result)
+                    vx_buffer.copy_(vx_result, non_blocking=use_gpu_buffer)
                 if ax_result is not None:
-                    ax_pinned.copy_(ax_result)
+                    ax_buffer.copy_(ax_result, non_blocking=use_gpu_buffer)
 
                 # Clean up GPU tensors (can happen while transfer runs)
                 del vx_gpu, ax_gpu, video_gpu, audio_gpu, video_out, audio_out
@@ -311,12 +336,12 @@ def enable_block_swap_with_activation_offload(
             transfer_stream.synchronize()
 
         # Final move back to GPU for output
-        if vx_pinned is not None:
-            vx_final = vx_pinned.to(device)
+        if vx_buffer is not None:
+            vx_final = vx_buffer.to(device)
         else:
             vx_final = None
-        if ax_pinned is not None:
-            ax_final = ax_pinned.to(device)
+        if ax_buffer is not None:
+            ax_final = ax_buffer.to(device)
         else:
             ax_final = None
 
@@ -817,3 +842,65 @@ def offload_all_text_encoder_blocks(text_encoder) -> None:
 
     clean_memory_on_device(device)
     print("[TextEncoderBlockSwap] All layers offloaded to CPU")
+
+
+# =============================================================================
+# Tensor-Parallel FFN for Dual GPU
+# =============================================================================
+
+def enable_tensor_parallel_ffn(
+    model: X0Model | LTXModel,
+    device0: torch.device | str = "cuda:0",
+    device1: torch.device | str = "cuda:1",
+) -> int:
+    """
+    Replace all FFN modules with tensor-parallel versions split across two GPUs.
+
+    This halves the peak memory usage per GPU for FFN operations by splitting
+    the 4x intermediate tensor across both devices. Eliminates the need for
+    FFN chunking on memory-constrained setups.
+
+    Args:
+        model: X0Model (wraps LTXModel) or LTXModel directly.
+        device0: Primary GPU device (keeps first half of FFN weights).
+        device1: Secondary GPU device (keeps second half of FFN weights).
+
+    Returns:
+        Number of FFN modules converted to tensor-parallel.
+    """
+    from ltx_core.model.transformer.feed_forward import TensorParallelFeedForward
+
+    # Get the underlying LTXModel
+    if isinstance(model, X0Model):
+        ltx_model = model.velocity_model
+    else:
+        ltx_model = model
+
+    device0 = torch.device(device0) if isinstance(device0, str) else device0
+    device1 = torch.device(device1) if isinstance(device1, str) else device1
+
+    count = 0
+    for block in ltx_model.transformer_blocks:
+        # Convert video FFN
+        if hasattr(block, 'ff'):
+            block.ff = TensorParallelFeedForward.from_feed_forward(
+                block.ff, device0, device1
+            )
+            count += 1
+        # Convert audio FFN
+        if hasattr(block, 'audio_ff'):
+            block.audio_ff = TensorParallelFeedForward.from_feed_forward(
+                block.audio_ff, device0, device1
+            )
+            count += 1
+
+    print(f"[TensorParallelFFN] Converted {count} FFN modules to tensor-parallel across {device0} and {device1}")
+    return count
+
+
+def disable_tensor_parallel_ffn(model: X0Model | LTXModel) -> None:
+    """
+    This is a placeholder - tensor-parallel FFN cannot be easily reverted
+    since we don't store the original modules. To restore, reload the model.
+    """
+    print("[TensorParallelFFN] Warning: Cannot revert tensor-parallel FFN. Reload model to restore.")
