@@ -119,6 +119,45 @@ class TensorParallelFeedForward(torch.nn.Module):
 
         return output
 
+    def to(self, device=None, dtype=None, non_blocking=False, *args, **kwargs):
+        """
+        Override to() to only move device0 submodules.
+
+        When block swap calls block.to(device), we must NOT move the device1
+        submodules (proj_in_1, proj_out_1) - they need to stay on device1
+        for tensor parallelism to work.
+        """
+        if device is not None:
+            device = torch.device(device) if isinstance(device, str) else device
+            # Only move device0 submodules to the new device
+            self.proj_in_0 = self.proj_in_0.to(device=device, dtype=dtype, non_blocking=non_blocking)
+            self.proj_out_0 = self.proj_out_0.to(device=device, dtype=dtype, non_blocking=non_blocking)
+            self.device0 = device
+            # Keep device1 submodules where they are, but apply dtype if specified
+            if dtype is not None:
+                self.proj_in_1 = self.proj_in_1.to(dtype=dtype, non_blocking=non_blocking)
+                self.proj_out_1 = self.proj_out_1.to(dtype=dtype, non_blocking=non_blocking)
+        elif dtype is not None:
+            # Only dtype change, apply to all
+            self.proj_in_0 = self.proj_in_0.to(dtype=dtype, non_blocking=non_blocking)
+            self.proj_out_0 = self.proj_out_0.to(dtype=dtype, non_blocking=non_blocking)
+            self.proj_in_1 = self.proj_in_1.to(dtype=dtype, non_blocking=non_blocking)
+            self.proj_out_1 = self.proj_out_1.to(dtype=dtype, non_blocking=non_blocking)
+        return self
+
+    def cuda(self, device=None):
+        """Override cuda() to only move device0 submodules."""
+        if device is None:
+            device = self.device0
+        return self.to(device=device)
+
+    def cpu(self):
+        """Override cpu() - moves device0 parts to CPU, keeps device1 on GPU."""
+        self.proj_in_0 = self.proj_in_0.cpu()
+        self.proj_out_0 = self.proj_out_0.cpu()
+        self.device0 = torch.device("cpu")
+        return self
+
     @classmethod
     def from_feed_forward(
         cls,
