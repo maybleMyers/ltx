@@ -2996,7 +2996,7 @@ def create_interface():
                             height = gr.Number(label="Height", value=1024, step=64, info="Must be divisible by 64")
                         with gr.Row():
                             num_frames = gr.Slider(minimum=9, maximum=2001, step=8, value=121, label="Num Frames (8*K+1)", info="e.g., 121 = 5s @ 24fps")
-                            frame_rate = gr.Slider(minimum=12, maximum=60, value=24, step=1, label="Frame Rate")
+                            frame_rate = gr.Slider(minimum=12, maximum=120, value=24, step=1, label="Frame Rate")
                         with gr.Row():
                             cfg_guidance_scale = gr.Slider(minimum=1.0, maximum=15.0, value=4.0, step=0.5, label="CFG Scale")
                             num_inference_steps = gr.Slider(minimum=1, maximum=60, value=40, step=1, label="Inference Steps")
