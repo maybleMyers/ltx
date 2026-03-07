@@ -31,8 +31,8 @@ import torch
 from tqdm import tqdm
 
 # Import LTX-2 components
-from ltx_core.components.diffusion_steps import EulerDiffusionStep
-from ltx_core.components.guiders import CFGGuider, STGGuider, MultiModalGuider, MultiModalGuiderParams
+from ltx_core.components.diffusion_steps import EulerDiffusionStep, Res2sDiffusionStep
+from ltx_core.components.guiders import CFGGuider, CFGStarRescalingGuider, LtxAPGGuider, STGGuider, MultiModalGuider, MultiModalGuiderParams
 from ltx_core.guidance.perturbations import (
     BatchedPerturbationConfig,
     Perturbation,
@@ -43,7 +43,7 @@ from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.components.schedulers import LTX2Scheduler
 from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
-from ltx_core.model.audio_vae import AudioProcessor, decode_audio as vae_decode_audio
+from ltx_core.model.audio_vae import AudioProcessor, decode_audio as vae_decode_audio, encode_audio as vae_encode_audio
 from ltx_core.model.upsampler import upsample_video
 from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
 from ltx_core.model.video_vae import decode_video as vae_decode_video
@@ -77,15 +77,19 @@ from ltx_pipelines.utils.helpers import (
     create_per_step_adain_norm_fn,
     create_per_step_stat_norm_fn,
     denoise_audio_video,
+    denoise_video_only,
     euler_denoising_loop,
     generate_enhanced_prompt,
     get_device,
+    gradient_estimating_euler_denoising_loop,
     guider_denoising_func,
     image_conditionings_by_adding_guiding_latent,
     image_conditionings_by_replacing_latent,
     simple_denoising_func,
 )
-from ltx_pipelines.utils.media_io import decode_audio_from_file, encode_video, load_video_conditioning
+from ltx_pipelines.utils.media_io import decode_audio_from_file, encode_video, get_videostream_metadata, load_video_conditioning
+from ltx_pipelines.utils.samplers import res2s_audio_video_denoising_loop
+from ltx_core.conditioning import VideoConditionByKeyframeIndex, VideoConditionByReferenceLatent, ConditioningItemAttentionStrengthWrapper
 from ltx_pipelines.utils.types import PipelineComponents
 
 
@@ -340,7 +344,7 @@ def get_sampler(sampler_name: str) -> DiffusionStepProtocol:
     Factory function to get the appropriate sampler.
 
     Args:
-        sampler_name: One of "euler", "unipc", "lcm"
+        sampler_name: One of "euler", "unipc", "lcm", "res2s"
 
     Returns:
         Sampler instance implementing DiffusionStepProtocol
@@ -351,8 +355,10 @@ def get_sampler(sampler_name: str) -> DiffusionStepProtocol:
         return UniPCDiffusionStep(solver_order=2, predict_x0=True, solver_type="bh2")
     elif sampler_name == "lcm":
         return LCMDiffusionStep()
+    elif sampler_name == "res2s":
+        return Res2sDiffusionStep()
     else:
-        raise ValueError(f"Unknown sampler: {sampler_name}. Choose from: euler, unipc, lcm")
+        raise ValueError(f"Unknown sampler: {sampler_name}. Choose from: euler, unipc, lcm, res2s")
 
 
 # =============================================================================
@@ -1991,6 +1997,21 @@ class ImageAction(argparse.Action):
         setattr(namespace, self.dest, current)
 
 
+class KeyframeAction(argparse.Action):
+    """Parse keyframe interpolation arguments: PATH FRAME_IDX STRENGTH"""
+    def __call__(self, parser, namespace, values, option_string=None):
+        if len(values) != 3:
+            msg = f"{option_string} requires 3 arguments (PATH FRAME_IDX STRENGTH), got {len(values)}"
+            raise argparse.ArgumentError(self, msg)
+        path, frame_idx, strength_str = values
+        resolved_path = resolve_path(path)
+        frame_idx = int(frame_idx)
+        strength = float(strength_str)
+        current = getattr(namespace, self.dest) or []
+        current.append((resolved_path, frame_idx, strength))
+        setattr(namespace, self.dest, current)
+
+
 class LoraAction(argparse.Action):
     """Parse LoRA arguments: PATH [STRENGTH]"""
     def __call__(self, parser, namespace, values, option_string=None):
@@ -2176,20 +2197,77 @@ def parse_args() -> argparse.Namespace:
         "--sampler",
         type=str,
         default="euler",
-        choices=["euler", "unipc", "lcm"],
+        choices=["euler", "unipc", "lcm", "res2s"],
         help="Sampler to use for stage 1 denoising. 'euler' is the default first-order method. "
              "'unipc' is a higher-order predictor-corrector (good with 10-25 steps). "
              "'lcm' is optimized for few steps (4-8) with distilled models using SGM Uniform schedule. "
+             "'res2s' is a second-order RK sampler (fewer steps needed, 2 NFEs per step). "
              "(default: euler)",
     )
     gen_group.add_argument(
         "--stage2-sampler",
         type=str,
         default="euler",
-        choices=["euler", "unipc", "lcm"],
+        choices=["euler", "unipc", "lcm", "res2s"],
         help="Sampler to use for stage 2/3 denoising. 'euler' is recommended for distilled models "
              "with few steps. If not specified, defaults to 'euler'. Stage 3 inherits this choice. "
              "(default: euler)",
+    )
+    gen_group.add_argument(
+        "--res2s-noise-seed",
+        type=int,
+        default=-1,
+        help="Seed for SDE noise injection in res2s sampler. -1 uses main seed. (default: -1)",
+    )
+    gen_group.add_argument(
+        "--denoising-loop",
+        type=str,
+        default="standard",
+        choices=["standard", "gradient_estimation"],
+        help="Denoising loop type: 'standard' (default) or 'gradient_estimation' "
+             "(velocity correction for fewer steps, 20-30 vs 40).",
+    )
+    gen_group.add_argument(
+        "--ge-gamma",
+        type=float,
+        default=2.0,
+        help="Gradient estimation gamma coefficient (default: 2.0). "
+             "Only used when --denoising-loop is 'gradient_estimation'.",
+    )
+    gen_group.add_argument(
+        "--guider-type",
+        type=str,
+        default="cfg",
+        choices=["cfg", "cfg_star", "apg"],
+        help="Guider type for legacy guidance mode: 'cfg' (standard), "
+             "'cfg_star' (norm-rescaled uncond), 'apg' (adaptive projected). (default: cfg)",
+    )
+    gen_group.add_argument(
+        "--apg-eta",
+        type=float,
+        default=1.0,
+        help="APG parallel component weight (default: 1.0). Only used with --guider-type apg.",
+    )
+    gen_group.add_argument(
+        "--apg-norm-threshold",
+        type=float,
+        default=0.0,
+        help="APG minimum guidance norm threshold (default: 0.0). Only used with --guider-type apg.",
+    )
+    gen_group.add_argument(
+        "--spatial-upscale-factor",
+        type=float,
+        default=2.0,
+        choices=[1.5, 2.0],
+        help="Spatial upscale factor for two-stage pipeline. "
+             "1.5 uses the 1.5x upscaler, 2.0 uses the 2x upscaler. (default: 2.0)",
+    )
+    gen_group.add_argument(
+        "--fast",
+        action="store_true",
+        default=False,
+        help="Fast distilled mode: uses distilled checkpoint with 8+4 steps, no CFG/STG. "
+             "Requires --checkpoint-path pointing to a distilled checkpoint.",
     )
     gen_group.add_argument(
         "--cfg-guidance-scale",
@@ -2455,6 +2533,140 @@ def parse_args() -> argparse.Namespace:
         "--depth-stage2",
         action="store_true",
         help="Also apply depth conditioning to stage 2 refinement (default: stage 1 only).",
+    )
+
+    # ==========================================================================
+    # Keyframe Interpolation
+    # ==========================================================================
+    kf_group = parser.add_argument_group("Keyframe Interpolation")
+    kf_group.add_argument(
+        "--keyframe-interpolation",
+        action="store_true",
+        default=False,
+        help="Enable keyframe interpolation mode. Uses guiding latents instead of replacing latents.",
+    )
+    kf_group.add_argument(
+        "--keyframe",
+        dest="keyframes",
+        action=KeyframeAction,
+        nargs="+",
+        metavar="ARG",
+        default=[],
+        help="Keyframe image: PATH FRAME_IDX STRENGTH. Can be repeated for multiple keyframes.",
+    )
+
+    # ==========================================================================
+    # Retake / Temporal Editing
+    # ==========================================================================
+    retake_group = parser.add_argument_group("Retake / Temporal Editing")
+    retake_group.add_argument(
+        "--retake-video",
+        type=resolve_path,
+        default=None,
+        help="Source video to partially regenerate. Only the specified time region is regenerated.",
+    )
+    retake_group.add_argument(
+        "--retake-start-time",
+        type=float,
+        default=None,
+        help="Start time in seconds for region to regenerate (inclusive).",
+    )
+    retake_group.add_argument(
+        "--retake-end-time",
+        type=float,
+        default=None,
+        help="End time in seconds for region to regenerate (exclusive).",
+    )
+    retake_group.add_argument(
+        "--retake-regenerate-video",
+        action="store_true",
+        default=True,
+        help="Regenerate video in the retake region (default: True).",
+    )
+    retake_group.add_argument(
+        "--retake-no-regenerate-video",
+        dest="retake_regenerate_video",
+        action="store_false",
+        help="Do NOT regenerate video (only regenerate audio in retake region).",
+    )
+    retake_group.add_argument(
+        "--retake-regenerate-audio",
+        action="store_true",
+        default=True,
+        help="Regenerate audio in the retake region (default: True).",
+    )
+    retake_group.add_argument(
+        "--retake-no-regenerate-audio",
+        dest="retake_regenerate_audio",
+        action="store_false",
+        help="Do NOT regenerate audio in retake region.",
+    )
+
+    # ==========================================================================
+    # Enhanced IC-LoRA (Reference Video Conditioning)
+    # ==========================================================================
+    ic_group = parser.add_argument_group("Enhanced IC-LoRA (Reference Video Conditioning)")
+    ic_group.add_argument(
+        "--ic-reference-video",
+        type=resolve_path,
+        default=None,
+        help="Reference video path for IC-LoRA conditioning (e.g., depth map video, edge video).",
+    )
+    ic_group.add_argument(
+        "--ic-reference-strength",
+        type=float,
+        default=1.0,
+        help="Reference video conditioning strength (default: 1.0).",
+    )
+    ic_group.add_argument(
+        "--ic-attention-strength",
+        type=float,
+        default=1.0,
+        help="Attention strength for IC-LoRA reference tokens (0-1, default: 1.0). "
+             "Lower values reduce reference influence.",
+    )
+    ic_group.add_argument(
+        "--ic-skip-stage2",
+        action="store_true",
+        default=False,
+        help="Skip stage 2 for IC-LoRA mode (output at half resolution).",
+    )
+
+    # ==========================================================================
+    # Audio-to-Video (A2V) Mode
+    # ==========================================================================
+    a2v_group = parser.add_argument_group("Audio-to-Video (A2V) Mode")
+    a2v_group.add_argument(
+        "--a2v-mode",
+        action="store_true",
+        default=False,
+        help="Enable audio-to-video mode: generate video conditioned on input audio. "
+             "Audio is encoded and frozen during stage 1 (video-only denoising), "
+             "then stage 2 refines both at full resolution.",
+    )
+    a2v_group.add_argument(
+        "--a2v-audio-path",
+        type=resolve_path,
+        default=None,
+        help="Path to the audio file for A2V conditioning.",
+    )
+    a2v_group.add_argument(
+        "--a2v-audio-start-time",
+        type=float,
+        default=0.0,
+        help="Start time in seconds to read audio from (default: 0.0).",
+    )
+    a2v_group.add_argument(
+        "--a2v-audio-max-duration",
+        type=float,
+        default=None,
+        help="Maximum audio duration in seconds. Defaults to video duration (num_frames / frame_rate).",
+    )
+    a2v_group.add_argument(
+        "--a2v-guidance-scale",
+        type=float,
+        default=1.0,
+        help="Cross-modal (audio-to-video) guidance scale for A2V mode (default: 1.0).",
     )
 
     # ==========================================================================
@@ -3918,6 +4130,25 @@ class LTXVideoGeneratorWithOffloading:
         # Kandinsky scheduler parameters
         kandinsky_scheduler: bool = False,
         kandinsky_scheduler_scale: float = 5.0,
+        # Res2s sampler parameters
+        res2s_noise_seed: int = -1,
+        # Denoising loop selection
+        denoising_loop: str = "standard",
+        ge_gamma: float = 2.0,
+        # Guider type
+        guider_type: str = "cfg",
+        apg_eta: float = 1.0,
+        apg_norm_threshold: float = 0.0,
+        # Spatial upscale factor
+        spatial_upscale_factor: float = 2.0,
+        # Keyframe interpolation
+        keyframe_interpolation: bool = False,
+        keyframes: list[tuple[str, int, float]] | None = None,
+        # IC-LoRA reference video
+        ic_reference_video: str | None = None,
+        ic_reference_strength: float = 1.0,
+        ic_attention_strength: float = 1.0,
+        ic_skip_stage2: bool = False,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor | None, str | None]:
         """
         Generate video with optional audio.
@@ -3934,7 +4165,14 @@ class LTXVideoGeneratorWithOffloading:
         stepper = get_sampler(sampler)
         stage2_stepper = get_sampler(stage2_sampler)
         print(f">>> Using {sampler} sampler (stage 1), {stage2_sampler} sampler (stage 2/3)")
-        cfg_guider = CFGGuider(cfg_guidance_scale)
+        if guider_type == "cfg_star":
+            cfg_guider = CFGStarRescalingGuider(scale=cfg_guidance_scale)
+            print(f">>> Using CFG Star Rescaling guider (scale={cfg_guidance_scale})")
+        elif guider_type == "apg":
+            cfg_guider = LtxAPGGuider(scale=cfg_guidance_scale, eta=apg_eta, norm_threshold=apg_norm_threshold)
+            print(f">>> Using APG guider (scale={cfg_guidance_scale}, eta={apg_eta}, norm_threshold={apg_norm_threshold})")
+        else:
+            cfg_guider = CFGGuider(cfg_guidance_scale)
         # Initialize STG (Spatio-Temporal Guidance) components
         effective_stg_blocks = stg_blocks if stg_blocks is not None else [29]
         stg_guider = STGGuider(stg_scale)
@@ -4318,6 +4556,47 @@ class LTXVideoGeneratorWithOffloading:
             use_stg = stg_guider.enabled() and stg_perturbation_config is not None
             # Convert anchor_decay "none" to None for the denoising loop
             effective_anchor_decay = anchor_decay if anchor_decay and anchor_decay != "none" else None
+            # Helper to select the right denoising loop based on sampler and denoising_loop type
+            def _run_denoising_loop(sigmas, video_state, audio_state, stepper, denoise_fn,
+                                    use_anchor_decay=True, use_callback=True, use_norm=True):
+                _anchor = effective_anchor_decay if use_anchor_decay else None
+                _callback = preview_callback if use_callback else None
+                _cb_interval = preview_callback_interval
+                _norm = latent_norm_fn if use_norm else None
+                if sampler == "res2s":
+                    _noise_seed = res2s_noise_seed if res2s_noise_seed >= 0 else seed
+                    return res2s_audio_video_denoising_loop(
+                        sigmas=sigmas,
+                        video_state=video_state,
+                        audio_state=audio_state,
+                        stepper=stepper,
+                        denoise_fn=denoise_fn,
+                        noise_seed=_noise_seed,
+                    )
+                elif denoising_loop == "gradient_estimation":
+                    return gradient_estimating_euler_denoising_loop(
+                        sigmas=sigmas,
+                        video_state=video_state,
+                        audio_state=audio_state,
+                        stepper=stepper,
+                        denoise_fn=denoise_fn,
+                        ge_gamma=ge_gamma,
+                        anchor_decay=_anchor,
+                        latent_norm_fn=_norm,
+                    )
+                else:
+                    return euler_denoising_loop(
+                        sigmas=sigmas,
+                        video_state=video_state,
+                        audio_state=audio_state,
+                        stepper=stepper,
+                        denoise_fn=denoise_fn,
+                        anchor_decay=_anchor,
+                        callback=_callback,
+                        callback_interval=_cb_interval,
+                        latent_norm_fn=_norm,
+                    )
+
             if use_cfg or use_stg:
                 # CFG+STG guidance (handles both independently)
                 def first_stage_denoising_loop(
@@ -4326,7 +4605,7 @@ class LTXVideoGeneratorWithOffloading:
                     audio_state: LatentState,
                     stepper: DiffusionStepProtocol,
                 ) -> tuple[LatentState, LatentState]:
-                    return euler_denoising_loop(
+                    return _run_denoising_loop(
                         sigmas=sigmas,
                         video_state=video_state,
                         audio_state=audio_state,
@@ -4341,10 +4620,6 @@ class LTXVideoGeneratorWithOffloading:
                             a_context_n=a_context_n,
                             transformer=transformer,
                         ),
-                        anchor_decay=effective_anchor_decay,
-                        callback=preview_callback,
-                        callback_interval=preview_callback_interval,
-                        latent_norm_fn=latent_norm_fn,
                     )
             else:
                 # No guidance, single forward pass
@@ -4354,7 +4629,7 @@ class LTXVideoGeneratorWithOffloading:
                     audio_state: LatentState,
                     stepper: DiffusionStepProtocol,
                 ) -> tuple[LatentState, LatentState]:
-                    return euler_denoising_loop(
+                    return _run_denoising_loop(
                         sigmas=sigmas,
                         video_state=video_state,
                         audio_state=audio_state,
@@ -4364,10 +4639,6 @@ class LTXVideoGeneratorWithOffloading:
                             audio_context=a_context_p,
                             transformer=transformer,
                         ),
-                        anchor_decay=effective_anchor_decay,
-                        callback=preview_callback,
-                        callback_interval=preview_callback_interval,
-                        latent_norm_fn=latent_norm_fn,
                     )
 
             # Stage 1 output shape (half resolution for two-stage, full for one-stage)
@@ -4390,12 +4661,14 @@ class LTXVideoGeneratorWithOffloading:
                     fps=frame_rate,
                 )
             else:
-                # Exponential mode: stage 1 at half resolution
+                # Exponential mode: stage 1 at reduced resolution based on upscale factor
+                stage1_w = (int(width / spatial_upscale_factor) // 32) * 32
+                stage1_h = (int(height / spatial_upscale_factor) // 32) * 32
                 stage_1_output_shape = VideoPixelShape(
                     batch=1,
                     frames=num_frames,
-                    width=width // 2,
-                    height=height // 2,
+                    width=stage1_w,
+                    height=stage1_h,
                     fps=frame_rate,
                 )
 
@@ -4430,6 +4703,61 @@ class LTXVideoGeneratorWithOffloading:
                     )
                     stage_1_conditionings = stage_1_conditionings + anchor_conditionings
                     print(f">>> Added {len(anchor_conditionings)} anchor points at frames {[t[1] for t in anchor_tuples]}")
+
+            # Keyframe interpolation conditioning (guiding latents at specific frames)
+            if keyframe_interpolation and keyframes:
+                print(f">>> Keyframe interpolation: encoding {len(keyframes)} keyframes...")
+                kf_conditionings = image_conditionings_by_adding_guiding_latent(
+                    images=keyframes,
+                    height=stage_1_output_shape.height,
+                    width=stage_1_output_shape.width,
+                    video_encoder=video_encoder,
+                    dtype=dtype,
+                    device=self.device,
+                )
+                stage_1_conditionings = stage_1_conditionings + kf_conditionings
+                print(f">>> Added {len(kf_conditionings)} keyframe conditioning(s) at frames {[kf[1] for kf in keyframes]}")
+
+            # IC-LoRA reference video conditioning
+            if ic_reference_video:
+                print(f">>> IC-LoRA: Loading and encoding reference video...")
+                ref_video_tensor = load_video_conditioning(
+                    video_path=ic_reference_video,
+                    height=stage_1_output_shape.height,
+                    width=stage_1_output_shape.width,
+                    frame_cap=num_frames,
+                    dtype=dtype,
+                    device=self.device,
+                )
+                ref_video_latent = video_encoder(ref_video_tensor)
+                del ref_video_tensor
+
+                # Read downscale factor from LoRA metadata if available
+                ref_downscale = 1
+                for lora in self._stage_1_loras:
+                    try:
+                        from safetensors import safe_open
+                        with safe_open(lora.path, framework="pt") as f:
+                            metadata = f.metadata() or {}
+                            scale = int(metadata.get("reference_downscale_factor", 1))
+                            if scale != 1:
+                                ref_downscale = scale
+                    except Exception:
+                        pass
+
+                ic_cond = VideoConditionByReferenceLatent(
+                    latent=ref_video_latent,
+                    downscale_factor=ref_downscale,
+                    strength=ic_reference_strength,
+                )
+                if ic_attention_strength < 1.0:
+                    ic_cond = ConditioningItemAttentionStrengthWrapper(
+                        conditioning=ic_cond,
+                        attention_mask=ic_attention_strength,
+                    )
+                stage_1_conditionings = stage_1_conditionings + [ic_cond]
+                del ref_video_latent
+                print(f">>> IC-LoRA: Added reference video conditioning (downscale={ref_downscale}, strength={ic_reference_strength}, attention={ic_attention_strength})")
 
             # V2V: Encode input video as initial latent for denoising
             # This allows refine_strength to control how much of the input is preserved
@@ -4913,8 +5241,8 @@ class LTXVideoGeneratorWithOffloading:
             if a_context_n is not None:
                 a_context_n = a_context_n.cpu()
 
-            # For one-stage, skip upsampling and stage 2 refinement
-            if self.one_stage:
+            # For one-stage or IC-LoRA skip-stage2, skip upsampling and stage 2 refinement
+            if self.one_stage or ic_skip_stage2:
                 video_encoder = None
                 cleanup_memory()
 
@@ -6234,6 +6562,14 @@ def generate_svi_multi_clip(
                 # Kandinsky scheduler parameters
                 kandinsky_scheduler=args.kandinsky_scheduler,
                 kandinsky_scheduler_scale=args.kandinsky_scheduler_scale,
+                # New 2.3 features
+                res2s_noise_seed=args.res2s_noise_seed,
+                denoising_loop=args.denoising_loop,
+                ge_gamma=args.ge_gamma,
+                guider_type=args.guider_type,
+                apg_eta=args.apg_eta,
+                apg_norm_threshold=args.apg_norm_threshold,
+                spatial_upscale_factor=args.spatial_upscale_factor,
             )
 
             # Collect video frames from iterator - move to CPU immediately to save GPU memory
@@ -9912,6 +10248,14 @@ def sliding_window_generate(
             # Kandinsky scheduler parameters
             kandinsky_scheduler=args.kandinsky_scheduler,
             kandinsky_scheduler_scale=args.kandinsky_scheduler_scale,
+            # New 2.3 features
+            res2s_noise_seed=args.res2s_noise_seed,
+            denoising_loop=args.denoising_loop,
+            ge_gamma=args.ge_gamma,
+            guider_type=args.guider_type,
+            apg_eta=args.apg_eta,
+            apg_norm_threshold=args.apg_norm_threshold,
+            spatial_upscale_factor=args.spatial_upscale_factor,
         )
 
         # Collect video frames from iterator - move to CPU immediately to save GPU memory
@@ -10043,6 +10387,522 @@ def add_metadata_to_video(video_path: str, parameters: dict) -> None:
 
 
 @torch.inference_mode()
+def generate_retake(
+    generator: "LTXVideoGeneratorWithOffloading",
+    args,
+    video_path: str,
+    start_time: float,
+    end_time: float,
+    regenerate_video: bool = True,
+    regenerate_audio: bool = True,
+    latent_norm_fn: Callable | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Regenerate a specific time region of an existing video (retake mode).
+
+    Follows the generate_av_extension pattern: loads source video, encodes it,
+    creates temporal masks for the retake region, and denoises only that region.
+    """
+    from dataclasses import dataclass as _dataclass
+    from ltx_core.conditioning.item import ConditioningItem
+    from ltx_core.components.patchifiers import get_pixel_coords
+    from ltx_core.tools import LatentTools
+    from ltx_core.types import SpatioTemporalScaleFactors
+
+    @_dataclass(frozen=True)
+    class TemporalRegionMask(ConditioningItem):
+        """Conditioning that sets denoise_mask=0 outside [start_time, end_time] and 1 inside."""
+        start_time: float
+        end_time: float
+        fps: float
+
+        def apply_to(self, latent_state, latent_tools):
+            coords = latent_tools.patchifier.get_patch_grid_bounds(
+                latent_tools.target_shape, device=latent_state.denoise_mask.device
+            )
+            if coords.shape[1] == 1:
+                t_start = coords[:, 0, :, 0]
+                t_end = coords[:, 0, :, 1]
+                in_region = (t_end > self.start_time) & (t_start < self.end_time)
+            else:
+                scale_factors = getattr(latent_tools, "scale_factors", SpatioTemporalScaleFactors.default())
+                pixel_bounds = get_pixel_coords(coords, scale_factors, causal_fix=getattr(latent_tools, "causal_fix", True))
+                timestamp_bounds = pixel_bounds[0, 0] / self.fps
+                t_start, t_end = timestamp_bounds.unbind(dim=-1)
+                in_region = (t_end > self.start_time) & (t_start < self.end_time)
+            state = latent_state.clone()
+            mask_val = in_region.to(state.denoise_mask.dtype)
+            if state.denoise_mask.dim() == 3:
+                mask_val = mask_val.unsqueeze(-1)
+            state.denoise_mask.copy_(mask_val)
+            return state
+
+    device = generator.device
+    dtype = generator.dtype
+
+    # Get source video metadata
+    fps, num_pixel_frames, src_width, src_height = get_videostream_metadata(video_path)
+    print(f">>> Retake: Source video {src_width}x{src_height}, {num_pixel_frames} frames at {fps:.1f}fps")
+    print(f">>> Retake: Regenerating [{start_time:.2f}s - {end_time:.2f}s]")
+
+    output_shape = VideoPixelShape(
+        batch=1,
+        frames=num_pixel_frames,
+        width=src_width,
+        height=src_height,
+        fps=fps,
+    )
+
+    # Encode source video
+    print(">>> Retake: Encoding source video...")
+    video_encoder = generator.stage_1_model_ledger.video_encoder()
+    pixel_video = load_video_conditioning(
+        video_path=video_path,
+        height=src_height,
+        width=src_width,
+        frame_cap=num_pixel_frames,
+        dtype=dtype,
+        device=device,
+    )
+    initial_video_latent = video_encoder(pixel_video)
+    del pixel_video
+
+    # Create temporal region mask for video
+    video_conditionings = [
+        TemporalRegionMask(
+            start_time=start_time if regenerate_video else 0.0,
+            end_time=end_time if regenerate_video else 0.0,
+            fps=fps,
+        )
+    ]
+
+    # Encode source audio
+    initial_audio_latent = None
+    audio_conditionings = []
+    waveform, sample_rate = decode_audio_from_file(video_path, device)
+    if waveform is not None:
+        audio_encoder = generator.stage_1_model_ledger.audio_encoder()
+        from ltx_core.model.audio_vae import AudioProcessor
+        audio_processor = AudioProcessor(
+            sample_rate=audio_encoder.sample_rate,
+            mel_bins=audio_encoder.mel_bins,
+            mel_hop_length=audio_encoder.mel_hop_length,
+            n_fft=audio_encoder.n_fft,
+        ).to(device)
+
+        if waveform.dim() == 3:
+            num_frames_audio, channels, samples_per_frame = waveform.shape
+            waveform = waveform.permute(1, 0, 2).reshape(channels, -1).unsqueeze(0)
+        elif waveform.dim() == 2:
+            waveform = waveform.unsqueeze(0)
+
+        mel_spectrogram = audio_processor.waveform_to_mel(
+            waveform.to(dtype=torch.float32),
+            waveform_sample_rate=sample_rate
+        )
+        initial_audio_latent = audio_encoder.encode(mel_spectrogram.to(dtype=dtype)).mode()
+        del audio_encoder, audio_processor
+
+        audio_conditionings = [
+            TemporalRegionMask(
+                start_time=start_time if regenerate_audio else 0.0,
+                end_time=end_time if regenerate_audio else 0.0,
+                fps=fps,
+            )
+        ]
+
+    del video_encoder
+    cleanup_memory()
+
+    # Text encoding
+    print(">>> Retake: Encoding text...")
+    text_encoder = generator.stage_1_model_ledger.text_encoder()
+    from ltx_core.text_encoders.gemma import encode_text as gemma_encode_text
+
+    cfg_scale = args.cfg_guidance_scale
+    if cfg_scale > 1.0:
+        context_p, context_n = gemma_encode_text(text_encoder, prompts=[args.prompt, args.negative_prompt])
+        v_context_p, a_context_p = context_p
+        v_context_n, a_context_n = context_n
+    else:
+        context_p = gemma_encode_text(text_encoder, prompts=[args.prompt])[0]
+        v_context_p, a_context_p = context_p
+        v_context_n, a_context_n = None, None
+
+    del text_encoder
+    cleanup_memory()
+
+    # Load transformer
+    print(">>> Retake: Loading transformer...")
+    transformer = generator.stage_1_model_ledger.transformer()
+
+    # Set up scheduler
+    scheduler = LTX2Scheduler()
+    sigmas = scheduler.execute(steps=args.num_inference_steps).to(dtype=torch.float32, device=device)
+
+    # Set up denoising function
+    noiser = GaussianNoiser(generator=torch.Generator(device=device).manual_seed(args.seed))
+    stepper = get_sampler(args.sampler)
+
+    use_cfg = cfg_scale > 1.0 and v_context_n is not None
+    if use_cfg:
+        cfg_guider = CFGGuider(cfg_scale)
+        stg_guider = STGGuider(args.stg_scale)
+        stg_perturbation_config = build_stg_perturbation_config(
+            stg_scale=args.stg_scale,
+            stg_blocks=args.stg_blocks,
+            stg_mode=args.stg_mode,
+        )
+        denoise_fn = cfg_stg_denoising_func(
+            cfg_guider=cfg_guider,
+            stg_guider=stg_guider,
+            stg_perturbation_config=stg_perturbation_config,
+            v_context_p=v_context_p,
+            v_context_n=v_context_n,
+            a_context_p=a_context_p,
+            a_context_n=a_context_n,
+            transformer=transformer,
+        )
+    else:
+        denoise_fn = simple_denoising_func(
+            video_context=v_context_p,
+            audio_context=a_context_p,
+            transformer=transformer,
+        )
+
+    # Build noised states with temporal masks
+    from ltx_pipelines.utils.helpers import noise_video_state, noise_audio_state
+    from ltx_pipelines.utils.types import PipelineComponents
+
+    pipeline_components = PipelineComponents(dtype=dtype, device=device)
+
+    video_state, video_tools = noise_video_state(
+        output_shape=output_shape,
+        noiser=noiser,
+        conditionings=video_conditionings,
+        components=pipeline_components,
+        dtype=dtype,
+        device=device,
+        initial_latent=initial_video_latent,
+    )
+    audio_state, audio_tools = noise_audio_state(
+        output_shape=output_shape,
+        noiser=noiser,
+        conditionings=audio_conditionings,
+        components=pipeline_components,
+        dtype=dtype,
+        device=device,
+        initial_latent=initial_audio_latent,
+    )
+
+    # Run denoising loop
+    print(">>> Retake: Denoising...")
+    video_state, audio_state = euler_denoising_loop(
+        sigmas=sigmas,
+        video_state=video_state,
+        audio_state=audio_state,
+        stepper=stepper,
+        denoise_fn=denoise_fn,
+    )
+
+    video_state = video_tools.clear_conditioning(video_state)
+    video_state = video_tools.unpatchify(video_state)
+    audio_state = audio_tools.clear_conditioning(audio_state)
+    audio_state = audio_tools.unpatchify(audio_state)
+
+    del transformer
+    cleanup_memory()
+
+    # Decode video
+    print(">>> Retake: Decoding video...")
+    from ltx_core.model.video_vae import decode_video as vae_decode_video_fn
+    from ltx_core.model.audio_vae import decode_audio as vae_decode_audio_fn
+
+    tiling_config = TilingConfig.default()
+    decode_gen = torch.Generator(device=device).manual_seed(args.seed)
+    decoded_video = vae_decode_video_fn(
+        video_state.latent, generator.stage_1_model_ledger.video_decoder(), tiling_config, decode_gen
+    )
+
+    # Decode audio
+    decoded_audio = None
+    if audio_state.latent is not None:
+        decoded_audio = vae_decode_audio_fn(
+            audio_state.latent,
+            generator.stage_1_model_ledger.audio_decoder(),
+            generator.stage_1_model_ledger.vocoder(),
+        )
+
+    # Collect decoded video frames
+    video_frames = []
+    for chunk in decoded_video:
+        video_frames.append(chunk)
+    video_tensor = torch.cat(video_frames, dim=0) if len(video_frames) > 1 else video_frames[0]
+
+    return video_tensor, decoded_audio
+
+
+def generate_a2v(
+    generator: "LTXVideoGeneratorWithOffloading",
+    args,
+    audio_path: str,
+    audio_start_time: float = 0.0,
+    audio_max_duration: float | None = None,
+    a2v_guidance_scale: float = 1.0,
+    latent_norm_fn: Callable | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Audio-to-video generation: generate video conditioned on input audio.
+
+    Stage 1: Audio is encoded and frozen (denoise_mask=0), only video is denoised.
+    Stage 2: Upsamples video, refines both video and audio at full resolution.
+    Returns original audio (not VAE-decoded) for fidelity.
+    """
+    from ltx_core.types import AudioLatentShape
+    from ltx_core.model.video_vae import decode_video as vae_decode_video_fn
+
+    device = generator.device
+    dtype = generator.dtype
+
+    height = args.height
+    width = args.width
+    num_frames = args.num_frames
+    frame_rate = args.frame_rate
+    spatial_upscale_factor = getattr(args, 'spatial_upscale_factor', 2.0)
+
+    assert_resolution(height=height, width=width, is_two_stage=True)
+
+    # Compute audio duration
+    if audio_max_duration is None:
+        audio_max_duration = num_frames / frame_rate
+
+    # Encode audio
+    print(">>> A2V: Loading and encoding audio...")
+    waveform, sample_rate = decode_audio_from_file(audio_path, device)
+    if waveform is None:
+        raise ValueError(f"No audio stream found in {audio_path}")
+
+    # Ensure batch dimension: (batch, channels, samples)
+    if waveform.dim() == 3:
+        # (frames, channels, samples_per_frame) -> (1, channels, total_samples)
+        num_audio_frames, channels, samples_per_frame = waveform.shape
+        waveform = waveform.permute(1, 0, 2).reshape(channels, -1).unsqueeze(0)
+    elif waveform.dim() == 2:
+        waveform = waveform.unsqueeze(0)
+
+    # Trim audio to max duration
+    max_samples = int(audio_max_duration * sample_rate)
+    start_sample = int(audio_start_time * sample_rate)
+    waveform = waveform[:, :, start_sample:start_sample + max_samples]
+
+    audio_encoder = generator.stage_1_model_ledger.audio_encoder()
+    encoded_audio_latent = vae_encode_audio(
+        waveform=waveform,
+        sample_rate=sample_rate,
+        audio_encoder=audio_encoder,
+    )
+
+    # Trim encoded audio to expected shape
+    audio_shape = AudioLatentShape.from_duration(
+        batch=1, duration=num_frames / frame_rate, channels=8, mel_bins=16
+    )
+    encoded_audio_latent = encoded_audio_latent[:, :, :audio_shape.frames]
+    print(f">>> A2V: Audio encoded, latent shape: {encoded_audio_latent.shape}")
+    del audio_encoder
+
+    # Stage 1: Video-only denoising at reduced resolution
+    stage1_w = (int(width / spatial_upscale_factor) // 32) * 32
+    stage1_h = (int(height / spatial_upscale_factor) // 32) * 32
+    stage_1_output_shape = VideoPixelShape(
+        batch=1, frames=num_frames, width=stage1_w, height=stage1_h, fps=frame_rate
+    )
+    print(f">>> A2V Stage 1: {stage1_w}x{stage1_h}, {num_frames} frames")
+
+    # Encode image conditionings
+    video_encoder = generator.stage_1_model_ledger.video_encoder()
+    stage_1_conditionings = []
+    if args.images:
+        stage_1_conditionings = image_conditionings_by_replacing_latent(
+            images=args.images,
+            height=stage1_h,
+            width=stage1_w,
+            video_encoder=video_encoder,
+            dtype=dtype,
+            device=device,
+        )
+    torch.cuda.synchronize()
+    del video_encoder
+    cleanup_memory()
+
+    # Text encoding
+    print(">>> A2V: Encoding text...")
+    text_encoder = generator.stage_1_model_ledger.text_encoder()
+    from ltx_core.text_encoders.gemma import encode_text as gemma_encode_text
+
+    cfg_scale = args.cfg_guidance_scale
+    stg_scale = args.stg_scale
+    if cfg_scale > 1.0 or stg_scale > 0:
+        context_p, context_n = gemma_encode_text(text_encoder, prompts=[args.prompt, args.negative_prompt])
+        v_context_p, a_context_p = context_p
+        v_context_n, a_context_n = context_n
+    else:
+        context_p = gemma_encode_text(text_encoder, prompts=[args.prompt])[0]
+        v_context_p, a_context_p = context_p
+        v_context_n, a_context_n = None, None
+
+    del text_encoder
+    cleanup_memory()
+
+    # Load transformer and set up denoising
+    print(">>> A2V Stage 1: Loading transformer...")
+    transformer = generator.stage_1_model_ledger.transformer()
+    scheduler = LTX2Scheduler()
+    sigmas = scheduler.execute(steps=args.num_inference_steps).to(dtype=torch.float32, device=device)
+    noiser = GaussianNoiser(generator=torch.Generator(device=device).manual_seed(args.seed))
+    stepper = get_sampler(getattr(args, 'sampler', 'euler'))
+
+    # Build guider for video, no-op guider for audio
+    video_guider_params = MultiModalGuiderParams(
+        cfg_scale=cfg_scale,
+        stg_scale=stg_scale,
+        modality_scale=a2v_guidance_scale,
+        stg_blocks=args.stg_blocks if stg_scale > 0 else [],
+    )
+    video_guider = MultiModalGuider(
+        params=video_guider_params,
+        negative_context=v_context_n,
+    )
+    audio_guider = MultiModalGuider(
+        params=MultiModalGuiderParams(),
+    )
+
+    # Build denoising loop function
+    denoise_fn = multi_modal_guider_denoising_func(
+        video_guider=video_guider,
+        audio_guider=audio_guider,
+        v_context_p=v_context_p,
+        a_context_p=a_context_p,
+        transformer=transformer,
+    )
+
+    from ltx_pipelines.utils.types import PipelineComponents
+    pipeline_components = PipelineComponents(dtype=dtype, device=device)
+
+    def stage1_denoising_loop(sigmas, video_state, audio_state, stepper):
+        return euler_denoising_loop(
+            sigmas=sigmas,
+            video_state=video_state,
+            audio_state=audio_state,
+            stepper=stepper,
+            denoise_fn=denoise_fn,
+        )
+
+    print(">>> A2V Stage 1: Denoising video (audio frozen)...")
+    video_state = denoise_video_only(
+        output_shape=stage_1_output_shape,
+        conditionings=stage_1_conditionings,
+        noiser=noiser,
+        sigmas=sigmas,
+        stepper=stepper,
+        denoising_loop_fn=stage1_denoising_loop,
+        components=pipeline_components,
+        dtype=dtype,
+        device=device,
+        initial_audio_latent=encoded_audio_latent,
+    )
+
+    torch.cuda.synchronize()
+    del transformer
+    cleanup_memory()
+
+    # Stage 2: Upsample and refine
+    if not generator.one_stage:
+        print(">>> A2V Stage 2: Upsampling and refining...")
+        video_encoder = generator.stage_1_model_ledger.video_encoder()
+        upscaled_video_latent = upsample_video(
+            latent=video_state.latent[:1],
+            video_encoder=video_encoder,
+            upsampler=generator.stage_2_model_ledger.spatial_upsampler(),
+        )
+
+        stage_2_output_shape = VideoPixelShape(
+            batch=1, frames=num_frames, width=width, height=height, fps=frame_rate
+        )
+
+        # Re-encode images for stage 2 resolution
+        stage_2_conditionings = []
+        if args.images:
+            stage_2_conditionings = image_conditionings_by_replacing_latent(
+                images=args.images,
+                height=height,
+                width=width,
+                video_encoder=video_encoder,
+                dtype=dtype,
+                device=device,
+            )
+
+        del video_encoder
+        torch.cuda.synchronize()
+        cleanup_memory()
+
+        # Stage 2 uses distilled sigmas
+        transformer = generator.stage_2_model_ledger.transformer()
+        distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(device)
+
+        stage2_denoise_fn = simple_denoising_func(
+            video_context=v_context_p,
+            audio_context=a_context_p,
+            transformer=transformer,
+        )
+
+        def stage2_denoising_loop(sigmas, video_state, audio_state, stepper):
+            return euler_denoising_loop(
+                sigmas=sigmas,
+                video_state=video_state,
+                audio_state=audio_state,
+                stepper=stepper,
+                denoise_fn=stage2_denoise_fn,
+            )
+
+        video_state = denoise_video_only(
+            output_shape=stage_2_output_shape,
+            conditionings=stage_2_conditionings,
+            noiser=noiser,
+            sigmas=distilled_sigmas,
+            stepper=stepper,
+            denoising_loop_fn=stage2_denoising_loop,
+            components=pipeline_components,
+            dtype=dtype,
+            device=device,
+            noise_scale=distilled_sigmas[0],
+            initial_video_latent=upscaled_video_latent,
+            initial_audio_latent=encoded_audio_latent,
+        )
+
+        torch.cuda.synchronize()
+        del transformer
+        cleanup_memory()
+
+    # Decode video
+    print(">>> A2V: Decoding video...")
+    tiling_config = TilingConfig.default()
+    decode_gen = torch.Generator(device=device).manual_seed(args.seed)
+
+    video_decoder = generator.stage_2_model_ledger.video_decoder() if not generator.one_stage else generator.stage_1_model_ledger.video_decoder()
+    decoded_video = vae_decode_video_fn(video_state.latent, video_decoder, tiling_config, decode_gen)
+
+    video_frames = []
+    for chunk in decoded_video:
+        video_frames.append(chunk)
+    video_tensor = torch.cat(video_frames, dim=0) if len(video_frames) > 1 else video_frames[0]
+
+    # Return original audio for fidelity (not VAE-decoded)
+    # Trim waveform to match video duration
+    target_samples = int((num_frames / frame_rate) * sample_rate)
+    original_audio = waveform[:, :, :target_samples].squeeze(0)  # (channels, samples)
+
+    return video_tensor, original_audio
+
+
+@torch.inference_mode()
 def main():
     """Main entry point for LTX-2 video generation."""
     args = parse_args()
@@ -10058,6 +10918,35 @@ def main():
         if args.refine_only:
             print("Error: --v2a-mode cannot be combined with --refine-only")
             sys.exit(1)
+
+    # Fast mode: override settings for distilled pipeline
+    if args.fast:
+        print("=" * 60)
+        print(">>> FAST MODE: Using distilled pipeline settings")
+        print("=" * 60)
+        args.distilled_checkpoint = True
+        args.cfg_guidance_scale = 1.0
+        args.stg_scale = 0.0
+        args.num_inference_steps = 8
+        args.distilled_lora = []  # Distilled checkpoint doesn't need LoRA
+
+    # Retake mode validation
+    if args.retake_video:
+        if args.retake_start_time is None or args.retake_end_time is None:
+            print("Error: --retake-video requires both --retake-start-time and --retake-end-time")
+            sys.exit(1)
+        if args.retake_start_time >= args.retake_end_time:
+            print("Error: --retake-start-time must be less than --retake-end-time")
+            sys.exit(1)
+
+    # A2V mode validation
+    if args.a2v_mode:
+        if not args.a2v_audio_path:
+            print("Error: --a2v-mode requires --a2v-audio-path")
+            sys.exit(1)
+        if args.disable_audio:
+            print(">>> Warning: --disable-audio is ignored in A2V mode")
+            args.disable_audio = False
 
     # Preprocess V2V join videos to ensure audio is at 24000Hz
     temp_audio_converted_files = preprocess_v2v_join_videos(args)
@@ -10137,6 +11026,34 @@ def main():
         print(f"  Extension Steps: {args.av_extend_steps}")
         print(f"  Terminal Sigma: {args.av_extend_terminal}")
         print(f"  Skip Stage 2: {args.av_no_stage2}")
+    # Retake mode info
+    if args.retake_video:
+        print(f"Retake Mode: Temporal Editing")
+        print(f"  Source: {args.retake_video}")
+        print(f"  Region: [{args.retake_start_time:.2f}s - {args.retake_end_time:.2f}s]")
+        print(f"  Regenerate Video: {args.retake_regenerate_video}")
+        print(f"  Regenerate Audio: {args.retake_regenerate_audio}")
+    # A2V mode info
+    if args.a2v_mode:
+        print(f"A2V Mode: Audio-to-Video (encode audio, generate video)")
+        print(f"  Audio: {args.a2v_audio_path}")
+        print(f"  Start Time: {args.a2v_audio_start_time}s")
+        a2v_dur = args.a2v_audio_max_duration if args.a2v_audio_max_duration else args.num_frames / args.frame_rate
+        print(f"  Max Duration: {a2v_dur:.1f}s")
+        print(f"  A2V Guidance: {args.a2v_guidance_scale}")
+    # New feature info
+    if args.sampler != "euler":
+        print(f"Sampler: {args.sampler}")
+    if args.denoising_loop != "standard":
+        print(f"Denoising Loop: {args.denoising_loop} (gamma={args.ge_gamma})")
+    if args.guider_type != "cfg":
+        print(f"Guider: {args.guider_type}")
+    if args.spatial_upscale_factor != 2.0:
+        print(f"Spatial Upscale: {args.spatial_upscale_factor}x")
+    if args.keyframe_interpolation:
+        print(f"Keyframe Interpolation: {len(args.keyframes)} keyframe(s)")
+    if args.ic_reference_video:
+        print(f"IC-LoRA Reference: {args.ic_reference_video} (strength={args.ic_reference_strength})")
     print("=" * 60)
     print(f"Prompt: {args.prompt}")
     print("=" * 60)
@@ -10217,8 +11134,57 @@ def main():
     # Track enhanced prompt for metadata (only set in regular generation mode)
     enhanced_prompt = None
 
-    # Branch between sliding window, SVI Pro mode, and regular mode
-    if use_sliding_window:
+    # Branch between a2v, retake, sliding window, SVI Pro mode, and regular mode
+    if args.a2v_mode:
+        # A2V mode: generate video conditioned on input audio
+        print("=" * 60)
+        print(">>> Using A2V mode (audio-to-video generation)")
+        print("=" * 60)
+
+        video_tensor, audio = generate_a2v(
+            generator=generator,
+            args=args,
+            audio_path=args.a2v_audio_path,
+            audio_start_time=args.a2v_audio_start_time,
+            audio_max_duration=args.a2v_audio_max_duration
+            if args.a2v_audio_max_duration is not None
+            else args.num_frames / args.frame_rate,
+            a2v_guidance_scale=args.a2v_guidance_scale,
+            latent_norm_fn=latent_norm_fn,
+        )
+
+        def tensor_to_iterator(tensor):
+            yield tensor
+
+        video = tensor_to_iterator(video_tensor)
+        total_frames = video_tensor.shape[0]
+        video_chunks_number = get_video_chunks_number(total_frames, tiling_config)
+
+    elif args.retake_video:
+        # Retake mode: regenerate a time region of an existing video
+        print("=" * 60)
+        print(">>> Using Retake mode (temporal region editing)")
+        print("=" * 60)
+
+        video_tensor, audio = generate_retake(
+            generator=generator,
+            args=args,
+            video_path=args.retake_video,
+            start_time=args.retake_start_time,
+            end_time=args.retake_end_time,
+            regenerate_video=args.retake_regenerate_video,
+            regenerate_audio=args.retake_regenerate_audio,
+            latent_norm_fn=latent_norm_fn,
+        )
+
+        def tensor_to_iterator(tensor):
+            yield tensor
+
+        video = tensor_to_iterator(video_tensor)
+        total_frames = video_tensor.shape[0]
+        video_chunks_number = get_video_chunks_number(total_frames, tiling_config)
+
+    elif use_sliding_window:
         # Sliding window mode for long videos
         print("=" * 60)
         print(f">>> Using Sliding Window mode: {args.num_frames} frames > {args.sliding_window_size} window size")
@@ -10374,8 +11340,9 @@ def main():
                 lw = args.width // 32
             else:
                 lf = (args.num_frames - 1) // 8 + 1
-                lh = (args.height // 2) // 32
-                lw = (args.width // 2) // 32
+                _sf = args.spatial_upscale_factor
+                lh = (int(args.height / _sf) // 32) * 32 // 32
+                lw = (int(args.width / _sf) // 32) * 32 // 32
 
             preview_callback = create_preview_callback(
                 preview_dir=args.preview_dir,
@@ -10438,13 +11405,64 @@ def main():
             stage3_steps=args.stage3_steps,
             kandinsky_scheduler=args.kandinsky_scheduler,
             kandinsky_scheduler_scale=args.kandinsky_scheduler_scale,
+            res2s_noise_seed=args.res2s_noise_seed,
+            denoising_loop=args.denoising_loop,
+            ge_gamma=args.ge_gamma,
+            guider_type=args.guider_type,
+            apg_eta=args.apg_eta,
+            apg_norm_threshold=args.apg_norm_threshold,
+            spatial_upscale_factor=args.spatial_upscale_factor,
+            keyframe_interpolation=args.keyframe_interpolation,
+            keyframes=args.keyframes,
+            ic_reference_video=args.ic_reference_video,
+            ic_reference_strength=args.ic_reference_strength,
+            ic_attention_strength=args.ic_attention_strength,
+            ic_skip_stage2=args.ic_skip_stage2,
         )
 
     # Encode and save video
     print(f">>> Encoding video to {args.output_path}...")
     encode_start = time.time()
 
-    if args.v2a_mode and args.input_video:
+    if args.a2v_mode:
+        import subprocess
+        import tempfile
+        import os
+
+        print(">>> A2V Mode: Encoding video and muxing with original audio...")
+
+        # First encode video without audio to a temp file
+        temp_video = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
+        temp_video_path = temp_video.name
+        temp_video.close()
+
+        encode_video(
+            video=video,
+            fps=args.frame_rate,
+            audio=None,
+            audio_sample_rate=None,
+            output_path=temp_video_path,
+            video_chunks_number=video_chunks_number,
+        )
+
+        # Use ffmpeg to combine generated video with original audio
+        subprocess.run([
+            'ffmpeg', '-y',
+            '-i', temp_video_path,
+            '-i', args.a2v_audio_path,
+            '-c:v', 'copy',
+            '-c:a', 'aac',
+            '-map', '0:v:0',
+            '-map', '1:a:0',
+            '-ss', str(args.a2v_audio_start_time),
+            '-t', str(args.a2v_audio_max_duration if args.a2v_audio_max_duration else args.num_frames / args.frame_rate),
+            '-shortest',
+            args.output_path
+        ], check=True)
+
+        os.unlink(temp_video_path)
+
+    elif args.v2a_mode and args.input_video:
         import subprocess
         import tempfile
         import os

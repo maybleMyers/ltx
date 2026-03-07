@@ -1632,6 +1632,43 @@ def generate_ltx_video(
     v2v_join_transition_time: float,
     v2v_join_steps: int,
     v2v_join_terminal: float,
+    # Advanced Generation (2.3 Features)
+    guider_type: str,
+    denoising_loop: str,
+    spatial_upscale_factor: str,
+    apg_eta: float,
+    apg_norm_threshold: float,
+    ge_gamma: float,
+    res2s_noise_seed: int,
+    fast_mode: bool,
+    # Keyframe Interpolation
+    keyframe_interpolation: bool,
+    keyframe_image_1: str,
+    keyframe_frame_1: int,
+    keyframe_strength_1: float,
+    keyframe_image_2: str,
+    keyframe_frame_2: int,
+    keyframe_strength_2: float,
+    keyframe_image_3: str,
+    keyframe_frame_3: int,
+    keyframe_strength_3: float,
+    # IC-LoRA Reference Video
+    ic_reference_video: str,
+    ic_reference_strength: float,
+    ic_attention_strength: float,
+    ic_skip_stage2: bool,
+    # Retake (Temporal Editing)
+    retake_video: str,
+    retake_start_time: float,
+    retake_end_time: float,
+    retake_regenerate_video: bool,
+    retake_regenerate_audio: bool,
+    # A2V Mode (Audio-to-Video)
+    a2v_mode: bool,
+    a2v_audio_input: str,
+    a2v_audio_start_time: float,
+    a2v_audio_max_duration: float,
+    a2v_guidance_scale_input: float,
 ) -> Generator[Tuple[List[Tuple[str, str]], Optional[str], str, str], None, None]:
     """
     Generate video using LTX-2 pipeline.
@@ -1877,6 +1914,63 @@ def generate_ltx_video(
             command.extend(["--v2v-join-transition-time", str(float(v2v_join_transition_time))])
             command.extend(["--v2v-join-steps", str(int(v2v_join_steps))])
             command.extend(["--v2v-join-terminal", str(float(v2v_join_terminal))])
+
+        # Advanced Generation (2.3 Features)
+        if guider_type and guider_type != "cfg":
+            command.extend(["--guider-type", str(guider_type)])
+            if guider_type == "apg":
+                command.extend(["--apg-eta", str(float(apg_eta))])
+                command.extend(["--apg-norm-threshold", str(float(apg_norm_threshold))])
+        if denoising_loop and denoising_loop != "standard":
+            command.extend(["--denoising-loop", str(denoising_loop)])
+            command.extend(["--ge-gamma", str(float(ge_gamma))])
+        if spatial_upscale_factor and str(spatial_upscale_factor) != "2.0":
+            command.extend(["--spatial-upscale-factor", str(spatial_upscale_factor)])
+        if res2s_noise_seed and int(res2s_noise_seed) >= 0:
+            command.extend(["--res2s-noise-seed", str(int(res2s_noise_seed))])
+        if fast_mode:
+            command.append("--fast")
+
+        # Keyframe Interpolation
+        if keyframe_interpolation:
+            command.append("--keyframe-interpolation")
+            keyframes = [
+                (keyframe_image_1, keyframe_frame_1, keyframe_strength_1),
+                (keyframe_image_2, keyframe_frame_2, keyframe_strength_2),
+                (keyframe_image_3, keyframe_frame_3, keyframe_strength_3),
+            ]
+            for kf_img, kf_frame, kf_str in keyframes:
+                if kf_img and os.path.exists(kf_img):
+                    command.extend(["--keyframe", str(kf_img), str(int(kf_frame)), str(float(kf_str))])
+
+        # IC-LoRA Reference Video
+        if ic_reference_video and os.path.exists(ic_reference_video):
+            command.extend(["--ic-reference-video", str(ic_reference_video)])
+            command.extend(["--ic-reference-strength", str(float(ic_reference_strength))])
+            command.extend(["--ic-attention-strength", str(float(ic_attention_strength))])
+            if ic_skip_stage2:
+                command.append("--ic-skip-stage2")
+
+        # Retake (Temporal Editing)
+        if retake_video and os.path.exists(retake_video):
+            command.extend(["--retake-video", str(retake_video)])
+            command.extend(["--retake-start-time", str(float(retake_start_time))])
+            command.extend(["--retake-end-time", str(float(retake_end_time))])
+            if not retake_regenerate_video:
+                command.append("--retake-no-regenerate-video")
+            if not retake_regenerate_audio:
+                command.append("--retake-no-regenerate-audio")
+
+        # A2V Mode (Audio-to-Video)
+        if a2v_mode:
+            command.append("--a2v-mode")
+            if a2v_audio_input and os.path.exists(a2v_audio_input):
+                command.extend(["--a2v-audio-path", str(a2v_audio_input)])
+            if a2v_audio_start_time and float(a2v_audio_start_time) > 0:
+                command.extend(["--a2v-audio-start-time", str(float(a2v_audio_start_time))])
+            if a2v_audio_max_duration and float(a2v_audio_max_duration) > 0:
+                command.extend(["--a2v-audio-max-duration", str(float(a2v_audio_max_duration))])
+            command.extend(["--a2v-guidance-scale", str(float(a2v_guidance_scale_input))])
 
         # User LoRAs - apply to selected stage(s)
         lora_configs = [
@@ -2963,13 +3057,13 @@ def create_interface():
                             )
                             sampler = gr.Dropdown(
                                 label="Sampler (Stage 1)",
-                                choices=["euler", "unipc", "lcm"],
+                                choices=["euler", "unipc", "lcm", "res2s"],
                                 value="euler",
-                                info="euler = default, unipc = higher-order (10-25 steps), lcm = fast (4-8 steps)"
+                                info="euler = default, unipc = higher-order, lcm = fast, res2s = 2nd-order (15 steps ≈ 30 euler)"
                             )
                             stage2_sampler = gr.Dropdown(
                                 label="Sampler (Stage 2/3)",
-                                choices=["euler", "unipc", "lcm"],
+                                choices=["euler", "unipc", "lcm", "res2s"],
                                 value="euler",
                                 info="euler recommended for distilled models with few steps"
                             )
@@ -3005,6 +3099,55 @@ def create_interface():
                             stg_scale = gr.Slider(minimum=0.0, maximum=2.0, value=0.0, step=0.1, label="STG Scale", info="Spatio-temporal guidance scale (0=disabled)")
                             stg_blocks = gr.Textbox(label="STG Blocks", value="29", info="Comma-separated block indices, e.g., 29 or 20,21,22")
                             stg_mode = gr.Dropdown(label="STG Mode", choices=["stg_av", "stg_v"], value="stg_av", info="stg_av=audio+video, stg_v=video only")
+
+                        # Advanced Generation Features (2.3)
+                        with gr.Accordion("Advanced Generation (2.3 Features)", open=False):
+                            with gr.Row():
+                                guider_type = gr.Dropdown(
+                                    label="Guider Type",
+                                    choices=["cfg", "cfg_star", "apg"],
+                                    value="cfg",
+                                    info="cfg = standard, cfg_star = norm-rescaled, apg = adaptive projected"
+                                )
+                                denoising_loop = gr.Dropdown(
+                                    label="Denoising Loop",
+                                    choices=["standard", "gradient_estimation"],
+                                    value="standard",
+                                    info="gradient_estimation = velocity correction (use ~25 steps)"
+                                )
+                                spatial_upscale_factor = gr.Dropdown(
+                                    label="Spatial Upscale Factor",
+                                    choices=["2.0", "1.5"],
+                                    value="2.0",
+                                    info="Stage 1→Stage 2 upscale ratio"
+                                )
+                            with gr.Row():
+                                apg_eta = gr.Slider(
+                                    minimum=0.0, maximum=2.0, value=1.0, step=0.1,
+                                    label="APG Eta",
+                                    info="Parallel component weight (APG guider only)"
+                                )
+                                apg_norm_threshold = gr.Slider(
+                                    minimum=0.0, maximum=5.0, value=0.0, step=0.1,
+                                    label="APG Norm Threshold",
+                                    info="Minimum guidance norm (APG guider only)"
+                                )
+                                ge_gamma = gr.Slider(
+                                    minimum=0.0, maximum=5.0, value=2.0, step=0.1,
+                                    label="GE Gamma",
+                                    info="Gradient estimation gamma (gradient_estimation loop only)"
+                                )
+                            with gr.Row():
+                                res2s_noise_seed = gr.Number(
+                                    label="Res2s Noise Seed",
+                                    value=-1,
+                                    info="SDE noise seed for res2s sampler (-1 = no noise)"
+                                )
+                                fast_mode = gr.Checkbox(
+                                    label="Fast Mode (Distilled)",
+                                    value=False,
+                                    info="8 steps, no CFG/STG — requires distilled checkpoint"
+                                )
 
                         # Advanced CFG (MultiModal Guidance)
                         with gr.Accordion("Advanced CFG (MultiModal Guidance)", open=False):
@@ -3657,6 +3800,116 @@ def create_interface():
                                     minimum=0.0, maximum=1.0, value=0.1, step=0.05,
                                     label="Terminal Sigma",
                                     info="Terminal sigma for partial denoising (lower = smoother)"
+                                )
+
+                        # Keyframe Interpolation
+                        with gr.Accordion("Keyframe Interpolation", open=False):
+                            gr.Markdown("""
+                            **Add keyframe images at specific frame indices to guide video generation.**
+                            Unlike I2V conditioning (which replaces latents), keyframes use additive guidance
+                            and can be placed at any frame. Useful for controlling motion between key poses.
+                            """)
+                            keyframe_interpolation = gr.Checkbox(
+                                label="Enable Keyframe Interpolation",
+                                value=False,
+                                info="Enable keyframe-based video generation"
+                            )
+                            with gr.Row():
+                                keyframe_image_1 = gr.Image(label="Keyframe 1", type="filepath")
+                                keyframe_frame_1 = gr.Number(label="Frame Idx", value=0, minimum=0, step=1)
+                                keyframe_strength_1 = gr.Slider(minimum=0.0, maximum=1.0, value=1.0, step=0.05, label="Strength")
+                            with gr.Row():
+                                keyframe_image_2 = gr.Image(label="Keyframe 2", type="filepath")
+                                keyframe_frame_2 = gr.Number(label="Frame Idx", value=60, minimum=0, step=1)
+                                keyframe_strength_2 = gr.Slider(minimum=0.0, maximum=1.0, value=1.0, step=0.05, label="Strength")
+                            with gr.Row():
+                                keyframe_image_3 = gr.Image(label="Keyframe 3", type="filepath")
+                                keyframe_frame_3 = gr.Number(label="Frame Idx", value=120, minimum=0, step=1)
+                                keyframe_strength_3 = gr.Slider(minimum=0.0, maximum=1.0, value=1.0, step=0.05, label="Strength")
+
+                        # IC-LoRA Reference Video
+                        with gr.Accordion("IC-LoRA Reference Video", open=False):
+                            gr.Markdown("""
+                            **Condition generation on a reference video using IC-LoRA.**
+                            The reference video (e.g., depth maps, edge maps) is encoded and used as
+                            additional conditioning tokens with controllable attention strength.
+                            Requires an IC-LoRA to be loaded.
+                            """)
+                            ic_reference_video = gr.Video(label="Reference Video", sources=["upload"])
+                            with gr.Row():
+                                ic_reference_strength = gr.Slider(
+                                    minimum=0.0, maximum=2.0, value=1.0, step=0.05,
+                                    label="Reference Strength",
+                                    info="Conditioning strength of the reference video"
+                                )
+                                ic_attention_strength = gr.Slider(
+                                    minimum=0.0, maximum=1.0, value=1.0, step=0.05,
+                                    label="Attention Strength",
+                                    info="Attention mask weight for reference tokens (0-1)"
+                                )
+                            ic_skip_stage2 = gr.Checkbox(
+                                label="Skip Stage 2 (output at half resolution)",
+                                value=False,
+                                info="Skip upsampling/refinement for faster IC-LoRA output"
+                            )
+
+                        # Retake / Temporal Editing
+                        with gr.Accordion("Retake (Temporal Editing)", open=False):
+                            gr.Markdown("""
+                            **Regenerate a specific time region of an existing video.**
+                            Encodes the source video, masks the retake region, and re-denoises
+                            only within that time range while preserving the rest.
+                            """)
+                            retake_video = gr.Video(label="Source Video", sources=["upload"])
+                            with gr.Row():
+                                retake_start_time = gr.Number(
+                                    label="Start Time (seconds)",
+                                    value=0.0, minimum=0.0, step=0.1,
+                                    info="Start of region to regenerate"
+                                )
+                                retake_end_time = gr.Number(
+                                    label="End Time (seconds)",
+                                    value=2.0, minimum=0.0, step=0.1,
+                                    info="End of region to regenerate"
+                                )
+                            with gr.Row():
+                                retake_regenerate_video = gr.Checkbox(
+                                    label="Regenerate Video", value=True,
+                                    info="Regenerate video in the retake region"
+                                )
+                                retake_regenerate_audio = gr.Checkbox(
+                                    label="Regenerate Audio", value=True,
+                                    info="Regenerate audio in the retake region"
+                                )
+
+                        # A2V Mode (Audio-to-Video)
+                        with gr.Accordion("A2V Mode (Audio-to-Video)", open=False):
+                            gr.Markdown("""
+                            **Generate video conditioned on input audio.**
+                            Audio is encoded with the audio VAE and frozen during Stage 1 (video-only denoising).
+                            Stage 2 upsamples and refines. Original audio is preserved for fidelity.
+                            """)
+                            a2v_mode = gr.Checkbox(
+                                label="Enable A2V Mode",
+                                value=False,
+                                info="Generate video from audio input"
+                            )
+                            a2v_audio_input = gr.Audio(label="Audio Input", type="filepath")
+                            with gr.Row():
+                                a2v_audio_start_time = gr.Number(
+                                    label="Audio Start Time (s)",
+                                    value=0.0, minimum=0.0, step=0.1,
+                                    info="Start time in seconds to read audio from"
+                                )
+                                a2v_audio_max_duration = gr.Number(
+                                    label="Max Duration (s)",
+                                    value=0, minimum=0, step=0.5,
+                                    info="Max audio duration (0 = match video length)"
+                                )
+                                a2v_guidance_scale_input = gr.Slider(
+                                    minimum=0.0, maximum=10.0, value=1.0, step=0.1,
+                                    label="A2V Guidance Scale",
+                                    info="Cross-modal audio-to-video guidance strength"
                                 )
 
             # =================================================================
@@ -4704,6 +4957,23 @@ def create_interface():
                 v2v_join_preserve1, v2v_join_preserve2,
                 v2v_join_transition_time,
                 v2v_join_steps, v2v_join_terminal,
+                # Advanced Generation (2.3 Features)
+                guider_type, denoising_loop, spatial_upscale_factor,
+                apg_eta, apg_norm_threshold, ge_gamma,
+                res2s_noise_seed, fast_mode,
+                # Keyframe Interpolation
+                keyframe_interpolation,
+                keyframe_image_1, keyframe_frame_1, keyframe_strength_1,
+                keyframe_image_2, keyframe_frame_2, keyframe_strength_2,
+                keyframe_image_3, keyframe_frame_3, keyframe_strength_3,
+                # IC-LoRA Reference Video
+                ic_reference_video, ic_reference_strength, ic_attention_strength, ic_skip_stage2,
+                # Retake (Temporal Editing)
+                retake_video, retake_start_time, retake_end_time,
+                retake_regenerate_video, retake_regenerate_audio,
+                # A2V Mode (Audio-to-Video)
+                a2v_mode, a2v_audio_input, a2v_audio_start_time,
+                a2v_audio_max_duration, a2v_guidance_scale_input,
             ],
             outputs=[output_gallery, preview_gallery, status_text, progress_text]
         )
