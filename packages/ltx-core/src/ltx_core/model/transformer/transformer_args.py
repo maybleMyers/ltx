@@ -65,7 +65,12 @@ class TransformerArgsPreprocessor:
         """Prepare timestep embeddings."""
         timestep_scaled = timestep * self.timestep_scale_multiplier
 
-        N = timestep_scaled.shape[1] if timestep_scaled.ndim > 1 else timestep_scaled.shape[0] // batch_size
+        if timestep_scaled.ndim > 1:
+            N = timestep_scaled.shape[1]
+        elif timestep_scaled.ndim == 1:
+            N = timestep_scaled.shape[0] // batch_size
+        else:
+            N = 1  # scalar
 
         if N <= chunk_size:
             timestep_out, embedded_timestep = adaln(
