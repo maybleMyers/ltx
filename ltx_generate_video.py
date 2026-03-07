@@ -4440,7 +4440,8 @@ class LTXVideoGeneratorWithOffloading:
                 # Move the wrapper and non-block parts to GPU
                 transformer.velocity_model.patchify_proj.to(self.device)
                 transformer.velocity_model.adaln_single.to(self.device)
-                transformer.velocity_model.caption_projection.to(self.device)
+                if hasattr(transformer.velocity_model, "caption_projection"):
+                    transformer.velocity_model.caption_projection.to(self.device)
                 transformer.velocity_model.norm_out.to(self.device)
                 transformer.velocity_model.proj_out.to(self.device)
                 transformer.velocity_model.scale_shift_table = torch.nn.Parameter(
@@ -5341,7 +5342,8 @@ class LTXVideoGeneratorWithOffloading:
                 # Move non-block components to GPU (may already be there from stage 1)
                 transformer.velocity_model.patchify_proj.to(self.device)
                 transformer.velocity_model.adaln_single.to(self.device)
-                transformer.velocity_model.caption_projection.to(self.device)
+                if hasattr(transformer.velocity_model, "caption_projection"):
+                    transformer.velocity_model.caption_projection.to(self.device)
                 transformer.velocity_model.norm_out.to(self.device)
                 transformer.velocity_model.proj_out.to(self.device)
                 transformer.velocity_model.scale_shift_table = torch.nn.Parameter(
@@ -5477,7 +5479,8 @@ class LTXVideoGeneratorWithOffloading:
                 print(f">>> Enabling refiner block swapping ({self.refiner_blocks_in_memory} blocks in GPU)...")
                 transformer.velocity_model.patchify_proj.to(self.device)
                 transformer.velocity_model.adaln_single.to(self.device)
-                transformer.velocity_model.caption_projection.to(self.device)
+                if hasattr(transformer.velocity_model, "caption_projection"):
+                    transformer.velocity_model.caption_projection.to(self.device)
                 transformer.velocity_model.norm_out.to(self.device)
                 transformer.velocity_model.proj_out.to(self.device)
                 transformer.velocity_model.scale_shift_table = torch.nn.Parameter(
@@ -6048,7 +6051,8 @@ class LTXVideoGeneratorWithOffloading:
                 print(f">>> Enabling stage 3 block swapping ({self.stage3_blocks_in_memory} blocks in GPU)...")
                 transformer.velocity_model.patchify_proj.to(self.device)
                 transformer.velocity_model.adaln_single.to(self.device)
-                transformer.velocity_model.caption_projection.to(self.device)
+                if hasattr(transformer.velocity_model, "caption_projection"):
+                    transformer.velocity_model.caption_projection.to(self.device)
                 transformer.velocity_model.norm_out.to(self.device)
                 transformer.velocity_model.proj_out.to(self.device)
                 transformer.velocity_model.scale_shift_table = torch.nn.Parameter(
@@ -6104,7 +6108,8 @@ class LTXVideoGeneratorWithOffloading:
                 print(f">>> Enabling stage 3 block swapping ({self.stage3_blocks_in_memory} blocks in GPU)...")
                 transformer.velocity_model.patchify_proj.to(self.device)
                 transformer.velocity_model.adaln_single.to(self.device)
-                transformer.velocity_model.caption_projection.to(self.device)
+                if hasattr(transformer.velocity_model, "caption_projection"):
+                    transformer.velocity_model.caption_projection.to(self.device)
                 transformer.velocity_model.norm_out.to(self.device)
                 transformer.velocity_model.proj_out.to(self.device)
                 transformer.velocity_model.scale_shift_table = torch.nn.Parameter(
@@ -7352,12 +7357,17 @@ def generate_av_extension(
         # Move non-block components to GPU, keep blocks on CPU
         transformer.velocity_model.patchify_proj.to(device)
         transformer.velocity_model.adaln_single.to(device)
-        transformer.velocity_model.caption_projection.to(device)
+        if hasattr(transformer.velocity_model, "caption_projection"):
+            transformer.velocity_model.caption_projection.to(device)
         transformer.velocity_model.norm_out.to(device)
         transformer.velocity_model.proj_out.to(device)
         transformer.velocity_model.scale_shift_table = torch.nn.Parameter(
             transformer.velocity_model.scale_shift_table.to(device)
         )
+        # 22B cross-attention adaln components
+        if hasattr(transformer.velocity_model, "prompt_adaln_single"):
+            if transformer.velocity_model.prompt_adaln_single is not None:
+                transformer.velocity_model.prompt_adaln_single.to(device)
         # Audio components
         if hasattr(transformer.velocity_model, "audio_patchify_proj"):
             transformer.velocity_model.audio_patchify_proj.to(device)
@@ -7877,7 +7887,11 @@ def generate_av_extension(
             # Move non-block components to GPU
             stage2_transformer.velocity_model.patchify_proj.to(device)
             stage2_transformer.velocity_model.adaln_single.to(device)
-            stage2_transformer.velocity_model.caption_projection.to(device)
+            if hasattr(stage2_transformer.velocity_model, "caption_projection"):
+                stage2_transformer.velocity_model.caption_projection.to(device)
+            if hasattr(stage2_transformer.velocity_model, "prompt_adaln_single"):
+                if stage2_transformer.velocity_model.prompt_adaln_single is not None:
+                    stage2_transformer.velocity_model.prompt_adaln_single.to(device)
             stage2_transformer.velocity_model.norm_out.to(device)
             stage2_transformer.velocity_model.proj_out.to(device)
             stage2_transformer.velocity_model.scale_shift_table = torch.nn.Parameter(
@@ -8783,7 +8797,11 @@ def generate_v2v_join(
         # Move non-block components to GPU
         transformer.velocity_model.patchify_proj.to(device)
         transformer.velocity_model.adaln_single.to(device)
-        transformer.velocity_model.caption_projection.to(device)
+        if hasattr(transformer.velocity_model, "caption_projection"):
+            transformer.velocity_model.caption_projection.to(device)
+        if hasattr(transformer.velocity_model, "prompt_adaln_single"):
+            if transformer.velocity_model.prompt_adaln_single is not None:
+                transformer.velocity_model.prompt_adaln_single.to(device)
         transformer.velocity_model.norm_out.to(device)
         transformer.velocity_model.proj_out.to(device)
         transformer.velocity_model.scale_shift_table = torch.nn.Parameter(
@@ -9320,7 +9338,11 @@ def generate_v2v_join(
             # Move non-block components to GPU
             stage2_transformer.velocity_model.patchify_proj.to(device)
             stage2_transformer.velocity_model.adaln_single.to(device)
-            stage2_transformer.velocity_model.caption_projection.to(device)
+            if hasattr(stage2_transformer.velocity_model, "caption_projection"):
+                stage2_transformer.velocity_model.caption_projection.to(device)
+            if hasattr(stage2_transformer.velocity_model, "prompt_adaln_single"):
+                if stage2_transformer.velocity_model.prompt_adaln_single is not None:
+                    stage2_transformer.velocity_model.prompt_adaln_single.to(device)
             stage2_transformer.velocity_model.norm_out.to(device)
             stage2_transformer.velocity_model.proj_out.to(device)
             stage2_transformer.velocity_model.scale_shift_table = torch.nn.Parameter(
