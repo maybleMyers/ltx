@@ -1641,7 +1641,6 @@ def generate_ltx_video(
     apg_norm_threshold: float,
     ge_gamma: float,
     res2s_noise_seed: int,
-    fast_mode: bool,
     # Keyframe Interpolation
     keyframe_interpolation: bool,
     keyframe_image_1: str,
@@ -1931,8 +1930,6 @@ def generate_ltx_video(
             command.extend(["--spatial-upscale-factor", str(spatial_upscale_factor)])
         if res2s_noise_seed and int(res2s_noise_seed) >= 0:
             command.extend(["--res2s-noise-seed", str(int(res2s_noise_seed))])
-        if fast_mode:
-            command.append("--fast")
 
         # Keyframe Interpolation
         if keyframe_interpolation:
@@ -3145,11 +3142,6 @@ def create_interface():
                                     label="Res2s Noise Seed",
                                     value=-1,
                                     info="SDE noise seed for res2s sampler (-1 = no noise)"
-                                )
-                                fast_mode = gr.Checkbox(
-                                    label="Fast Mode (Distilled)",
-                                    value=False,
-                                    info="8 steps, no CFG/STG — requires distilled checkpoint"
                                 )
 
                         # Advanced CFG (MultiModal Guidance)
@@ -4963,7 +4955,7 @@ def create_interface():
                 # Advanced Generation (2.3 Features)
                 guider_type, denoising_loop, spatial_upscale_factor,
                 apg_eta, apg_norm_threshold, ge_gamma,
-                res2s_noise_seed, fast_mode,
+                res2s_noise_seed,
                 # Keyframe Interpolation
                 keyframe_interpolation,
                 keyframe_image_1, keyframe_frame_1, keyframe_strength_1,

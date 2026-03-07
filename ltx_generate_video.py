@@ -2662,13 +2662,6 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Maximum audio duration in seconds. Defaults to video duration (num_frames / frame_rate).",
     )
-    a2v_group.add_argument(
-        "--a2v-guidance-scale",
-        type=float,
-        default=1.0,
-        help="Cross-modal (audio-to-video) guidance scale for A2V mode (default: 1.0).",
-    )
-
     # ==========================================================================
     # Memory Optimization
     # ==========================================================================
