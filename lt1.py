@@ -194,22 +194,23 @@ def validate_resolution(width: int, height: int) -> Optional[str]:
 def validate_model_paths(checkpoint_path: str, spatial_upsampler_path: str,
                          distilled_lora_path: str, gemma_root: str,
                          is_one_stage: bool = False,
-                         is_refine_only: bool = False) -> Optional[str]:
+                         is_refine_only: bool = False,
+                         distilled_checkpoint: bool = False,
+                         stage2_checkpoint: str = "") -> Optional[str]:
     """Validate all required model paths exist."""
     # Core paths required for all pipelines
     paths = [
         ("LTX Checkpoint", checkpoint_path),
         ("Gemma Root", gemma_root),
     ]
-    # Two-stage specific paths (spatial upsampler always needed for two-stage)
+    # Two-stage specific paths
     if not is_one_stage and not is_refine_only:
-        paths.extend([
-            ("Spatial Upsampler", spatial_upsampler_path),
-            ("Distilled LoRA", distilled_lora_path),
-        ])
+        paths.append(("Spatial Upsampler", spatial_upsampler_path))
+        # Distilled LoRA only required when NOT using distilled checkpoint or stage2 checkpoint
+        if not distilled_checkpoint and not (stage2_checkpoint and stage2_checkpoint.strip()):
+            paths.append(("Distilled LoRA", distilled_lora_path))
     # Refine-only: distilled LoRA is optional, but validate if provided
     if is_refine_only:
-        # Only validate distilled LoRA if path is provided
         if distilled_lora_path and distilled_lora_path.strip():
             paths.append(("Distilled LoRA", distilled_lora_path))
     for name, path in paths:
@@ -1703,7 +1704,9 @@ def generate_ltx_video(
     error = validate_model_paths(checkpoint_path, spatial_upsampler_path,
                                   distilled_lora_path, gemma_root,
                                   is_one_stage=is_one_stage or is_three_stage_linear,
-                                  is_refine_only=is_refine_only)
+                                  is_refine_only=is_refine_only,
+                                  distilled_checkpoint=distilled_checkpoint,
+                                  stage2_checkpoint=stage2_checkpoint)
     if error:
         yield [], None, error, ""
         return
