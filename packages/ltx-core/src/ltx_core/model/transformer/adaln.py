@@ -32,3 +32,16 @@ class AdaLayerNormSingle(torch.nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         embedded_timestep = self.emb(timestep, hidden_dtype=hidden_dtype)
         return self.linear(self.silu(embedded_timestep)), embedded_timestep
+
+
+ADALN_NUM_BASE_PARAMS = 6
+ADALN_NUM_CROSS_ATTN_PARAMS = 3
+
+
+def adaln_embedding_coefficient(cross_attention_adaln: bool) -> int:
+    """Return the number of AdaLN parameters per transformer block.
+
+    Base (19B): 6 params (shift/scale/gate for self-attn + shift/scale/gate for FFN).
+    With cross-attention AdaLN (22B): 9 params (base 6 + shift/scale/gate for text cross-attn).
+    """
+    return ADALN_NUM_BASE_PARAMS + (ADALN_NUM_CROSS_ATTN_PARAMS if cross_attention_adaln else 0)
