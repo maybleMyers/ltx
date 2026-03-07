@@ -4440,6 +4440,9 @@ class LTXVideoGeneratorWithOffloading:
                 # Move the wrapper and non-block parts to GPU
                 transformer.velocity_model.patchify_proj.to(self.device)
                 transformer.velocity_model.adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "prompt_adaln_single"):
+                    if transformer.velocity_model.prompt_adaln_single is not None:
+                        transformer.velocity_model.prompt_adaln_single.to(self.device)
                 if hasattr(transformer.velocity_model, "caption_projection"):
                     transformer.velocity_model.caption_projection.to(self.device)
                 transformer.velocity_model.norm_out.to(self.device)
@@ -4452,6 +4455,9 @@ class LTXVideoGeneratorWithOffloading:
                     transformer.velocity_model.audio_patchify_proj.to(self.device)
                 if hasattr(transformer.velocity_model, "audio_adaln_single"):
                     transformer.velocity_model.audio_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_prompt_adaln_single"):
+                    if transformer.velocity_model.audio_prompt_adaln_single is not None:
+                        transformer.velocity_model.audio_prompt_adaln_single.to(self.device)
                 if hasattr(transformer.velocity_model, "audio_caption_projection"):
                     transformer.velocity_model.audio_caption_projection.to(self.device)
                 if hasattr(transformer.velocity_model, "audio_norm_out"):
@@ -5342,6 +5348,9 @@ class LTXVideoGeneratorWithOffloading:
                 # Move non-block components to GPU (may already be there from stage 1)
                 transformer.velocity_model.patchify_proj.to(self.device)
                 transformer.velocity_model.adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "prompt_adaln_single"):
+                    if transformer.velocity_model.prompt_adaln_single is not None:
+                        transformer.velocity_model.prompt_adaln_single.to(self.device)
                 if hasattr(transformer.velocity_model, "caption_projection"):
                     transformer.velocity_model.caption_projection.to(self.device)
                 transformer.velocity_model.norm_out.to(self.device)
@@ -5353,6 +5362,9 @@ class LTXVideoGeneratorWithOffloading:
                     transformer.velocity_model.audio_patchify_proj.to(self.device)
                 if hasattr(transformer.velocity_model, "audio_adaln_single"):
                     transformer.velocity_model.audio_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_prompt_adaln_single"):
+                    if transformer.velocity_model.audio_prompt_adaln_single is not None:
+                        transformer.velocity_model.audio_prompt_adaln_single.to(self.device)
                 if hasattr(transformer.velocity_model, "audio_caption_projection"):
                     transformer.velocity_model.audio_caption_projection.to(self.device)
                 if hasattr(transformer.velocity_model, "audio_norm_out"):
@@ -5479,6 +5491,9 @@ class LTXVideoGeneratorWithOffloading:
                 print(f">>> Enabling refiner block swapping ({self.refiner_blocks_in_memory} blocks in GPU)...")
                 transformer.velocity_model.patchify_proj.to(self.device)
                 transformer.velocity_model.adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "prompt_adaln_single"):
+                    if transformer.velocity_model.prompt_adaln_single is not None:
+                        transformer.velocity_model.prompt_adaln_single.to(self.device)
                 if hasattr(transformer.velocity_model, "caption_projection"):
                     transformer.velocity_model.caption_projection.to(self.device)
                 transformer.velocity_model.norm_out.to(self.device)
@@ -5490,6 +5505,9 @@ class LTXVideoGeneratorWithOffloading:
                     transformer.velocity_model.audio_patchify_proj.to(self.device)
                 if hasattr(transformer.velocity_model, "audio_adaln_single"):
                     transformer.velocity_model.audio_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_prompt_adaln_single"):
+                    if transformer.velocity_model.audio_prompt_adaln_single is not None:
+                        transformer.velocity_model.audio_prompt_adaln_single.to(self.device)
                 if hasattr(transformer.velocity_model, "audio_caption_projection"):
                     transformer.velocity_model.audio_caption_projection.to(self.device)
                 if hasattr(transformer.velocity_model, "audio_norm_out"):
@@ -6051,6 +6069,9 @@ class LTXVideoGeneratorWithOffloading:
                 print(f">>> Enabling stage 3 block swapping ({self.stage3_blocks_in_memory} blocks in GPU)...")
                 transformer.velocity_model.patchify_proj.to(self.device)
                 transformer.velocity_model.adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "prompt_adaln_single"):
+                    if transformer.velocity_model.prompt_adaln_single is not None:
+                        transformer.velocity_model.prompt_adaln_single.to(self.device)
                 if hasattr(transformer.velocity_model, "caption_projection"):
                     transformer.velocity_model.caption_projection.to(self.device)
                 transformer.velocity_model.norm_out.to(self.device)
@@ -6062,6 +6083,9 @@ class LTXVideoGeneratorWithOffloading:
                     transformer.velocity_model.audio_patchify_proj.to(self.device)
                 if hasattr(transformer.velocity_model, "audio_adaln_single"):
                     transformer.velocity_model.audio_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_prompt_adaln_single"):
+                    if transformer.velocity_model.audio_prompt_adaln_single is not None:
+                        transformer.velocity_model.audio_prompt_adaln_single.to(self.device)
                 if hasattr(transformer.velocity_model, "audio_caption_projection"):
                     transformer.velocity_model.audio_caption_projection.to(self.device)
                 if hasattr(transformer.velocity_model, "audio_norm_out"):
@@ -6108,6 +6132,9 @@ class LTXVideoGeneratorWithOffloading:
                 print(f">>> Enabling stage 3 block swapping ({self.stage3_blocks_in_memory} blocks in GPU)...")
                 transformer.velocity_model.patchify_proj.to(self.device)
                 transformer.velocity_model.adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "prompt_adaln_single"):
+                    if transformer.velocity_model.prompt_adaln_single is not None:
+                        transformer.velocity_model.prompt_adaln_single.to(self.device)
                 if hasattr(transformer.velocity_model, "caption_projection"):
                     transformer.velocity_model.caption_projection.to(self.device)
                 transformer.velocity_model.norm_out.to(self.device)
@@ -6119,6 +6146,9 @@ class LTXVideoGeneratorWithOffloading:
                     transformer.velocity_model.audio_patchify_proj.to(self.device)
                 if hasattr(transformer.velocity_model, "audio_adaln_single"):
                     transformer.velocity_model.audio_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_prompt_adaln_single"):
+                    if transformer.velocity_model.audio_prompt_adaln_single is not None:
+                        transformer.velocity_model.audio_prompt_adaln_single.to(self.device)
                 if hasattr(transformer.velocity_model, "audio_caption_projection"):
                     transformer.velocity_model.audio_caption_projection.to(self.device)
                 if hasattr(transformer.velocity_model, "audio_norm_out"):
@@ -7373,6 +7403,9 @@ def generate_av_extension(
             transformer.velocity_model.audio_patchify_proj.to(device)
         if hasattr(transformer.velocity_model, "audio_adaln_single"):
             transformer.velocity_model.audio_adaln_single.to(device)
+        if hasattr(transformer.velocity_model, "audio_prompt_adaln_single"):
+            if transformer.velocity_model.audio_prompt_adaln_single is not None:
+                transformer.velocity_model.audio_prompt_adaln_single.to(device)
         if hasattr(transformer.velocity_model, "audio_caption_projection"):
             transformer.velocity_model.audio_caption_projection.to(device)
         if hasattr(transformer.velocity_model, "audio_norm_out"):
@@ -7901,6 +7934,9 @@ def generate_av_extension(
                 stage2_transformer.velocity_model.audio_patchify_proj.to(device)
             if hasattr(stage2_transformer.velocity_model, "audio_adaln_single"):
                 stage2_transformer.velocity_model.audio_adaln_single.to(device)
+            if hasattr(stage2_transformer.velocity_model, "audio_prompt_adaln_single"):
+                if stage2_transformer.velocity_model.audio_prompt_adaln_single is not None:
+                    stage2_transformer.velocity_model.audio_prompt_adaln_single.to(device)
             if hasattr(stage2_transformer.velocity_model, "audio_caption_projection"):
                 stage2_transformer.velocity_model.audio_caption_projection.to(device)
             if hasattr(stage2_transformer.velocity_model, "audio_norm_out"):
@@ -8812,6 +8848,9 @@ def generate_v2v_join(
             transformer.velocity_model.audio_patchify_proj.to(device)
         if hasattr(transformer.velocity_model, "audio_adaln_single"):
             transformer.velocity_model.audio_adaln_single.to(device)
+        if hasattr(transformer.velocity_model, "audio_prompt_adaln_single"):
+            if transformer.velocity_model.audio_prompt_adaln_single is not None:
+                transformer.velocity_model.audio_prompt_adaln_single.to(device)
         if hasattr(transformer.velocity_model, "audio_caption_projection"):
             transformer.velocity_model.audio_caption_projection.to(device)
         if hasattr(transformer.velocity_model, "audio_norm_out"):
@@ -9352,6 +9391,9 @@ def generate_v2v_join(
                 stage2_transformer.velocity_model.audio_patchify_proj.to(device)
             if hasattr(stage2_transformer.velocity_model, "audio_adaln_single"):
                 stage2_transformer.velocity_model.audio_adaln_single.to(device)
+            if hasattr(stage2_transformer.velocity_model, "audio_prompt_adaln_single"):
+                if stage2_transformer.velocity_model.audio_prompt_adaln_single is not None:
+                    stage2_transformer.velocity_model.audio_prompt_adaln_single.to(device)
             if hasattr(stage2_transformer.velocity_model, "audio_caption_projection"):
                 stage2_transformer.velocity_model.audio_caption_projection.to(device)
             if hasattr(stage2_transformer.velocity_model, "audio_norm_out"):
