@@ -510,6 +510,7 @@ def modality_from_latent_state(
         positions=state.positions,
         context=context,
         context_mask=None,
+        sigma=sigma if isinstance(sigma, torch.Tensor) else torch.tensor(sigma, device=state.latent.device, dtype=state.latent.dtype),
     )
 
 

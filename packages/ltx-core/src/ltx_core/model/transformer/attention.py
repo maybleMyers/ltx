@@ -177,6 +177,7 @@ class Attention(torch.nn.Module):
         norm_eps: float = 1e-6,
         rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
         attention_function: AttentionCallable | AttentionFunction = AttentionFunction.DEFAULT,
+        apply_gated_attention: bool = False,
     ) -> None:
         super().__init__()
         self.rope_type = rope_type
@@ -197,6 +198,11 @@ class Attention(torch.nn.Module):
 
         self.to_out = torch.nn.Sequential(torch.nn.Linear(inner_dim, query_dim, bias=True), torch.nn.Identity())
 
+        if apply_gated_attention:
+            self.to_gate_logits = torch.nn.Linear(query_dim, heads, bias=True)
+        else:
+            self.to_gate_logits = None
+
     def forward(
         self,
         x: torch.Tensor,
@@ -204,21 +210,40 @@ class Attention(torch.nn.Module):
         mask: torch.Tensor | None = None,
         pe: torch.Tensor | None = None,
         k_pe: torch.Tensor | None = None,
+        perturbation_mask: torch.Tensor | None = None,
+        all_perturbed: bool = False,
     ) -> torch.Tensor:
-        q = self.to_q(x)
         context = x if context is None else context
-        k = self.to_k(context)
+        use_attention = not all_perturbed
+
         v = self.to_v(context)
 
-        q = self.q_norm(q)
-        k = self.k_norm(k)
+        if not use_attention:
+            out = v
+        else:
+            q = self.to_q(x)
+            k = self.to_k(context)
 
-        if pe is not None:
-            q = apply_rotary_emb(q, pe, self.rope_type)
-            k = apply_rotary_emb(k, pe if k_pe is None else k_pe, self.rope_type)
+            q = self.q_norm(q)
+            k = self.k_norm(k)
 
-        # attention_function can be an enum *or* a custom callable
-        out = self.attention_function(q, k, v, self.heads, mask)
+            if pe is not None:
+                q = apply_rotary_emb(q, pe, self.rope_type)
+                k = apply_rotary_emb(k, pe if k_pe is None else k_pe, self.rope_type)
+
+            out = self.attention_function(q, k, v, self.heads, mask)
+
+            if perturbation_mask is not None:
+                out = out * perturbation_mask + v * (1 - perturbation_mask)
+
+        # Apply per-head gating if enabled
+        if self.to_gate_logits is not None:
+            gate_logits = self.to_gate_logits(x)
+            b, t, _ = out.shape
+            out = out.view(b, t, self.heads, self.dim_head)
+            gate = 2.0 * torch.sigmoid(gate_logits).unsqueeze(-1)
+            out = (out * gate).reshape(b, t, -1)
+
         return self.to_out(out)
 
     def forward_chunked(

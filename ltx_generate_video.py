@@ -900,6 +900,7 @@ def cfg_stg_denoising_func(
             positions=state.positions,
             context=context,
             context_mask=None,
+            sigma=torch.tensor(sigma, device=latent.device, dtype=latent.dtype) if not isinstance(sigma, torch.Tensor) else sigma,
         )
 
     def cfg_stg_denoising_step(
@@ -1047,6 +1048,7 @@ def multi_modal_guider_denoising_func(
             positions=state.positions,
             context=context,
             context_mask=None,
+            sigma=torch.tensor(sigma, device=latent.device, dtype=latent.dtype) if not isinstance(sigma, torch.Tensor) else sigma,
         )
 
     def build_stg_perturbation_config(video_blocks: list[int], audio_blocks: list[int]) -> BatchedPerturbationConfig:
