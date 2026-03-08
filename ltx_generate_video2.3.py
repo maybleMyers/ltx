@@ -4894,8 +4894,6 @@ class LTXVideoGeneratorWithOffloading:
                         audio_state=audio_state,
                         stepper=stepper,
                         denoise_fn=denoise_fn,
-                        callback_interval=_cb_interval,
-                        latent_norm_fn=_norm,
                     )
 
             if use_cfg or use_stg:
