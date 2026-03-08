@@ -45,6 +45,8 @@ def _move_transformer_args_to_device(args: TransformerArgs, device: torch.device
         cross_positional_embeddings=pe_to_device(args.cross_positional_embeddings),
         cross_scale_shift_timestep=to_device(args.cross_scale_shift_timestep),
         cross_gate_timestep=to_device(args.cross_gate_timestep),
+        prompt_timestep=to_device(getattr(args, 'prompt_timestep', None)),
+        self_attention_mask=to_device(getattr(args, 'self_attention_mask', None)),
     )
 
 
