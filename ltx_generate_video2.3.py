@@ -11815,9 +11815,7 @@ def main():
             video=video,
             fps=args.frame_rate,
             audio=None,
-            audio_sample_rate=None,
-            output_path=temp_video_path,
-            video_chunks_number=video_chunks_number,
+            output_path=temp_video_path,            video_chunks_number=video_chunks_number,
         )
 
         # Use ffmpeg to combine generated video with original audio
@@ -11886,9 +11884,7 @@ def main():
             video=video,
             fps=args.frame_rate,
             audio=None,  # No audio in temp video
-            audio_sample_rate=None,
-            output_path=temp_video_path,
-            video_chunks_number=video_chunks_number,
+            output_path=temp_video_path,            video_chunks_number=video_chunks_number,
         )
 
         # Use ffmpeg to combine generated video with original audio
@@ -11922,9 +11918,7 @@ def main():
             video=video,
             fps=args.frame_rate,
             audio=None,
-            audio_sample_rate=None,
-            output_path=temp_video_path,
-            video_chunks_number=video_chunks_number,
+            output_path=temp_video_path,            video_chunks_number=video_chunks_number,
         )
 
         # Copy audio from input video
