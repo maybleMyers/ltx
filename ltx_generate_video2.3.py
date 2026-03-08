@@ -5973,10 +5973,6 @@ class LTXVideoGeneratorWithOffloading:
                     audio_context=a_context_p,
                     transformer=transformer,
                 ),
-                anchor_decay=effective_anchor_decay,
-                callback=preview_callback,
-                callback_interval=preview_callback_interval,
-                latent_norm_fn=latent_norm_fn,
             )
 
         # Stage 2 output shape (full resolution)
