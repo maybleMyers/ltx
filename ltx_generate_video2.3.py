@@ -11949,11 +11949,9 @@ def main():
             video=video,
             fps=args.frame_rate,
             audio=audio,
-            audio_sample_rate=AUDIO_SAMPLE_RATE if audio is not None else None,
             output_path=args.output_path,
             video_chunks_number=video_chunks_number,
         )
-
     print(f">>> Video saved in {time.time() - encode_start:.1f}s")
 
     # Build and save metadata
