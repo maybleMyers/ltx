@@ -139,9 +139,27 @@ class CombinedTextEncoder(torch.nn.Module):
         super().__init__()
         self.text_encoder = text_encoder
         self.embeddings_processor = embeddings_processor
+        self._block_swap_device = None  # Set by enable_text_encoder_block_swap workaround
+
+    def encode(self, prompt: str, padding_side: str = "left"):
+        """Encode text to hidden states + mask (device-aware for block swapping)."""
+        device = self._block_swap_device
+        if device is not None:
+            # Block swap mode: create tensors on GPU device directly
+            token_pairs = self.text_encoder.tokenizer.tokenize_with_weights(prompt)["gemma"]
+            input_ids = torch.tensor([[t[0] for t in token_pairs]], device=device)
+            attention_mask = torch.tensor([[w[1] for w in token_pairs]], device=device)
+            outputs = self.text_encoder.model.model(
+                input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True
+            )
+            hidden_states = outputs.hidden_states
+            del outputs
+            return hidden_states, attention_mask
+        else:
+            return self.text_encoder.encode(prompt, padding_side)
 
     def forward(self, prompt: str):
-        hidden_states, attention_mask = self.text_encoder.encode(prompt)
+        hidden_states, attention_mask = self.encode(prompt)
         output = self.embeddings_processor.process_hidden_states(hidden_states, attention_mask)
         return output.video_encoding, output.audio_encoding, output.attention_mask
 
@@ -174,6 +192,22 @@ class CombinedTextEncoder(torch.nn.Module):
             return self.text_encoder.enhance(*args, **kwargs)
         return self.text_encoder._enhance(*args, **kwargs)
 
+    def enhance_t2v(self, *args, **kwargs):
+        return self.text_encoder.enhance_t2v(*args, **kwargs)
+
+    def enhance_i2v(self, *args, **kwargs):
+        return self.text_encoder.enhance_i2v(*args, **kwargs)
+
+    def cleanup(self):
+        """Release all references for garbage collection."""
+        if hasattr(self.text_encoder, 'model'):
+            self.text_encoder.model = None
+        if hasattr(self.text_encoder, 'tokenizer'):
+            self.text_encoder.tokenizer = None
+        if hasattr(self.text_encoder, 'processor'):
+            self.text_encoder.processor = None
+        self.embeddings_processor = None
+
 
 def encode_text(text_encoder, prompts: list[str]) -> list[tuple[torch.Tensor, torch.Tensor]]:
     """Encode prompts using a Gemma text encoder. Returns list of (v_context, a_context) tuples."""
@@ -203,6 +237,25 @@ def build_combined_text_encoder(model_ledger, device_override=None):
 
     combined = CombinedTextEncoder(text_encoder, embeddings_processor)
     return combined
+
+
+def enable_combined_text_encoder_block_swap(combined_encoder, blocks_in_memory, device):
+    """Enable block swapping on a CombinedTextEncoder.
+
+    Applies block swap to the inner GemmaTextEncoder, moves the EmbeddingsProcessor
+    to GPU, and sets the device-aware encoding flag.
+    """
+    # Apply block swap to the inner GemmaTextEncoder
+    inner_te = combined_encoder.text_encoder
+    offloader = enable_text_encoder_block_swap(inner_te, blocks_in_memory=blocks_in_memory, device=device)
+
+    # Move embeddings processor to GPU (it's small and needed for every encode call)
+    combined_encoder.embeddings_processor.to(device)
+
+    # Enable device-aware encoding in CombinedTextEncoder
+    combined_encoder._block_swap_device = device
+
+    return offloader
 
 
 # =============================================================================
@@ -2297,6 +2350,28 @@ def parse_args() -> argparse.Namespace:
              "Use this when the main checkpoint is a distilled model (not requiring CFG).",
     )
     model_group.add_argument(
+        "--distilled-lora-strength-stage-1",
+        type=float,
+        default=0.0,
+        help="Override distilled LoRA strength for stage 1 (HQ default: 0.25). "
+             "When > 0, applies the distilled LoRA to stage 1 with this strength.",
+    )
+    model_group.add_argument(
+        "--distilled-lora-strength-stage-2",
+        type=float,
+        default=0.0,
+        help="Override distilled LoRA strength for stage 2 (HQ default: 0.5). "
+             "When > 0, overrides the default distilled LoRA strength for stage 2.",
+    )
+    model_group.add_argument(
+        "--quantization",
+        type=str,
+        choices=["fp8-cast", "fp8-scaled-mm"],
+        default=None,
+        help="Quantization policy for transformer: fp8-cast (FP8 with upcasting) or "
+             "fp8-scaled-mm (FP8 scaled matrix multiplication).",
+    )
+    model_group.add_argument(
         "--stage2-checkpoint",
         type=resolve_path,
         default=None,
@@ -3681,20 +3756,25 @@ def destroy_text_encoder(text_encoder, text_encoder_block_swap=None):
     print_memory_report("Before text encoder cleanup")
 
     if text_encoder_block_swap is not None:
-        _cleanup_text_encoder_block_swap(text_encoder)
+        # For CombinedTextEncoder, clean up block swap on inner encoder
+        inner = text_encoder.text_encoder if isinstance(text_encoder, CombinedTextEncoder) else text_encoder
+        _cleanup_text_encoder_block_swap(inner)
 
-    if hasattr(text_encoder, 'model') and text_encoder.model is not None:
-        text_encoder.model = None
-    if hasattr(text_encoder, 'tokenizer'):
-        text_encoder.tokenizer = None
-    if hasattr(text_encoder, 'processor'):
-        text_encoder.processor = None
-    if hasattr(text_encoder, 'feature_extractor_linear'):
-        text_encoder.feature_extractor_linear = None
-    if hasattr(text_encoder, 'embeddings_connector'):
-        text_encoder.embeddings_connector = None
-    if hasattr(text_encoder, 'audio_embeddings_connector'):
-        text_encoder.audio_embeddings_connector = None
+    if isinstance(text_encoder, CombinedTextEncoder):
+        text_encoder.cleanup()
+    else:
+        if hasattr(text_encoder, 'model') and text_encoder.model is not None:
+            text_encoder.model = None
+        if hasattr(text_encoder, 'tokenizer'):
+            text_encoder.tokenizer = None
+        if hasattr(text_encoder, 'processor'):
+            text_encoder.processor = None
+        if hasattr(text_encoder, 'feature_extractor_linear'):
+            text_encoder.feature_extractor_linear = None
+        if hasattr(text_encoder, 'embeddings_connector'):
+            text_encoder.embeddings_connector = None
+        if hasattr(text_encoder, 'audio_embeddings_connector'):
+            text_encoder.audio_embeddings_connector = None
 
 
 def reconfigure_block_swap(
@@ -4157,6 +4237,8 @@ class LTXVideoGeneratorWithOffloading:
         loras: list[LoraPathStrengthAndSDOps],
         stage2_loras: list[LoraPathStrengthAndSDOps] = None,
         stage3_loras: list[LoraPathStrengthAndSDOps] = None,
+        distilled_lora_stage_1: list[LoraPathStrengthAndSDOps] = None,
+        quantization_policy=None,
         device: str = None,
         fp8transformer: bool = False,
         offload: bool = False,
@@ -4212,6 +4294,11 @@ class LTXVideoGeneratorWithOffloading:
         # Store stage 1 loras for use in linear mode
         self._stage_1_loras = loras
 
+        # HQ mode: include distilled LoRA in stage 1 if provided
+        stage_1_all_loras = loras
+        if distilled_lora_stage_1:
+            stage_1_all_loras = (*loras, *distilled_lora_stage_1)
+
         # Create model ledger for stage 1
         self.stage_1_model_ledger = ModelLedger(
             dtype=self.dtype,
@@ -4220,8 +4307,9 @@ class LTXVideoGeneratorWithOffloading:
             gemma_root_path=gemma_root,
             spatial_upsampler_path=spatial_upsampler_path,
             vae_path=vae_path,
-            loras=loras,
+            loras=stage_1_all_loras,
             fp8transformer=fp8transformer,
+            quantization=quantization_policy,
         )
 
         # Store params for stage 2 (create fresh ledger later to avoid shared state issues)
@@ -4405,20 +4493,17 @@ class LTXVideoGeneratorWithOffloading:
         text_encoder_block_swap = None
         if self.enable_text_encoder_block_swap:
             # Load text encoder to CPU first for block swapping
-            original_device = self.stage_1_model_ledger.device
-            self.stage_1_model_ledger.device = torch.device("cpu")
-            text_encoder = self.stage_1_model_ledger.text_encoder()
-            self.stage_1_model_ledger.device = original_device
+            text_encoder = build_combined_text_encoder(self.stage_1_model_ledger, device_override=torch.device("cpu"))
 
             # Enable block swap for text encoder
             print(f">>> Enabling text encoder block swap ({self.text_encoder_blocks_in_memory} layers in GPU)...", flush=True)
-            text_encoder_block_swap = enable_text_encoder_block_swap(
+            text_encoder_block_swap = enable_combined_text_encoder_block_swap(
                 text_encoder,
                 blocks_in_memory=self.text_encoder_blocks_in_memory,
                 device=self.device,
             )
         else:
-            text_encoder = self.stage_1_model_ledger.text_encoder()
+            text_encoder = build_combined_text_encoder(self.stage_1_model_ledger)
 
         # Track the enhanced prompt for metadata (None if not enhanced)
         enhanced_prompt = None
@@ -7508,20 +7593,17 @@ def generate_av_extension(
     text_encoder_block_swap = None
     if generator.enable_text_encoder_block_swap:
         # Load text encoder to CPU first for block swapping
-        original_device = generator.stage_1_model_ledger.device
-        generator.stage_1_model_ledger.device = torch.device("cpu")
-        text_encoder = generator.stage_1_model_ledger.text_encoder()
-        generator.stage_1_model_ledger.device = original_device
+        text_encoder = build_combined_text_encoder(generator.stage_1_model_ledger, device_override=torch.device("cpu"))
 
         # Enable block swap for text encoder
         print(f">>> Enabling text encoder block swap ({generator.text_encoder_blocks_in_memory} layers in GPU)...", flush=True)
-        text_encoder_block_swap = enable_text_encoder_block_swap(
+        text_encoder_block_swap = enable_combined_text_encoder_block_swap(
             text_encoder,
             blocks_in_memory=generator.text_encoder_blocks_in_memory,
             device=device,
         )
     else:
-        text_encoder = generator.stage_1_model_ledger.text_encoder()
+        text_encoder = build_combined_text_encoder(generator.stage_1_model_ledger)
     print(">>> Encoding prompts...")
     if args.cfg_guidance_scale > 1.0:
         context_p, context_n = encode_text(text_encoder, prompts=[args.prompt, args.negative_prompt])
@@ -8978,7 +9060,7 @@ def generate_v2v_join(
     cleanup_memory()
 
     # Load text encoder and encode prompts
-    text_encoder = generator.stage_1_model_ledger.text_encoder()
+    text_encoder = build_combined_text_encoder(generator.stage_1_model_ledger)
     print(">>> Encoding prompts...")
     if args.cfg_guidance_scale > 1.0:
         context_p, context_n = encode_text(text_encoder, prompts=[args.prompt, args.negative_prompt])
@@ -10792,7 +10874,7 @@ def generate_retake(
 
     # Text encoding
     print(">>> Retake: Encoding text...")
-    text_encoder = generator.stage_1_model_ledger.text_encoder()
+    text_encoder = build_combined_text_encoder(generator.stage_1_model_ledger)
     gemma_encode_text = encode_text
 
     cfg_scale = args.cfg_guidance_scale
@@ -11011,7 +11093,7 @@ def generate_a2v(
 
     # Text encoding
     print(">>> A2V: Encoding text...")
-    text_encoder = generator.stage_1_model_ledger.text_encoder()
+    text_encoder = build_combined_text_encoder(generator.stage_1_model_ledger)
     gemma_encode_text = encode_text
 
     cfg_scale = args.cfg_guidance_scale
@@ -11247,6 +11329,39 @@ def main():
                 LTXV_LORA_COMFY_RENAMING_MAP
             )]
 
+    # HQ per-stage distilled LoRA strength overrides
+    # When --distilled-lora-strength-stage-1 > 0, apply distilled LoRA to stage 1
+    # with the specified strength (creates a separate LoRA entry for stage 1)
+    args.distilled_lora_stage_1 = []
+    if args.distilled_lora_strength_stage_1 > 0 and args.distilled_lora:
+        args.distilled_lora_stage_1 = [LoraPathStrengthAndSDOps(
+            args.distilled_lora[0].path,
+            args.distilled_lora_strength_stage_1,
+            args.distilled_lora[0].sd_ops,
+        )]
+        print(f">>> HQ: Stage 1 distilled LoRA strength = {args.distilled_lora_strength_stage_1}")
+
+    # When --distilled-lora-strength-stage-2 > 0, override distilled LoRA strength for stage 2
+    if args.distilled_lora_strength_stage_2 > 0 and args.distilled_lora:
+        args.distilled_lora = [LoraPathStrengthAndSDOps(
+            args.distilled_lora[0].path,
+            args.distilled_lora_strength_stage_2,
+            args.distilled_lora[0].sd_ops,
+        )]
+        print(f">>> HQ: Stage 2 distilled LoRA strength = {args.distilled_lora_strength_stage_2}")
+
+    # Handle --quantization (applies QuantizationPolicy to transformer)
+    if args.quantization is not None:
+        from ltx_core.quantization import QuantizationPolicy
+        if args.quantization == "fp8-cast":
+            args.quantization_policy = QuantizationPolicy.fp8_cast()
+            print(f">>> Quantization: fp8-cast (FP8 with upcasting)")
+        elif args.quantization == "fp8-scaled-mm":
+            args.quantization_policy = QuantizationPolicy.fp8_scaled_mm()
+            print(f">>> Quantization: fp8-scaled-mm (FP8 scaled matrix multiply)")
+    else:
+        args.quantization_policy = None
+
     pipeline_type = "refine-only" if args.refine_only else ("one-stage" if args.one_stage else "two-stage")
     checkpoint_type = "distilled" if args.distilled_checkpoint else "standard"
     print("=" * 60)
@@ -11344,6 +11459,8 @@ def main():
         loras=args.loras,
         stage2_loras=args.stage2_loras,
         stage3_loras=args.stage3_loras,
+        distilled_lora_stage_1=args.distilled_lora_stage_1,
+        quantization_policy=args.quantization_policy,
         fp8transformer=args.enable_fp8,
         offload=args.offload,
         enable_dit_block_swap=args.enable_dit_block_swap,

@@ -1641,6 +1641,10 @@ def generate_ltx_video(
     apg_norm_threshold: float,
     ge_gamma: float,
     res2s_noise_seed: int,
+    # HQ Pipeline (per-stage distilled LoRA + quantization)
+    distilled_lora_strength_stage_1: float,
+    distilled_lora_strength_stage_2: float,
+    quantization_mode: str,
     # Keyframe Interpolation
     keyframe_interpolation: bool,
     keyframe_image_1: str,
@@ -1746,7 +1750,7 @@ def generate_ltx_video(
 
         # Build command
         command = [
-            sys.executable, "ltx_generate_video.py",
+            sys.executable, "ltx_generate_video2.3.py",
             "--checkpoint-path", checkpoint_path,
             "--gemma-root", gemma_root,
             "--prompt", str(prompt),
@@ -1930,6 +1934,14 @@ def generate_ltx_video(
             command.extend(["--spatial-upscale-factor", str(spatial_upscale_factor)])
         if res2s_noise_seed and int(res2s_noise_seed) >= 0:
             command.extend(["--res2s-noise-seed", str(int(res2s_noise_seed))])
+
+        # HQ Pipeline (per-stage distilled LoRA strengths + quantization)
+        if distilled_lora_strength_stage_1 and float(distilled_lora_strength_stage_1) > 0:
+            command.extend(["--distilled-lora-strength-stage-1", str(float(distilled_lora_strength_stage_1))])
+        if distilled_lora_strength_stage_2 and float(distilled_lora_strength_stage_2) > 0:
+            command.extend(["--distilled-lora-strength-stage-2", str(float(distilled_lora_strength_stage_2))])
+        if quantization_mode and quantization_mode != "none":
+            command.extend(["--quantization", str(quantization_mode)])
 
         # Keyframe Interpolation
         if keyframe_interpolation:
@@ -2622,7 +2634,7 @@ def generate_svi_ltx_video(
 
         # Build command
         command = [
-            sys.executable, "ltx_generate_video.py",
+            sys.executable, "ltx_generate_video2.3.py",
             "--checkpoint-path", checkpoint_path,
             "--gemma-root", gemma_root,
             "--prompt", str(main_prompt),
@@ -3142,6 +3154,32 @@ def create_interface():
                                     label="Res2s Noise Seed",
                                     value=-1,
                                     info="SDE noise seed for res2s sampler (-1 = no noise)"
+                                )
+
+                        # HQ Pipeline Features (per-stage distilled LoRA + quantization)
+                        with gr.Accordion("HQ Pipeline (Per-Stage LoRA & Quantization)", open=False):
+                            gr.Markdown("""
+                            **HQ Pipeline features** from `ti2vid_two_stages_hq`:
+                            - Per-stage distilled LoRA strengths (stage 1 = base generation, stage 2 = refinement)
+                            - Quantization for reduced VRAM (FP8 casting or scaled matrix multiply)
+                            """)
+                            with gr.Row():
+                                distilled_lora_strength_stage_1 = gr.Slider(
+                                    minimum=0.0, maximum=1.0, value=0.25, step=0.05,
+                                    label="Distilled LoRA Strength (Stage 1)",
+                                    info="Strength for stage 1 base generation (HQ default: 0.25, 0=disabled)"
+                                )
+                                distilled_lora_strength_stage_2 = gr.Slider(
+                                    minimum=0.0, maximum=1.0, value=0.5, step=0.05,
+                                    label="Distilled LoRA Strength (Stage 2)",
+                                    info="Strength for stage 2 refinement (HQ default: 0.5, 0=disabled)"
+                                )
+                            with gr.Row():
+                                quantization_mode = gr.Dropdown(
+                                    label="Quantization",
+                                    choices=["none", "fp8-cast", "fp8-scaled-mm"],
+                                    value="none",
+                                    info="FP8 quantization policy for transformer (reduces VRAM)"
                                 )
 
                         # Advanced CFG (MultiModal Guidance)
@@ -4956,6 +4994,9 @@ def create_interface():
                 guider_type, denoising_loop, spatial_upscale_factor,
                 apg_eta, apg_norm_threshold, ge_gamma,
                 res2s_noise_seed,
+                # HQ Pipeline (per-stage distilled LoRA + quantization)
+                distilled_lora_strength_stage_1, distilled_lora_strength_stage_2,
+                quantization_mode,
                 # Keyframe Interpolation
                 keyframe_interpolation,
                 keyframe_image_1, keyframe_frame_1, keyframe_strength_1,

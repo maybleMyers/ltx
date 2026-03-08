@@ -103,6 +103,8 @@ class ModelLedger:
         loras: tuple[LoraPathStrengthAndSDOps, ...] = (),
         registry: Registry | None = None,
         quantization: QuantizationPolicy | None = None,
+        vae_path: str | None = None,
+        fp8transformer: bool = False,
     ):
         self.dtype = dtype
         self.device = device
@@ -112,9 +114,14 @@ class ModelLedger:
         self.loras = loras
         self.registry = registry or DummyRegistry()
         self.quantization = quantization
+        self.vae_path = vae_path
+        self.fp8transformer = fp8transformer
         self.build_model_builders()
 
     def build_model_builders(self) -> None:
+        # Use separate VAE path if provided, otherwise fall back to checkpoint
+        vae_model_path = self.vae_path if self.vae_path is not None else self.checkpoint_path
+
         if self.checkpoint_path is not None:
             self.transformer_builder = Builder(
                 model_path=self.checkpoint_path,
@@ -125,14 +132,14 @@ class ModelLedger:
             )
 
             self.vae_decoder_builder = Builder(
-                model_path=self.checkpoint_path,
+                model_path=vae_model_path,
                 model_class_configurator=VideoDecoderConfigurator,
                 model_sd_ops=VAE_DECODER_COMFY_KEYS_FILTER,
                 registry=self.registry,
             )
 
             self.vae_encoder_builder = Builder(
-                model_path=self.checkpoint_path,
+                model_path=vae_model_path,
                 model_class_configurator=VideoEncoderConfigurator,
                 model_sd_ops=VAE_ENCODER_COMFY_KEYS_FILTER,
                 registry=self.registry,
@@ -208,6 +215,8 @@ class ModelLedger:
             loras=loras,
             registry=self.registry,
             quantization=self.quantization,
+            vae_path=self.vae_path,
+            fp8transformer=self.fp8transformer,
         )
 
     def transformer(self) -> X0Model:
