@@ -99,25 +99,25 @@ def combined_image_conditionings(
     conditionings = []
     for img in images:
         image = load_image_conditioning(
-            image_path=img.path,
+            image_path=img[0],
             height=height,
             width=width,
             dtype=dtype,
             device=device,
-            crf=img.crf,
+            crf=img[3],
         )
         encoded_image = video_encoder(image)
-        if img.frame_idx == 0:
+        if img[1] == 0:
             conditioning = VideoConditionByLatentIndex(
                 latent=encoded_image,
-                strength=img.strength,
+                strength=img[2],
                 latent_idx=0,
             )
         else:
             conditioning = VideoConditionByKeyframeIndex(
                 keyframes=encoded_image,
-                strength=img.strength,
-                frame_idx=img.frame_idx,
+                strength=img[2],
+                frame_idx=img[1],
             )
         conditionings.append(conditioning)
     return conditionings
@@ -134,19 +134,19 @@ def image_conditionings_by_replacing_latent(
     conditionings = []
     for img in images:
         image = load_image_conditioning(
-            image_path=img.path,
+            image_path=img[0],
             height=height,
             width=width,
             dtype=dtype,
             device=device,
-            crf=img.crf,
+            crf=img[3],
         )
         encoded_image = video_encoder(image)
         conditionings.append(
             VideoConditionByLatentIndex(
                 latent=encoded_image,
-                strength=img.strength,
-                latent_idx=img.frame_idx,
+                strength=img[2],
+                latent_idx=img[1],
             )
         )
 
@@ -164,16 +164,16 @@ def image_conditionings_by_adding_guiding_latent(
     conditionings = []
     for img in images:
         image = load_image_conditioning(
-            image_path=img.path,
+            image_path=img[0],
             height=height,
             width=width,
             dtype=dtype,
             device=device,
-            crf=img.crf,
+            crf=img[3],
         )
         encoded_image = video_encoder(image)
         conditionings.append(
-            VideoConditionByKeyframeIndex(keyframes=encoded_image, frame_idx=img.frame_idx, strength=img.strength)
+            VideoConditionByKeyframeIndex(keyframes=encoded_image, frame_idx=img[1], strength=img[2])
         )
     return conditionings
 
