@@ -5418,8 +5418,6 @@ class LTXVideoGeneratorWithOffloading:
                         'dtype': dtype,
                         'device': self.device,
                         'initial_audio_latent': v2a_preserved_audio_latent,
-                        'audio_conditionings': audio_conditionings if audio_conditionings else None,
-                        'audio_noise_scale': audio_noise_scale,
                     }
 
                     # Execute with OOM retry
@@ -5470,8 +5468,6 @@ class LTXVideoGeneratorWithOffloading:
                     'noise_scale': video_noise_scale,
                     'initial_video_latent': v2v_initial_latent,
                     'initial_audio_latent': v2a_preserved_audio_latent,
-                    'audio_conditionings': audio_conditionings if audio_conditionings else None,
-                    'audio_noise_scale': audio_noise_scale,
                 }
 
                 # Execute with OOM retry
@@ -6246,7 +6242,6 @@ class LTXVideoGeneratorWithOffloading:
             'noise_scale': distilled_sigmas[0],
             'initial_video_latent': upscaled_video_latent,
             'initial_audio_latent': stage_2_initial_audio,
-            'audio_conditionings': audio_conditionings if audio_conditionings else None,
         }
 
         # Execute with OOM retry
@@ -6622,7 +6617,6 @@ class LTXVideoGeneratorWithOffloading:
                 'noise_scale': stage3_sigmas[0],
                 'initial_video_latent': stage_3_initial_video,
                 'initial_audio_latent': stage_3_initial_audio,
-                'audio_conditionings': audio_conditionings if audio_conditionings else None,
             }
 
             # Execute with OOM retry
