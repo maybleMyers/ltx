@@ -54,7 +54,7 @@ from ltx_core.model.audio_vae import AudioProcessor, decode_audio as vae_decode_
 from ltx_core.model.upsampler import upsample_video
 from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
 from ltx_core.model.video_vae import decode_video as vae_decode_video
-from ltx_core.types import LatentState, VideoPixelShape
+from ltx_core.types import Audio, LatentState, VideoPixelShape
 
 from ltx_pipelines.utils import ModelLedger
 # Block swap and offloading utils are from the modified packages (not in unmodified 2.3)
@@ -4630,10 +4630,8 @@ class LTXVideoGeneratorWithOffloading:
                         waveform = waveform.unsqueeze(0)
 
                     # Convert waveform to mel spectrogram (use float32 for audio quality)
-                    mel_spectrogram = audio_processor.waveform_to_mel(
-                        waveform.to(dtype=torch.float32),
-                        waveform_sample_rate=sample_rate
-                    )
+                    audio_obj = Audio(waveform=waveform.to(dtype=torch.float32), sampling_rate=sample_rate)
+                    mel_spectrogram = audio_processor.waveform_to_mel(audio_obj)
 
                     # Encode mel spectrogram to latents
                     audio_latent = audio_encoder(mel_spectrogram.to(dtype=torch.float32))
@@ -5342,10 +5340,8 @@ class LTXVideoGeneratorWithOffloading:
                     elif waveform.dim() == 2:
                         waveform = waveform.unsqueeze(0)
 
-                    mel_spectrogram = audio_processor.waveform_to_mel(
-                        waveform.to(dtype=torch.float32),
-                        waveform_sample_rate=sample_rate
-                    )
+                    audio_obj = Audio(waveform=waveform.to(dtype=torch.float32), sampling_rate=sample_rate)
+                    mel_spectrogram = audio_processor.waveform_to_mel(audio_obj)
                     audio_latent = audio_encoder(mel_spectrogram.to(dtype=torch.float32))
                     audio_latent = audio_latent.to(dtype=dtype)
 
@@ -7211,7 +7207,7 @@ def generate_av_extension(
 
     import cv2
     from dataclasses import replace as dataclass_replace
-    from ltx_core.types import LatentState, VideoPixelShape
+    from ltx_core.types import Audio, LatentState, VideoPixelShape
 
     device = generator.device
     dtype = generator.dtype
@@ -8596,7 +8592,7 @@ def generate_v2v_join(
     import cv2
     import numpy as np
     from dataclasses import replace as dataclass_replace
-    from ltx_core.types import LatentState, VideoPixelShape
+    from ltx_core.types import Audio, LatentState, VideoPixelShape
 
     device = generator.device
     dtype = generator.dtype
