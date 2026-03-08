@@ -4669,6 +4669,47 @@ class LTXVideoGeneratorWithOffloading:
         # =====================================================================
         skip_stage_1 = self.refine_only and input_video
 
+        # Convert anchor_decay "none" to None for all stages
+        effective_anchor_decay = anchor_decay if anchor_decay and anchor_decay != "none" else None
+
+        # Helper to select the right denoising loop based on sampler and denoising_loop type
+        def _run_denoising_loop(sigmas, video_state, audio_state, stepper, denoise_fn,
+                                sampler_override=None,
+                                use_anchor_decay=True, use_callback=True, use_norm=True):
+            _anchor = effective_anchor_decay if use_anchor_decay else None
+            _callback = preview_callback if use_callback else None
+            _cb_interval = preview_callback_interval
+            _norm = latent_norm_fn if use_norm else None
+            _sampler = sampler_override if sampler_override else sampler
+            
+            if _sampler == "res2s":
+                _noise_seed = res2s_noise_seed if res2s_noise_seed >= 0 else seed
+                return res2s_audio_video_denoising_loop(
+                    sigmas=sigmas,
+                    video_state=video_state,
+                    audio_state=audio_state,
+                    stepper=stepper,
+                    denoise_fn=denoise_fn,
+                    noise_seed=_noise_seed,
+                )
+            elif denoising_loop == "gradient_estimation" and _sampler == "euler":
+                return gradient_estimating_euler_denoising_loop(
+                    sigmas=sigmas,
+                    video_state=video_state,
+                    audio_state=audio_state,
+                    stepper=stepper,
+                    denoise_fn=denoise_fn,
+                    ge_gamma=ge_gamma,
+                )
+            else:
+                return euler_denoising_loop(
+                    sigmas=sigmas,
+                    video_state=video_state,
+                    audio_state=audio_state,
+                    stepper=stepper,
+                    denoise_fn=denoise_fn,
+                )
+
         # Initialize V2V initial latent (will be set if input_video is provided for non-refine-only)
         v2v_initial_latent = None
         v2v_audio_latent = None
@@ -4857,42 +4898,6 @@ class LTXVideoGeneratorWithOffloading:
             # Use CFG+STG guidance if either is enabled, otherwise simple denoising
             use_cfg = cfg_guidance_scale > 1.0 and v_context_n is not None
             use_stg = stg_guider.enabled() and stg_perturbation_config is not None
-            # Convert anchor_decay "none" to None for the denoising loop
-            effective_anchor_decay = anchor_decay if anchor_decay and anchor_decay != "none" else None
-            # Helper to select the right denoising loop based on sampler and denoising_loop type
-            def _run_denoising_loop(sigmas, video_state, audio_state, stepper, denoise_fn,
-                                    use_anchor_decay=True, use_callback=True, use_norm=True):
-                _anchor = effective_anchor_decay if use_anchor_decay else None
-                _callback = preview_callback if use_callback else None
-                _cb_interval = preview_callback_interval
-                _norm = latent_norm_fn if use_norm else None
-                if sampler == "res2s":
-                    _noise_seed = res2s_noise_seed if res2s_noise_seed >= 0 else seed
-                    return res2s_audio_video_denoising_loop(
-                        sigmas=sigmas,
-                        video_state=video_state,
-                        audio_state=audio_state,
-                        stepper=stepper,
-                        denoise_fn=denoise_fn,
-                        noise_seed=_noise_seed,
-                    )
-                elif denoising_loop == "gradient_estimation":
-                    return gradient_estimating_euler_denoising_loop(
-                        sigmas=sigmas,
-                        video_state=video_state,
-                        audio_state=audio_state,
-                        stepper=stepper,
-                        denoise_fn=denoise_fn,
-                        ge_gamma=ge_gamma,
-                    )
-                else:
-                    return euler_denoising_loop(
-                        sigmas=sigmas,
-                        video_state=video_state,
-                        audio_state=audio_state,
-                        stepper=stepper,
-                        denoise_fn=denoise_fn,
-                    )
 
             if use_cfg or use_stg:
                 # CFG+STG guidance (handles both independently)
@@ -5952,15 +5957,13 @@ class LTXVideoGeneratorWithOffloading:
             stage2_stepper.reset()
 
         # Define denoising function for stage 2 (no CFG, just positive)
-        # Convert anchor_decay "none" to None for the denoising loop (if not already done in stage 1)
-        effective_anchor_decay = anchor_decay if anchor_decay and anchor_decay != "none" else None
         def second_stage_denoising_loop(
             sigmas: torch.Tensor,
             video_state: LatentState,
             audio_state: LatentState,
             stepper: DiffusionStepProtocol,
         ) -> tuple[LatentState, LatentState]:
-            return euler_denoising_loop(
+            return _run_denoising_loop(
                 sigmas=sigmas,
                 video_state=video_state,
                 audio_state=audio_state,
@@ -5970,6 +5973,7 @@ class LTXVideoGeneratorWithOffloading:
                     audio_context=a_context_p,
                     transformer=transformer,
                 ),
+                sampler_override=stage2_sampler,
             )
 
         # Stage 2 output shape (full resolution)
@@ -6525,14 +6529,13 @@ class LTXVideoGeneratorWithOffloading:
                 stage2_stepper.reset()
 
             # Define denoising function for stage 3
-            effective_anchor_decay = anchor_decay if anchor_decay and anchor_decay != "none" else None
             def third_stage_denoising_loop(
                 sigmas: torch.Tensor,
                 video_state: LatentState,
                 audio_state: LatentState,
                 stepper: DiffusionStepProtocol,
             ) -> tuple[LatentState, LatentState]:
-                return euler_denoising_loop(
+                return _run_denoising_loop(
                     sigmas=sigmas,
                     video_state=video_state,
                     audio_state=audio_state,
@@ -6542,10 +6545,7 @@ class LTXVideoGeneratorWithOffloading:
                         audio_context=a_context_p,
                         transformer=transformer,
                     ),
-                    anchor_decay=effective_anchor_decay,
-                    callback=preview_callback,
-                    callback_interval=preview_callback_interval,
-                    latent_norm_fn=latent_norm_fn,
+                    sampler_override=stage2_sampler,
                 )
 
             # Stage 3 output shape (always full resolution)
