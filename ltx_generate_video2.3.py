@@ -4886,8 +4886,6 @@ class LTXVideoGeneratorWithOffloading:
                         stepper=stepper,
                         denoise_fn=denoise_fn,
                         ge_gamma=ge_gamma,
-                        anchor_decay=_anchor,
-                        latent_norm_fn=_norm,
                     )
                 else:
                     return euler_denoising_loop(
@@ -4896,8 +4894,6 @@ class LTXVideoGeneratorWithOffloading:
                         audio_state=audio_state,
                         stepper=stepper,
                         denoise_fn=denoise_fn,
-                        anchor_decay=_anchor,
-                        callback=_callback,
                         callback_interval=_cb_interval,
                         latent_norm_fn=_norm,
                     )
