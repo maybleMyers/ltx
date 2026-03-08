@@ -5325,7 +5325,8 @@ class LTXVideoGeneratorWithOffloading:
             if audio is not None:
                 from ltx_core.conditioning import AudioConditionByLatent
                 print(f">>> Loading and encoding audio from {audio}...")
-                waveform, sample_rate = decode_audio_from_file(audio, self.device)
+                audio_data = decode_audio_from_file(audio, self.device)
+                waveform, sample_rate = (audio_data.waveform, audio_data.sampling_rate) if audio_data else (None, None)
                 if waveform is not None:
                     audio_encoder = self.stage_1_model_ledger.audio_encoder()
                     audio_processor = AudioProcessor(
