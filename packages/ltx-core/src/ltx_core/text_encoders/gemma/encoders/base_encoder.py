@@ -6,6 +6,7 @@ from einops import rearrange
 from transformers import AutoImageProcessor, Gemma3ForConditionalGeneration, Gemma3Processor
 
 from ltx_core.loader.module_ops import ModuleOps
+from ltx_core.text_encoders.gemma.feature_extractor import GemmaFeaturesExtractorProjLinear
 from ltx_core.text_encoders.gemma.tokenizer import LTXVGemmaTokenizer
 
 
@@ -18,13 +19,13 @@ class GemmaTextEncoderModelBase(torch.nn.Module):
     Args:
         tokenizer (LTXVGemmaTokenizer): The tokenizer used for text preprocessing.
         model (Gemma3ForConditionalGeneration): The base Gemma LLM.
-        feature_extractor_linear (torch.nn.Module): Feature extraction module (V1 or V2).
+        feature_extractor_linear (GemmaFeaturesExtractorProjLinear): Linear projection for hidden state aggregation.
         dtype (torch.dtype, optional): The data type for model parameters (default: torch.bfloat16).
     """
 
     def __init__(
         self,
-        feature_extractor_linear: torch.nn.Module,
+        feature_extractor_linear: GemmaFeaturesExtractorProjLinear,
         tokenizer: LTXVGemmaTokenizer | None = None,
         model: Gemma3ForConditionalGeneration | None = None,
         img_processor: Gemma3Processor | None = None,

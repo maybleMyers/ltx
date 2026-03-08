@@ -510,7 +510,6 @@ def modality_from_latent_state(
         positions=state.positions,
         context=context,
         context_mask=None,
-        sigma=sigma if isinstance(sigma, torch.Tensor) else torch.tensor(sigma, device=state.latent.device, dtype=state.latent.dtype),
     )
 
 
@@ -989,60 +988,3 @@ def create_per_step_adain_norm_fn(
         return video_latent, audio_latent
 
     return norm_fn
-
-
-def denoise_video_only(
-    output_shape: VideoPixelShape,
-    conditionings: list[ConditioningItem],
-    noiser: Noiser,
-    sigmas: torch.Tensor,
-    stepper: DiffusionStepProtocol,
-    denoising_loop_fn: DenoisingLoopFunc,
-    components: PipelineComponents,
-    dtype: torch.dtype,
-    device: torch.device,
-    noise_scale: float = 1.0,
-    initial_video_latent: torch.Tensor | None = None,
-    initial_audio_latent: torch.Tensor | None = None,
-) -> LatentState:
-    """Denoise only video while keeping audio frozen (denoise_mask=0).
-
-    Used by audio-to-video pipelines where audio is pre-encoded and should
-    not be modified during denoising.
-    """
-    video_state, video_tools = noise_video_state(
-        output_shape=output_shape,
-        noiser=noiser,
-        conditionings=conditionings,
-        components=components,
-        dtype=dtype,
-        device=device,
-        noise_scale=noise_scale,
-        initial_latent=initial_video_latent,
-    )
-
-    audio_state, _ = noise_audio_state(
-        output_shape=output_shape,
-        noiser=noiser,
-        conditionings=[],
-        components=components,
-        dtype=dtype,
-        device=device,
-        noise_scale=0.0,
-        initial_latent=initial_audio_latent,
-    )
-
-    # Freeze audio: set denoise_mask to zero so audio latent is not modified
-    audio_state = replace(audio_state, denoise_mask=torch.zeros_like(audio_state.denoise_mask))
-
-    video_state, audio_state = denoising_loop_fn(
-        sigmas,
-        video_state,
-        audio_state,
-        stepper,
-    )
-
-    video_state = video_tools.clear_conditioning(video_state)
-    video_state = video_tools.unpatchify(video_state)
-
-    return video_state

@@ -156,22 +156,6 @@ class AudioLatentShape(NamedTuple):
         )
 
 
-@dataclass
-class Audio:
-    """
-    Container for decoded audio samples and metadata.
-    Attributes:
-        waveform: Audio waveform tensor.
-        sampling_rate: Sampling rate (Hz) of the waveform.
-    """
-
-    waveform: torch.Tensor
-    sampling_rate: int
-
-    def to(self, device: torch.device) -> "Audio":
-        return Audio(waveform=self.waveform.to(device), sampling_rate=self.sampling_rate)
-
-
 @dataclass(frozen=True)
 class LatentState:
     """

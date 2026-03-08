@@ -245,40 +245,6 @@ class AudioEncoder(torch.nn.Module):
         return self.patchifier.unpatchify(latent_normalized, latent_shape)
 
 
-def encode_audio(
-    waveform: torch.Tensor,
-    sample_rate: int,
-    audio_encoder: AudioEncoder,
-) -> torch.Tensor:
-    """Encode audio waveform into latent representation.
-    Args:
-        waveform: Audio waveform tensor of shape (batch, channels, samples).
-        sample_rate: Sampling rate of the waveform.
-        audio_encoder: Audio encoder model.
-    Returns:
-        Encoded latent tensor.
-    """
-    from ltx_core.model.audio_vae.ops import AudioProcessor as _AudioProcessor
-
-    dtype = next(audio_encoder.parameters()).dtype
-    device = next(audio_encoder.parameters()).device
-
-    audio_processor = _AudioProcessor(
-        sample_rate=audio_encoder.sample_rate,
-        mel_bins=audio_encoder.mel_bins,
-        mel_hop_length=audio_encoder.mel_hop_length,
-        n_fft=audio_encoder.n_fft,
-    ).to(device=device)
-
-    mel_spectrogram = audio_processor.waveform_to_mel(
-        waveform.to(device=device, dtype=torch.float32),
-        waveform_sample_rate=sample_rate,
-    )
-
-    latent = audio_encoder(mel_spectrogram.to(dtype=dtype))
-    return latent
-
-
 class AudioDecoder(torch.nn.Module):
     """
     Symmetric decoder that reconstructs audio spectrograms from latent features.

@@ -21,5 +21,3 @@ class Modality:
     context: torch.Tensor
     enabled: bool = True
     context_mask: torch.Tensor | None = None
-    sigma: torch.Tensor | None = None  # Shape: (B,). Current sigma value, used for cross-attention timestep calculation.
-    attention_mask: torch.Tensor | None = None

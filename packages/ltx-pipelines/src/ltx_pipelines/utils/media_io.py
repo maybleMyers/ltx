@@ -234,24 +234,6 @@ def encode_video(
     container.close()
 
 
-def get_videostream_metadata(path: str) -> tuple[float, int, int, int]:
-    """Read video stream metadata: (fps, num_frames, width, height).
-    If frame count is missing in the container, decodes the stream to count frames.
-    """
-    container = av.open(path)
-    try:
-        video_stream = next(s for s in container.streams if s.type == "video")
-        fps = float(video_stream.average_rate)
-        num_frames = video_stream.frames or 0
-        if num_frames == 0:
-            num_frames = sum(1 for _ in container.decode(video_stream))
-        width = video_stream.codec_context.width
-        height = video_stream.codec_context.height
-        return fps, num_frames, width, height
-    finally:
-        container.close()
-
-
 def decode_audio_from_file(path: str, device: torch.device) -> tuple[torch.Tensor | None, int | None]:
     container = av.open(path)
     sample_rate = None

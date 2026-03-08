@@ -10,6 +10,7 @@ from ltx_core.model.transformer.rope import (
     generate_freq_grid_pytorch,
     precompute_freqs_cis,
 )
+from ltx_core.model.transformer.text_projection import PixArtAlphaTextProjection
 
 
 @dataclass(frozen=True)
@@ -24,10 +25,6 @@ class TransformerArgs:
     cross_scale_shift_timestep: torch.Tensor | None
     cross_gate_timestep: torch.Tensor | None
     enabled: bool
-    prompt_timestep: torch.Tensor | None = None
-    self_attention_mask: torch.Tensor | None = (
-        None  # Additive log-space self-attention bias (B, 1, T, T), None = full attention
-    )
 
 
 class TransformerArgsPreprocessor:
@@ -35,6 +32,7 @@ class TransformerArgsPreprocessor:
         self,
         patchify_proj: torch.nn.Linear,
         adaln: AdaLayerNormSingle,
+        caption_projection: PixArtAlphaTextProjection,
         inner_dim: int,
         max_pos: list[int],
         num_attention_heads: int,
@@ -43,11 +41,10 @@ class TransformerArgsPreprocessor:
         double_precision_rope: bool,
         positional_embedding_theta: float,
         rope_type: LTXRopeType,
-        caption_projection: torch.nn.Module | None = None,
-        prompt_adaln: AdaLayerNormSingle | None = None,
     ) -> None:
         self.patchify_proj = patchify_proj
         self.adaln = adaln
+        self.caption_projection = caption_projection
         self.inner_dim = inner_dim
         self.max_pos = max_pos
         self.num_attention_heads = num_attention_heads
@@ -56,25 +53,18 @@ class TransformerArgsPreprocessor:
         self.double_precision_rope = double_precision_rope
         self.positional_embedding_theta = positional_embedding_theta
         self.rope_type = rope_type
-        self.caption_projection = caption_projection
-        self.prompt_adaln = prompt_adaln
 
     def _prepare_timestep(
-        self, timestep: torch.Tensor, adaln: AdaLayerNormSingle, batch_size: int, hidden_dtype: torch.dtype, chunk_size: int = 50000
+        self, timestep: torch.Tensor, batch_size: int, hidden_dtype: torch.dtype, chunk_size: int = 50000
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Prepare timestep embeddings."""
-        timestep_scaled = timestep * self.timestep_scale_multiplier
+        timestep = timestep * self.timestep_scale_multiplier
 
-        if timestep_scaled.ndim > 1:
-            N = timestep_scaled.shape[1]
-        elif timestep_scaled.ndim == 1:
-            N = timestep_scaled.shape[0] // batch_size
-        else:
-            N = 1  # scalar
+        N = timestep.shape[1] if timestep.ndim > 1 else timestep.shape[0] // batch_size
 
         if N <= chunk_size:
-            timestep_out, embedded_timestep = adaln(
-                timestep_scaled.flatten(),
+            timestep_out, embedded_timestep = self.adaln(
+                timestep.flatten(),
                 hidden_dtype=hidden_dtype,
             )
             timestep_out = timestep_out.view(batch_size, -1, timestep_out.shape[-1])
@@ -83,8 +73,8 @@ class TransformerArgsPreprocessor:
             ts_chunks, emb_chunks = [], []
             for start in range(0, N, chunk_size):
                 end = min(start + chunk_size, N)
-                ts_chunk = timestep_scaled[:, start:end] if timestep_scaled.ndim > 1 else timestep_scaled.view(batch_size, -1)[:, start:end]
-                ts_out, emb_out = adaln(ts_chunk.flatten(), hidden_dtype=hidden_dtype)
+                ts_chunk = timestep[:, start:end] if timestep.ndim > 1 else timestep.view(batch_size, -1)[:, start:end]
+                ts_out, emb_out = self.adaln(ts_chunk.flatten(), hidden_dtype=hidden_dtype)
                 ts_chunks.append(ts_out.cpu())
                 emb_chunks.append(emb_out.cpu())
                 del ts_chunk, ts_out, emb_out
@@ -100,12 +90,14 @@ class TransformerArgsPreprocessor:
         self,
         context: torch.Tensor,
         x: torch.Tensor,
-    ) -> torch.Tensor:
+        attention_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Prepare context for transformer blocks."""
-        if self.caption_projection is not None:
-            context = self.caption_projection(context)
         batch_size = x.shape[0]
-        return context.view(batch_size, -1, x.shape[-1])
+        context = self.caption_projection(context)
+        context = context.view(batch_size, -1, x.shape[-1])
+
+        return context, attention_mask
 
     def _prepare_attention_mask(self, attention_mask: torch.Tensor | None, x_dtype: torch.dtype) -> torch.Tensor | None:
         """Prepare attention mask."""
@@ -140,44 +132,14 @@ class TransformerArgsPreprocessor:
         )
         return pe
 
-    def _prepare_self_attention_mask(
-        self, attention_mask: torch.Tensor | None, x_dtype: torch.dtype
-    ) -> torch.Tensor | None:
-        """Prepare self-attention mask by converting [0,1] values to additive log-space bias.
-        Input shape: (B, T, T) with values in [0, 1].
-        Output shape: (B, 1, T, T) with 0.0 for full attention and a large negative value
-        for masked positions.
-        """
-        if attention_mask is None:
-            return None
-
-        finfo = torch.finfo(x_dtype)
-        eps = finfo.tiny
-
-        bias = torch.full_like(attention_mask, finfo.min, dtype=x_dtype)
-        positive = attention_mask > 0
-        if positive.any():
-            bias[positive] = torch.log(attention_mask[positive].clamp(min=eps)).to(x_dtype)
-
-        return bias.unsqueeze(1)  # (B, 1, T, T) for head broadcast
-
     def prepare(
         self,
         modality: Modality,
-        cross_modality: Modality | None = None,  # noqa: ARG002
     ) -> TransformerArgs:
         x = self.patchify_proj(modality.latent)
-        batch_size = x.shape[0]
-        timestep, embedded_timestep = self._prepare_timestep(
-            modality.timesteps, self.adaln, batch_size, modality.latent.dtype
-        )
-        prompt_timestep = None
-        if self.prompt_adaln is not None:
-            prompt_timestep, _ = self._prepare_timestep(
-                modality.sigma, self.prompt_adaln, batch_size, modality.latent.dtype
-            )
-        context = self._prepare_context(modality.context, x)
-        attention_mask = self._prepare_attention_mask(modality.context_mask, modality.latent.dtype)
+        timestep, embedded_timestep = self._prepare_timestep(modality.timesteps, x.shape[0], modality.latent.dtype)
+        context, attention_mask = self._prepare_context(modality.context, x, modality.context_mask)
+        attention_mask = self._prepare_attention_mask(attention_mask, modality.latent.dtype)
         pe = self._prepare_positional_embeddings(
             positions=modality.positions,
             inner_dim=self.inner_dim,
@@ -186,7 +148,6 @@ class TransformerArgsPreprocessor:
             num_attention_heads=self.num_attention_heads,
             x_dtype=modality.latent.dtype,
         )
-        self_attention_mask = self._prepare_self_attention_mask(modality.attention_mask, modality.latent.dtype)
         return TransformerArgs(
             x=x,
             context=context,
@@ -198,8 +159,6 @@ class TransformerArgsPreprocessor:
             cross_scale_shift_timestep=None,
             cross_gate_timestep=None,
             enabled=modality.enabled,
-            prompt_timestep=prompt_timestep,
-            self_attention_mask=self_attention_mask,
         )
 
 
@@ -208,6 +167,7 @@ class MultiModalTransformerArgsPreprocessor:
         self,
         patchify_proj: torch.nn.Linear,
         adaln: AdaLayerNormSingle,
+        caption_projection: PixArtAlphaTextProjection,
         cross_scale_shift_adaln: AdaLayerNormSingle,
         cross_gate_adaln: AdaLayerNormSingle,
         inner_dim: int,
@@ -221,12 +181,11 @@ class MultiModalTransformerArgsPreprocessor:
         positional_embedding_theta: float,
         rope_type: LTXRopeType,
         av_ca_timestep_scale_multiplier: int,
-        caption_projection: torch.nn.Module | None = None,
-        prompt_adaln: AdaLayerNormSingle | None = None,
     ) -> None:
         self.simple_preprocessor = TransformerArgsPreprocessor(
             patchify_proj=patchify_proj,
             adaln=adaln,
+            caption_projection=caption_projection,
             inner_dim=inner_dim,
             max_pos=max_pos,
             num_attention_heads=num_attention_heads,
@@ -235,8 +194,6 @@ class MultiModalTransformerArgsPreprocessor:
             double_precision_rope=double_precision_rope,
             positional_embedding_theta=positional_embedding_theta,
             rope_type=rope_type,
-            caption_projection=caption_projection,
-            prompt_adaln=prompt_adaln,
         )
         self.cross_scale_shift_adaln = cross_scale_shift_adaln
         self.cross_gate_adaln = cross_gate_adaln
@@ -247,22 +204,8 @@ class MultiModalTransformerArgsPreprocessor:
     def prepare(
         self,
         modality: Modality,
-        cross_modality: Modality | None = None,
     ) -> TransformerArgs:
         transformer_args = self.simple_preprocessor.prepare(modality)
-        if cross_modality is None:
-            return transformer_args
-
-        if cross_modality.sigma.numel() > 1:
-            if cross_modality.sigma.shape[0] != modality.timesteps.shape[0]:
-                raise ValueError("Cross modality sigma must have the same batch size as the modality")
-            if cross_modality.sigma.ndim != 1:
-                raise ValueError("Cross modality sigma must be a 1D tensor")
-
-        cross_timestep = cross_modality.sigma.view(
-            modality.timesteps.shape[0], 1, *[1] * len(modality.timesteps.shape[2:])
-        )
-
         cross_pe = self.simple_preprocessor._prepare_positional_embeddings(
             positions=modality.positions[:, 0:1, :],
             inner_dim=self.audio_cross_attention_dim,
@@ -273,7 +216,7 @@ class MultiModalTransformerArgsPreprocessor:
         )
 
         cross_scale_shift_timestep, cross_gate_timestep = self._prepare_cross_attention_timestep(
-            timestep=cross_timestep,
+            timestep=modality.timesteps,
             timestep_scale_multiplier=self.simple_preprocessor.timestep_scale_multiplier,
             batch_size=transformer_args.x.shape[0],
             hidden_dtype=modality.latent.dtype,

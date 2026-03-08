@@ -45,8 +45,6 @@ def _move_transformer_args_to_device(args: TransformerArgs, device: torch.device
         cross_positional_embeddings=pe_to_device(args.cross_positional_embeddings),
         cross_scale_shift_timestep=to_device(args.cross_scale_shift_timestep),
         cross_gate_timestep=to_device(args.cross_gate_timestep),
-        prompt_timestep=to_device(getattr(args, 'prompt_timestep', None)),
-        self_attention_mask=to_device(getattr(args, 'self_attention_mask', None)),
     )
 
 
@@ -537,72 +535,79 @@ def enable_text_encoder_block_swap(
     # Patch the text encoder's _preprocess_text to use the correct device for tensors
     # The issue is that _preprocess_text creates tensors on self.model.device (CPU),
     # but with block swapping, we need them on GPU for the model and feature extraction.
-    text_encoder._original_preprocess_text = text_encoder._preprocess_text
+    if hasattr(text_encoder, "_preprocess_text"):
+        text_encoder._original_preprocess_text = text_encoder._preprocess_text
 
-    def device_aware_preprocess_text(text: str, padding_side: str = "left"):
-        """Patched _preprocess_text that creates tensors on the correct device."""
-        token_pairs = text_encoder.tokenizer.tokenize_with_weights(text)["gemma"]
-        # Create tensors on the block swap device (GPU) instead of self.model.device (CPU)
-        input_ids = torch.tensor([[t[0] for t in token_pairs]], device=device)
-        attention_mask = torch.tensor([[w[1] for w in token_pairs]], device=device)
-        outputs = text_encoder.model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
-        projected = text_encoder._run_feature_extractor(
-            hidden_states=outputs.hidden_states, attention_mask=attention_mask, padding_side=padding_side
-        )
-        return projected, attention_mask
+        def device_aware_preprocess_text(text: str, padding_side: str = "left"):
+            """Patched _preprocess_text that creates tensors on the correct device."""
+            token_pairs = text_encoder.tokenizer.tokenize_with_weights(text)["gemma"]
+            # Create tensors on the block swap device (GPU) instead of self.model.device (CPU)
+            input_ids = torch.tensor([[t[0] for t in token_pairs]], device=device)
+            attention_mask = torch.tensor([[w[1] for w in token_pairs]], device=device)
+            outputs = text_encoder.model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+            projected = text_encoder._run_feature_extractor(
+                hidden_states=outputs.hidden_states, attention_mask=attention_mask, padding_side=padding_side
+            )
+            return projected, attention_mask
 
-    text_encoder._preprocess_text = device_aware_preprocess_text
+        text_encoder._preprocess_text = device_aware_preprocess_text
 
     # Also patch _enhance for prompt enhancement with Gemma
     # The issue is that _enhance uses self.model.device which returns CPU when block swapping is enabled
-    text_encoder._original_enhance = text_encoder._enhance
+    if hasattr(text_encoder, "_enhance"):
+        text_encoder._original_enhance = text_encoder._enhance
 
-    def device_aware_enhance(
-        messages: list[dict[str, str]],
-        image: torch.Tensor | None = None,
-        max_new_tokens: int = 512,
-        seed: int = 42,
-    ) -> str:
-        """Patched _enhance that creates tensors on the correct device."""
-        if text_encoder.processor is None:
-            text_encoder._init_image_processor()
-        text = text_encoder.processor.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        def device_aware_enhance(
+            messages: list[dict[str, str]],
+            image: torch.Tensor | None = None,
+            max_new_tokens: int = 512,
+            seed: int = 42,
+        ) -> str:
+            """Patched _enhance that creates tensors on the correct device."""
+            if text_encoder.processor is None:
+                text_encoder._init_image_processor()
+            text = text_encoder.processor.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
-        model_inputs = text_encoder.processor(
-            text=text,
-            images=image,
-            return_tensors="pt",
-        ).to(device)  # Use block swap device instead of self.model.device
-        pad_token_id = text_encoder.processor.tokenizer.pad_token_id if text_encoder.processor.tokenizer.pad_token_id is not None else 0
+            model_inputs = text_encoder.processor(
+                text=text,
+                images=image,
+                return_tensors="pt",
+            ).to(device)  # Use block swap device instead of self.model.device
+            pad_token_id = text_encoder.processor.tokenizer.pad_token_id if text_encoder.processor.tokenizer.pad_token_id is not None else 0
 
-        # Import the padding helper from base_encoder
-        from ltx_core.text_encoders.gemma.encoders.base_encoder import _pad_inputs_for_attention_alignment
-        model_inputs = _pad_inputs_for_attention_alignment(model_inputs, pad_token_id=pad_token_id)
+            # Import the padding helper from base_encoder
+            try:
+                from ltx_core.text_encoders.gemma.encoders.base_encoder import _pad_inputs_for_attention_alignment
+            except ImportError:
+                # Fallback for different ltx_core versions
+                def _pad_inputs_for_attention_alignment(inputs, pad_token_id=0): return inputs
+            
+            model_inputs = _pad_inputs_for_attention_alignment(model_inputs, pad_token_id=pad_token_id)
 
-        # Disable fast swap during generate() - it's incompatible with many forward calls.
-        # Use legacy swap method like mainbranch does.
-        _offloader = text_encoder.model.language_model._block_swap_offloader
-        _was_fast_swap = _offloader.use_fast_swap
-        _offloader.use_fast_swap = False
+            # Disable fast swap during generate() - it's incompatible with many forward calls.
+            # Use legacy swap method like mainbranch does.
+            _offloader = text_encoder.model.language_model._block_swap_offloader
+            _was_fast_swap = _offloader.use_fast_swap
+            _offloader.use_fast_swap = False
 
-        try:
-            with torch.inference_mode(), torch.random.fork_rng(devices=[device]):
-                torch.manual_seed(seed)
-                outputs = text_encoder.model.generate(
-                    **model_inputs,
-                    max_new_tokens=max_new_tokens,
-                    do_sample=True,
-                    temperature=0.7,
-                )
-                generated_ids = outputs[0][len(model_inputs.input_ids[0]) :]
-                enhanced_prompt = text_encoder.processor.tokenizer.decode(generated_ids, skip_special_tokens=True)
-        finally:
-            # Restore fast swap for text encoding
-            _offloader.use_fast_swap = _was_fast_swap
+            try:
+                with torch.inference_mode(), torch.random.fork_rng(devices=[device]):
+                    torch.manual_seed(seed)
+                    outputs = text_encoder.model.generate(
+                        **model_inputs,
+                        max_new_tokens=max_new_tokens,
+                        do_sample=True,
+                        temperature=0.7,
+                    )
+                    generated_ids = outputs[0][len(model_inputs.input_ids[0]) :]
+                    enhanced_prompt = text_encoder.processor.tokenizer.decode(generated_ids, skip_special_tokens=True)
+            finally:
+                # Restore fast swap for text encoding
+                _offloader.use_fast_swap = _was_fast_swap
 
-        return enhanced_prompt
+            return enhanced_prompt
 
-    text_encoder._enhance = device_aware_enhance
+        text_encoder._enhance = device_aware_enhance
 
     # Store original forward method
     gemma_text_model._original_forward = gemma_text_model.forward
