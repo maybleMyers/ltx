@@ -4613,7 +4613,7 @@ class LTXVideoGeneratorWithOffloading:
 
                     # Create audio processor with encoder's parameters
                     audio_processor = AudioProcessor(
-                        sample_rate=audio_encoder.sample_rate,
+                        target_sample_rate=audio_encoder.sample_rate,
                         mel_bins=audio_encoder.mel_bins,
                         mel_hop_length=audio_encoder.mel_hop_length,
                         n_fft=audio_encoder.n_fft,
@@ -5125,7 +5125,7 @@ class LTXVideoGeneratorWithOffloading:
                             audio_encoder = self.stage_1_model_ledger.audio_encoder()
 
                             audio_processor = AudioProcessor(
-                                sample_rate=audio_encoder.sample_rate,
+                                target_sample_rate=audio_encoder.sample_rate,
                                 mel_bins=audio_encoder.mel_bins,
                                 mel_hop_length=audio_encoder.mel_hop_length,
                                 n_fft=audio_encoder.n_fft,
@@ -5231,7 +5231,7 @@ class LTXVideoGeneratorWithOffloading:
 
                         audio_encoder = self.stage_1_model_ledger.audio_encoder()
                         audio_processor = AudioProcessor(
-                            sample_rate=audio_encoder.sample_rate,
+                            target_sample_rate=audio_encoder.sample_rate,
                             mel_bins=audio_encoder.mel_bins,
                             mel_hop_length=audio_encoder.mel_hop_length,
                             n_fft=audio_encoder.n_fft,
@@ -5330,7 +5330,7 @@ class LTXVideoGeneratorWithOffloading:
                 if waveform is not None:
                     audio_encoder = self.stage_1_model_ledger.audio_encoder()
                     audio_processor = AudioProcessor(
-                        sample_rate=audio_encoder.sample_rate,
+                        target_sample_rate=audio_encoder.sample_rate,
                         mel_bins=audio_encoder.mel_bins,
                         mel_hop_length=audio_encoder.mel_hop_length,
                         n_fft=audio_encoder.n_fft,
@@ -7448,7 +7448,7 @@ def generate_av_extension(
         print(">>> Encoding audio to latent space...")
         audio_encoder = generator.stage_1_model_ledger.audio_encoder()
         audio_processor = AudioProcessor(
-            sample_rate=audio_encoder.sample_rate,
+            target_sample_rate=audio_encoder.sample_rate,
             mel_bins=audio_encoder.mel_bins,
             mel_hop_length=audio_encoder.mel_hop_length,
             n_fft=audio_encoder.n_fft,
@@ -8963,7 +8963,7 @@ def generate_v2v_join(
         print(">>> Encoding audio to latent space...")
         audio_encoder = generator.stage_1_model_ledger.audio_encoder()
         audio_processor = AudioProcessor(
-            sample_rate=audio_encoder.sample_rate,
+            target_sample_rate=audio_encoder.sample_rate,
             mel_bins=audio_encoder.mel_bins,
             mel_hop_length=audio_encoder.mel_hop_length,
             n_fft=audio_encoder.n_fft,
@@ -10827,7 +10827,7 @@ def generate_retake(
         audio_encoder = generator.stage_1_model_ledger.audio_encoder()
         from ltx_core.model.audio_vae import AudioProcessor
         audio_processor = AudioProcessor(
-            sample_rate=audio_encoder.sample_rate,
+            target_sample_rate=audio_encoder.sample_rate,
             mel_bins=audio_encoder.mel_bins,
             mel_hop_length=audio_encoder.mel_hop_length,
             n_fft=audio_encoder.n_fft,
