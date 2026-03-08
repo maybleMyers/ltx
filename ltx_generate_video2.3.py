@@ -4634,7 +4634,7 @@ class LTXVideoGeneratorWithOffloading:
                     mel_spectrogram = audio_processor.waveform_to_mel(audio_obj)
 
                     # Encode mel spectrogram to latents
-                    audio_latent = audio_encoder(mel_spectrogram.to(dtype=torch.float32))
+                    audio_latent = audio_encoder(mel_spectrogram.to(dtype=dtype))
                     # Convert to bfloat16 for consistency with pipeline
                     audio_latent = audio_latent.to(dtype=dtype)
                     # If conditioning, add to audio_conditionings list
@@ -5140,7 +5140,7 @@ class LTXVideoGeneratorWithOffloading:
                                 waveform_sample_rate=sample_rate
                             )
 
-                            v2v_audio_latent = audio_encoder(mel_spectrogram.to(dtype=torch.float32))
+                            v2v_audio_latent = audio_encoder(mel_spectrogram.to(dtype=dtype))
                             v2v_audio_latent = v2v_audio_latent.to(dtype=dtype)
 
                             del audio_encoder, audio_processor
@@ -5248,7 +5248,7 @@ class LTXVideoGeneratorWithOffloading:
                             waveform_sample_rate=sample_rate
                         )
 
-                        v2a_preserved_audio_latent = audio_encoder(mel_spectrogram.to(dtype=torch.float32))
+                        v2a_preserved_audio_latent = audio_encoder(mel_spectrogram.to(dtype=dtype))
                         v2a_preserved_audio_latent = v2a_preserved_audio_latent.to(dtype=dtype)
 
                         del audio_encoder, audio_processor
@@ -5342,7 +5342,7 @@ class LTXVideoGeneratorWithOffloading:
 
                     audio_obj = Audio(waveform=waveform.to(dtype=torch.float32), sampling_rate=sample_rate)
                     mel_spectrogram = audio_processor.waveform_to_mel(audio_obj)
-                    audio_latent = audio_encoder(mel_spectrogram.to(dtype=torch.float32))
+                    audio_latent = audio_encoder(mel_spectrogram.to(dtype=dtype))
                     audio_latent = audio_latent.to(dtype=dtype)
 
                     audio_conditionings.append(
