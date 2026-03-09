@@ -29,10 +29,15 @@ class VideoConditionByKeyframeIndex(ConditioningItem):
         latent_state: LatentState,
         latent_tools: VideoLatentTools,
     ) -> LatentState:
-        tokens = latent_tools.patchifier.patchify(self.keyframes)
+        # Move keyframes to target device to support activation offloading
+        # (conditionings may be on CPU while latent state is on GPU)
+        target_device = latent_state.latent.device
+        keyframes = self.keyframes.to(target_device)
+
+        tokens = latent_tools.patchifier.patchify(keyframes)
         latent_coords = latent_tools.patchifier.get_patch_grid_bounds(
-            output_shape=VideoLatentShape.from_torch_shape(self.keyframes.shape),
-            device=self.keyframes.device,
+            output_shape=VideoLatentShape.from_torch_shape(keyframes.shape),
+            device=target_device,
         )
         positions = get_pixel_coords(
             latent_coords=latent_coords,
@@ -41,14 +46,14 @@ class VideoConditionByKeyframeIndex(ConditioningItem):
         )
 
         positions[:, 0, ...] += self.frame_idx
-        positions = positions.to(dtype=torch.float32)
+        positions = positions.to(dtype=torch.float32, device=target_device)
         positions[:, 0, ...] /= latent_tools.fps
 
         denoise_mask = torch.full(
             size=(*tokens.shape[:2], 1),
             fill_value=1.0 - self.strength,
-            device=self.keyframes.device,
-            dtype=self.keyframes.dtype,
+            device=target_device,
+            dtype=keyframes.dtype,
         )
 
         new_attention_mask = update_attention_mask(
@@ -57,8 +62,8 @@ class VideoConditionByKeyframeIndex(ConditioningItem):
             num_noisy_tokens=latent_tools.target_shape.token_count(),
             num_new_tokens=tokens.shape[1],
             batch_size=tokens.shape[0],
-            device=self.keyframes.device,
-            dtype=self.keyframes.dtype,
+            device=target_device,
+            dtype=keyframes.dtype,
         )
 
         return LatentState(

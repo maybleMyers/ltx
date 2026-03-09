@@ -45,19 +45,23 @@ class VideoConditionByReferenceLatent(ConditioningItem):
         latent_tools: VideoLatentTools,
     ) -> LatentState:
         """Append reference video tokens with scaled positions."""
-        tokens = latent_tools.patchifier.patchify(self.latent)
+        # Move latent to target device to support activation offloading
+        target_device = latent_state.latent.device
+        latent = self.latent.to(target_device)
+
+        tokens = latent_tools.patchifier.patchify(latent)
 
         # Compute positions for the reference video's actual dimensions
         latent_coords = latent_tools.patchifier.get_patch_grid_bounds(
-            output_shape=VideoLatentShape.from_torch_shape(self.latent.shape),
-            device=self.latent.device,
+            output_shape=VideoLatentShape.from_torch_shape(latent.shape),
+            device=target_device,
         )
         positions = get_pixel_coords(
             latent_coords=latent_coords,
             scale_factors=latent_tools.scale_factors,
             causal_fix=latent_tools.causal_fix,
         )
-        positions = positions.to(dtype=torch.float32)
+        positions = positions.to(dtype=torch.float32, device=target_device)
         positions[:, 0, ...] /= latent_tools.fps
 
         # Scale spatial positions to match target coordinate space
@@ -68,8 +72,8 @@ class VideoConditionByReferenceLatent(ConditioningItem):
         denoise_mask = torch.full(
             size=(*tokens.shape[:2], 1),
             fill_value=1.0 - self.strength,
-            device=self.latent.device,
-            dtype=self.latent.dtype,
+            device=target_device,
+            dtype=latent.dtype,
         )
 
         new_attention_mask = update_attention_mask(
@@ -78,8 +82,8 @@ class VideoConditionByReferenceLatent(ConditioningItem):
             num_noisy_tokens=latent_tools.target_shape.token_count(),
             num_new_tokens=tokens.shape[1],
             batch_size=tokens.shape[0],
-            device=self.latent.device,
-            dtype=self.latent.dtype,
+            device=target_device,
+            dtype=latent.dtype,
         )
 
         return LatentState(

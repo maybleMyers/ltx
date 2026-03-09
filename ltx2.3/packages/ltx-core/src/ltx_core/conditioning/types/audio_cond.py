@@ -11,7 +11,11 @@ class AudioConditionByLatent(ConditioningItem):
         self.strength = strength
 
     def apply_to(self, latent_state: LatentState, latent_tools: LatentTools) -> LatentState:
-        tokens = latent_tools.patchifier.patchify(self.latent)
+        # Move latent to target device to support activation offloading
+        target_device = latent_state.latent.device
+        latent = self.latent.to(target_device)
+
+        tokens = latent_tools.patchifier.patchify(latent)
 
         latent_state = latent_state.clone()
 
