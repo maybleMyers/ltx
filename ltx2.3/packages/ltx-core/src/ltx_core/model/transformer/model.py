@@ -16,6 +16,62 @@ from ltx_core.model.transformer.transformer_args import (
 from ltx_core.utils import to_denoised
 
 
+def _offload_transformer_args_to_cpu(args: TransformerArgs) -> TransformerArgs:
+    from dataclasses import replace
+
+    def to_pinned(t):
+        if t is None:
+            return t
+        if t.is_pinned():
+            return t
+        pinned = torch.empty_like(t, device='cpu', pin_memory=True)
+        pinned.copy_(t.cpu() if t.is_cuda else t)
+        return pinned
+
+    def pe_to_pinned(pe):
+        if pe is None:
+            return None
+        return (to_pinned(pe[0]), to_pinned(pe[1]))
+
+    return replace(args,
+        x=to_pinned(args.x),
+        timesteps=to_pinned(args.timesteps),
+        embedded_timestep=to_pinned(args.embedded_timestep),
+        context=to_pinned(args.context),
+        context_mask=to_pinned(args.context_mask) if args.context_mask is not None else None,
+        positional_embeddings=pe_to_pinned(args.positional_embeddings),
+        cross_positional_embeddings=pe_to_pinned(args.cross_positional_embeddings),
+        cross_scale_shift_timestep=to_pinned(args.cross_scale_shift_timestep),
+        cross_gate_timestep=to_pinned(args.cross_gate_timestep),
+    )
+
+
+def _move_transformer_args_to_device(args: TransformerArgs, device: torch.device) -> TransformerArgs:
+    from dataclasses import replace
+
+    def to_device(t):
+        if t is None or t.device == device:
+            return t
+        return t.to(device)
+
+    def pe_to_device(pe):
+        if pe is None:
+            return None
+        return (to_device(pe[0]), to_device(pe[1]))
+
+    return replace(args,
+        x=to_device(args.x),
+        timesteps=to_device(args.timesteps),
+        embedded_timestep=to_device(args.embedded_timestep),
+        context=to_device(args.context),
+        context_mask=to_device(args.context_mask) if args.context_mask is not None else None,
+        positional_embeddings=pe_to_device(args.positional_embeddings),
+        cross_positional_embeddings=pe_to_device(args.cross_positional_embeddings),
+        cross_scale_shift_timestep=to_device(args.cross_scale_shift_timestep),
+        cross_gate_timestep=to_device(args.cross_gate_timestep),
+    )
+
+
 class LTXModelType(Enum):
     AudioVideo = "ltx av model"
     VideoOnly = "ltx video only model"
@@ -358,11 +414,24 @@ class LTXModel(torch.nn.Module):
                     use_reentrant=False,
                 )
             else:
-                video, audio = block(
-                    video=video,
-                    audio=audio,
-                    perturbations=perturbations,
-                )
+                # Use temporal chunking if enabled
+                temporal_chunk_size = getattr(self, '_temporal_chunk_size', 0)
+                if temporal_chunk_size > 0 and not self.training:
+                    # Determine current computation device
+                    device = "cuda" if next(self.parameters()).is_cuda else "cpu"
+                    video, audio = block.forward_chunked(
+                        video=video,
+                        audio=audio,
+                        perturbations=perturbations,
+                        chunk_size=temporal_chunk_size,
+                        device=device
+                    )
+                else:
+                    video, audio = block(
+                        video=video,
+                        audio=audio,
+                        perturbations=perturbations,
+                    )
 
         return video, audio
 
@@ -382,7 +451,19 @@ class LTXModel(torch.nn.Module):
         shift, scale = scale_shift_values[:, :, 0], scale_shift_values[:, :, 1]
 
         x = norm_out(x)
-        x = x * (1 + scale) + shift
+        # Plain block swap (without activation offload) needs non-in-place ops
+        # because tensors are reused across blocks. Activation offload creates
+        # fresh tensors per block, so in-place is safe there.
+        has_offloader = getattr(self, '_block_swap_offloader', None) is not None
+        has_activation_offload = hasattr(self, '_activation_offload_verbose')
+        plain_block_swap = has_offloader and not has_activation_offload
+        if plain_block_swap:
+            x = x * (1 + scale) + shift
+        else:
+            # Use in-place ops to avoid intermediate tensor allocations (saves ~6GB for large latents)
+            scale.add_(1)
+            x.mul_(scale)
+            x.add_(shift)
         x = proj_out(x)
         return x
 
@@ -401,6 +482,19 @@ class LTXModel(torch.nn.Module):
 
         video_args = self.video_args_preprocessor.prepare(video, audio) if video is not None else None
         audio_args = self.audio_args_preprocessor.prepare(audio, video) if audio is not None else None
+
+        if getattr(self, '_activation_offload_verbose', False):
+            if video_args is not None:
+                video_args = _offload_transformer_args_to_cpu(video_args)
+            if audio_args is not None:
+                audio_args = _offload_transformer_args_to_cpu(audio_args)
+        else:
+            device = video.latent.device if video is not None else audio.latent.device
+            if video_args is not None:
+                video_args = _move_transformer_args_to_device(video_args, device)
+            if audio_args is not None:
+                audio_args = _move_transformer_args_to_device(audio_args, device)
+
         # Process transformer blocks
         video_out, audio_out = self._process_transformer_blocks(
             video=video_args,

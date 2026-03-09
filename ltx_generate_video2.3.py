@@ -4183,7 +4183,6 @@ def encode_video_chunked(
                 result = video_encoder.tiled_encode(
                     video_tensor,
                     tiling_config,
-                    target_device=device,
                 )
 
             if torch.cuda.is_available():

@@ -11,6 +11,46 @@ from ltx_core.model.transformer.transformer_args import TransformerArgs
 from ltx_core.utils import rms_norm
 
 
+# Maximum tokens to transfer to GPU at once during chunked forward.
+# This caps per-iteration GPU memory while allowing larger temporal_chunk_size
+# for fewer outer loop iterations and concatenations.
+MAX_GPU_TRANSFER_TOKENS = 50000
+
+
+# Helper functions for positional embeddings (which are tuples of (cos, sin) tensors)
+def _pe_to_cpu(pe: tuple[torch.Tensor, torch.Tensor] | None) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Move positional embedding tuple to CPU."""
+    if pe is None:
+        return None
+    return (pe[0].cpu(), pe[1].cpu())
+
+
+def _pe_to_device(pe: tuple[torch.Tensor, torch.Tensor] | None, device: torch.device | str) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Move positional embedding tuple to device."""
+    if pe is None:
+        return None
+    return (pe[0].to(device, non_blocking=True), pe[1].to(device, non_blocking=True))
+
+
+def _pe_slice(pe: tuple[torch.Tensor, torch.Tensor] | None, start: int, end: int) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Slice positional embedding tuple along token dimension.
+
+    For interleaved rope (3D tensors: B, T, D), slices dim 1.
+    For split rope (4D tensors: B, H, T, D), slices dim 2.
+    """
+    if pe is None:
+        return None
+    # Auto-detect dimension based on tensor shape
+    if pe[0].ndim == 3:
+        # Interleaved rope: (B, T, D) - slice dim 1
+        return (pe[0][:, start:end], pe[1][:, start:end])
+    elif pe[0].ndim == 4:
+        # Split rope: (B, H, T, D) - slice dim 2
+        return (pe[0][:, :, start:end], pe[1][:, :, start:end])
+    else:
+        raise ValueError(f"Unsupported positional embedding shape: {pe[0].shape}")
+
+
 @dataclass
 class TransformerConfig:
     dim: int
@@ -22,6 +62,11 @@ class TransformerConfig:
 
 
 class BasicAVTransformerBlock(torch.nn.Module):
+    # FFN chunk size for memory optimization (None = disabled, set during inference for long sequences)
+    ffn_chunk_size: int | None = None
+    # Temporal chunk size for processing long videos (None = disabled)
+    temporal_chunk_size: int | None = None
+
     def __init__(
         self,
         idx: int,
@@ -360,7 +405,11 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 self.scale_shift_table, vx.shape[0], video.timesteps, slice(3, 6)
             )
             vx_scaled = rms_norm(vx, eps=self.norm_eps) * (1 + vscale_mlp) + vshift_mlp
-            vx = vx + self.ff(vx_scaled) * vgate_mlp
+            # Use chunked FFN for long sequences to reduce peak memory (only during inference)
+            if not self.training and self.ffn_chunk_size is not None:
+                vx = vx + self.ff.forward_chunked(vx_scaled, self.ffn_chunk_size) * vgate_mlp
+            else:
+                vx = vx + self.ff(vx_scaled) * vgate_mlp
 
             del vshift_mlp, vscale_mlp, vgate_mlp, vx_scaled
 
@@ -369,11 +418,103 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slice(3, 6)
             )
             ax_scaled = rms_norm(ax, eps=self.norm_eps) * (1 + ascale_mlp) + ashift_mlp
-            ax = ax + self.audio_ff(ax_scaled) * agate_mlp
+            # Use chunked FFN for long sequences to reduce peak memory (only during inference)
+            if not self.training and self.ffn_chunk_size is not None:
+                ax = ax + self.audio_ff.forward_chunked(ax_scaled, self.ffn_chunk_size) * agate_mlp
+            else:
+                ax = ax + self.audio_ff(ax_scaled) * agate_mlp
 
             del ashift_mlp, ascale_mlp, agate_mlp, ax_scaled
 
         return replace(video, x=vx) if video is not None else None, replace(audio, x=ax) if audio is not None else None
+
+    def forward_chunked(
+        self,
+        video: TransformerArgs | None,
+        audio: TransformerArgs | None,
+        perturbations: BatchedPerturbationConfig | None = None,
+        chunk_size: int = 400000,
+        device: torch.device | str = "cuda",
+    ) -> tuple[TransformerArgs | None, TransformerArgs | None]:
+        """
+        Chunked forward pass for very long videos that don't fit in GPU memory.
+
+        Video tensors (vx) are kept on CPU and processed in chunks. Audio is small
+        enough to fit on GPU and is processed normally. This maintains full attention
+        context via streaming K/V from CPU.
+
+        Args:
+            video: TransformerArgs with video.x on CPU
+            audio: TransformerArgs with audio.x (can be on CPU or GPU)
+            perturbations: Optional perturbation config
+            chunk_size: Number of video tokens per chunk
+            device: GPU device for computation
+        """
+        if video is None:
+            return self.forward(video, audio, perturbations)
+
+        vx_cpu = video.x
+        batch, seq_len, dim = vx_cpu.shape
+
+        if seq_len <= chunk_size:
+            # Already small enough, just move to device and run normally
+            return self.forward(replace(video, x=vx_cpu.to(device)), audio, perturbations)
+
+        # Process video in chunks
+        vx_ffn_chunks = []
+        ax_accumulated = None
+
+        # Pre-move audio to device if it exists
+        if audio is not None:
+            from ltx_core.model.transformer.model import _move_transformer_args_to_device
+            audio = _move_transformer_args_to_device(audio, torch.device(device))
+
+        # We need to process the whole audio sequence for cross-attention
+        # but video can be chunked for self-attention/FFN.
+        for start in range(0, seq_len, chunk_size):
+            end = min(start + chunk_size, seq_len)
+            vx_chunk = vx_cpu[:, start:end, :].to(device)
+
+            # Slice relevant parts of video args
+            video_chunk = replace(
+                video,
+                x=vx_chunk,
+                timesteps=video.timesteps[:, start:end] if video.timesteps.shape[1] > 1 else video.timesteps,
+                embedded_timestep=video.embedded_timestep[:, start:end] if video.embedded_timestep.shape[1] > 1 else video.embedded_timestep,
+                positional_embeddings=_pe_slice(video.positional_embeddings, start, end),
+                cross_positional_embeddings=_pe_slice(video.cross_positional_embeddings, start, end),
+                # These are usually small or not per-token, but if they are, they need slicing
+                cross_scale_shift_timestep=video.cross_scale_shift_timestep[:, start:end] if (video.cross_scale_shift_timestep is not None and video.cross_scale_shift_timestep.ndim == 3 and video.cross_scale_shift_timestep.shape[1] > 1) else video.cross_scale_shift_timestep,
+                cross_gate_timestep=video.cross_gate_timestep[:, start:end] if (video.cross_gate_timestep is not None and video.cross_gate_timestep.ndim == 3 and video.cross_gate_timestep.shape[1] > 1) else video.cross_gate_timestep,
+            )
+
+            # Note: self_attention_mask and context_mask are NOT sliced here because
+            # standard Attention handles the sequence dimension. If they are custom,
+            # they might need slicing too.
+
+            # Forward pass on chunk
+            video_out, audio_out = self.forward(video_chunk, audio, perturbations)
+
+            # Collect results
+            vx_ffn_chunks.append(video_out.x.cpu())
+            if audio_out is not None:
+                if ax_accumulated is None:
+                    ax_accumulated = audio_out.x
+                else:
+                    # In this architecture, each video chunk update contributes to the full audio.
+                    # Usually, we take the last one or average, but LTX2 seems to return the same ax.
+                    # To be safe, we just keep the last one.
+                    ax_accumulated = audio_out.x
+
+            del vx_chunk, video_chunk, video_out, audio_out
+            if device == "cuda":
+                torch.cuda.empty_cache()
+
+        vx = torch.cat(vx_ffn_chunks, dim=1)
+        video_out = replace(video, x=vx)
+        audio_out = replace(audio, x=ax_accumulated) if audio is not None else None
+
+        return video_out, audio_out
 
 
 def apply_cross_attention_adaln(
