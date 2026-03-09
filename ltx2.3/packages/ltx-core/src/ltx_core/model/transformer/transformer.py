@@ -455,19 +455,27 @@ class BasicAVTransformerBlock(torch.nn.Module):
 
         vx_cpu = video.x
         batch, seq_len, dim = vx_cpu.shape
+        device = torch.device(device) if isinstance(device, str) else device
+
+        # Import device move helper
+        from ltx_core.model.transformer.model import _move_transformer_args_to_device
+
+        # Pre-move audio to device if it exists (do this before any return paths)
+        if audio is not None:
+            audio = _move_transformer_args_to_device(audio, device)
 
         if seq_len <= chunk_size:
-            # Already small enough, just move to device and run normally
-            return self.forward(replace(video, x=vx_cpu.to(device)), audio, perturbations)
+            # Already small enough, move all video args to device and run normally
+            video = _move_transformer_args_to_device(video, device)
+            return self.forward(video, audio, perturbations)
 
         # Process video in chunks
         vx_ffn_chunks = []
         ax_accumulated = None
 
-        # Pre-move audio to device if it exists
-        if audio is not None:
-            from ltx_core.model.transformer.model import _move_transformer_args_to_device
-            audio = _move_transformer_args_to_device(audio, torch.device(device))
+        # Move video args (except x) to device - x stays on CPU for chunked processing
+        video = _move_transformer_args_to_device(replace(video, x=torch.empty(0)), device)
+        video = replace(video, x=vx_cpu)  # Restore CPU x reference
 
         # We need to process the whole audio sequence for cross-attention
         # but video can be chunked for self-attention/FFN.
@@ -507,7 +515,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                     ax_accumulated = audio_out.x
 
             del vx_chunk, video_chunk, video_out, audio_out
-            if device == "cuda":
+            if device.type == "cuda":
                 torch.cuda.empty_cache()
 
         vx = torch.cat(vx_ffn_chunks, dim=1)
