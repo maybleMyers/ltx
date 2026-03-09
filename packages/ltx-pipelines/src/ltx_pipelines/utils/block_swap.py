@@ -519,6 +519,8 @@ def enable_text_encoder_block_swap(
         gemma_model.vision_tower.to(device)
     if hasattr(gemma_model, "multi_modal_projector") and gemma_model.multi_modal_projector is not None:
         gemma_model.multi_modal_projector.to(device)
+    if hasattr(gemma_model, "lm_head") and gemma_model.lm_head is not None:
+        gemma_model.lm_head.to(device)
 
     # Move text encoder's non-Gemma components to GPU
     # These are used after hidden states extraction
