@@ -10824,32 +10824,44 @@ def generate_retake(
         )
     ]
 
-    # Encode source audio
+    # Encode source audio (matching official retake.py pattern)
     initial_audio_latent = None
     audio_conditionings = []
-    waveform, sample_rate = decode_audio_from_file(video_path, device)
-    if waveform is not None:
+    audio_in = decode_audio_from_file(video_path, device)
+    if audio_in is not None:
+        waveform = audio_in.waveform.squeeze(0)
+        waveform_sr = audio_in.sampling_rate
+
         audio_encoder = generator.stage_1_model_ledger.audio_encoder()
-        from ltx_core.model.audio_vae import AudioProcessor
-        audio_processor = AudioProcessor(
-            target_sample_rate=audio_encoder.sample_rate,
-            mel_bins=audio_encoder.mel_bins,
-            mel_hop_length=audio_encoder.mel_hop_length,
-            n_fft=audio_encoder.n_fft,
-        ).to(device)
+        from ltx_core.model.audio_vae import encode_audio as vae_encode_audio
+        from ltx_core.types import Audio, AudioLatentShape
 
-        if waveform.dim() == 3:
-            num_frames_audio, channels, samples_per_frame = waveform.shape
-            waveform = waveform.permute(1, 0, 2).reshape(channels, -1).unsqueeze(0)
-        elif waveform.dim() == 2:
-            waveform = waveform.unsqueeze(0)
-
-        mel_spectrogram = audio_processor.waveform_to_mel(
-            waveform.to(dtype=torch.float32),
-            waveform_sample_rate=sample_rate
+        # Encode audio using vae_encode_audio (same as official retake.py)
+        waveform_batch = waveform.unsqueeze(0) if waveform.dim() == 2 else waveform
+        initial_audio_latent = vae_encode_audio(
+            Audio(waveform=waveform_batch.to(dtype), sampling_rate=waveform_sr),
+            audio_encoder,
+            None,
         )
-        initial_audio_latent = audio_encoder.encode(mel_spectrogram.to(dtype=dtype)).mode()
-        del audio_encoder, audio_processor
+
+        # Trim/pad to match output_shape (same as official retake.py)
+        expected_audio_shape = AudioLatentShape.from_video_pixel_shape(output_shape)
+        expected_frames = expected_audio_shape.frames
+        actual_frames = initial_audio_latent.shape[2]
+        if actual_frames > expected_frames:
+            initial_audio_latent = initial_audio_latent[:, :, :expected_frames, :]
+        elif actual_frames < expected_frames:
+            pad = torch.zeros(
+                initial_audio_latent.shape[0],
+                initial_audio_latent.shape[1],
+                expected_frames - actual_frames,
+                initial_audio_latent.shape[3],
+                device=initial_audio_latent.device,
+                dtype=initial_audio_latent.dtype,
+            )
+            initial_audio_latent = torch.cat([initial_audio_latent, pad], dim=2)
+
+        del audio_encoder
 
         audio_conditionings = [
             TemporalRegionMask(
