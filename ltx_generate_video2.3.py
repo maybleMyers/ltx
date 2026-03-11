@@ -10970,7 +10970,15 @@ def generate_retake(
     audio_state = audio_tools.clear_conditioning(audio_state)
     audio_state = audio_tools.unpatchify(audio_state)
 
-    del transformer
+    # Cleanup transformer and contexts before decoding (matching official retake.py)
+    torch.cuda.synchronize()
+    del transformer, denoise_fn
+    del v_context_p, a_context_p
+    if use_cfg:
+        del v_context_n, a_context_n
+    del initial_video_latent, initial_audio_latent
+    del video_tools, audio_tools, pipeline_components
+    del noiser, stepper, sigmas
     cleanup_memory()
 
     # Decode video
