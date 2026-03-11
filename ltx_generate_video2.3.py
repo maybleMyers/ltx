@@ -10807,7 +10807,12 @@ def generate_retake(
         dtype=dtype,
         device=device,
     )
-    initial_video_latent = video_encoder(pixel_video)
+    initial_video_latent = encode_video_chunked(
+        pixel_video,
+        video_encoder,
+        device=device,
+        dtype=dtype,
+    )
     del pixel_video
 
     # Create temporal region mask for video
