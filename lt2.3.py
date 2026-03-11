@@ -3479,7 +3479,9 @@ def create_interface():
                         # User LoRAs (up to 8)
                         with gr.Accordion("User LoRAs (Optional)", open=True):
                             lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
-                            lora_refresh_btn = gr.Button("🔄 Refresh", size="sm")
+                            with gr.Row():
+                                lora_refresh_btn = gr.Button("🔄 Refresh", size="sm")
+                                lora_clear_all_btn = gr.Button("🗑️ Clear All", size="sm")
                             # LoRA 1
                             with gr.Row():
                                 user_lora_1 = gr.Dropdown(
@@ -4852,6 +4854,13 @@ def create_interface():
         lora_refresh_btn.click(
             fn=refresh_all_lora_dropdowns,
             inputs=[lora_folder],
+            outputs=[user_lora_1, user_lora_2, user_lora_3, user_lora_4, user_lora_5, user_lora_6, user_lora_7, user_lora_8]
+        )
+
+        # Clear all LoRAs
+        lora_clear_all_btn.click(
+            fn=lambda: ["None"] * 8,
+            inputs=[],
             outputs=[user_lora_1, user_lora_2, user_lora_3, user_lora_4, user_lora_5, user_lora_6, user_lora_7, user_lora_8]
         )
 
