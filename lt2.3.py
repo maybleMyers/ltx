@@ -4859,9 +4859,10 @@ def create_interface():
 
         # Clear all LoRAs
         lora_clear_all_btn.click(
-            fn=lambda: ["None"] * 8,
+            fn=lambda: ["None"] * 8 + ["All"] * 8,
             inputs=[],
-            outputs=[user_lora_1, user_lora_2, user_lora_3, user_lora_4, user_lora_5, user_lora_6, user_lora_7, user_lora_8]
+            outputs=[user_lora_1, user_lora_2, user_lora_3, user_lora_4, user_lora_5, user_lora_6, user_lora_7, user_lora_8,
+                     user_lora_stage_1, user_lora_stage_2, user_lora_stage_3, user_lora_stage_4, user_lora_stage_5, user_lora_stage_6, user_lora_stage_7, user_lora_stage_8]
         )
 
         # Block swap visibility toggles
