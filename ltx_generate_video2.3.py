@@ -5575,8 +5575,8 @@ class LTXVideoGeneratorWithOffloading:
                 # Skip audio VAE decode when:
                 # - audio_strength == 1.0 (frozen external audio)
                 # - v2v_audio_mode == "preserve" (copy audio from input video)
-                skip_for_external_audio = audio is not None and audio_strength == 1.0
-                skip_for_v2v_preserve = input_video and v2v_audio_mode == "preserve"
+                skip_for_external_audio = audio is not None and audio_strength == 1.0 and not v2a_mode
+                skip_for_v2v_preserve = input_video and v2v_audio_mode == "preserve" and not v2a_mode
                 if not disable_audio and not skip_for_external_audio and not skip_for_v2v_preserve:
                     print(">>> Decoding audio...")
                     audio_decoder = self.stage_1_model_ledger.audio_decoder()
@@ -6687,8 +6687,8 @@ class LTXVideoGeneratorWithOffloading:
         # Skip audio VAE decode when:
         # - audio_strength == 1.0 (frozen external audio)
         # - v2v_audio_mode == "preserve" (copy audio from input video)
-        skip_for_external_audio = audio is not None and audio_strength == 1.0
-        skip_for_v2v_preserve = input_video and v2v_audio_mode == "preserve"
+        skip_for_external_audio = audio is not None and audio_strength == 1.0 and not v2a_mode
+        skip_for_v2v_preserve = input_video and v2v_audio_mode == "preserve" and not v2a_mode
         if not disable_audio and not skip_for_external_audio and not skip_for_v2v_preserve:
             print(">>> Decoding audio...")
             audio_decoder = self.stage_2_model_ledger.audio_decoder()
@@ -11287,6 +11287,7 @@ def main():
         if args.refine_only:
             print("Error: --v2a-mode cannot be combined with --refine-only")
             sys.exit(1)
+        args.v2v_audio_mode = "regenerate"
 
     # Fast mode: override settings for distilled pipeline
     if args.fast:
