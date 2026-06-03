@@ -5576,7 +5576,7 @@ class LTXVideoGeneratorWithOffloading:
                 # - audio_strength == 1.0 (frozen external audio)
                 # - v2v_audio_mode == "preserve" (copy audio from input video)
                 skip_for_external_audio = audio is not None and audio_strength == 1.0
-                skip_for_v2v_preserve = input_video and v2v_audio_mode == "preserve"
+                skip_for_v2v_preserve = input_video and v2v_audio_mode == "preserve" and not v2a_mode
                 if not disable_audio and not skip_for_external_audio and not skip_for_v2v_preserve:
                     print(">>> Decoding audio...")
                     audio_decoder = self.stage_1_model_ledger.audio_decoder()
