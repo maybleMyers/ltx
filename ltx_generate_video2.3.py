@@ -11878,10 +11878,21 @@ def main():
         temp_audio_path = temp_audio.name
         temp_audio.close()
 
-        audio_np = audio.cpu().numpy().T
+        # Handle both Audio objects and raw tensors
+        if hasattr(audio, 'waveform'):
+            audio_tensor = audio.waveform
+            audio_sr = audio.sampling_rate if hasattr(audio, 'sampling_rate') else AUDIO_SAMPLE_RATE
+        else:
+            audio_tensor = audio
+            audio_sr = AUDIO_SAMPLE_RATE
+            
+        if audio_tensor.dim() == 3:
+            audio_tensor = audio_tensor.squeeze(0)
+
+        audio_np = audio_tensor.cpu().numpy().T
         audio_np = np.clip(audio_np, -1.0, 1.0)
         audio_int16 = (audio_np * 32767).astype(np.int16)
-        wavfile.write(temp_audio_path, AUDIO_SAMPLE_RATE, audio_int16)
+        wavfile.write(temp_audio_path, audio_sr, audio_int16)
 
         subprocess.run([
             'ffmpeg', '-y',
