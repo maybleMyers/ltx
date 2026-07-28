@@ -4435,6 +4435,12 @@ def create_interface():
                             interp_generate_btn = gr.Button("🎬 Interpolate", variant="primary", elem_classes="green-btn")
                             upscale_btn = gr.Button("🔍 Upscale", variant="secondary")
 
+                        # Save/Load Defaults
+                        with gr.Row():
+                            interp_save_defaults_btn = gr.Button("💾 Save Defaults")
+                            interp_load_defaults_btn = gr.Button("📂 Load Defaults")
+                        interp_defaults_status = gr.Textbox(label="Defaults Status", value="", interactive=False, visible=True)
+
                     # Output Column
                     with gr.Column(scale=1):
                         interp_output_video = gr.Video(label="Interpolated Video")
@@ -6039,6 +6045,99 @@ def create_interface():
                 interp_seed,  # Reuse same seed
             ],
             outputs=[interp_output_video, interp_status, interp_progress]
+        )
+
+        # =================================================================
+        # Frame Interpolation Tab Save/Load Defaults
+        # =================================================================
+        INTERP_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "interp_defaults.json")
+
+        interp_ui_default_components_ORDERED_LIST = [
+            # Model settings
+            interp_model_variant, interp_checkpoint_path, interp_config_path,
+            # Interpolation settings
+            interp_factor, interp_ds_scale, interp_output_fps,
+            # Advanced
+            interp_raft_iters, interp_pyr_level, interp_seed,
+            # Upscaling
+            upscale_enable, upscale_model, upscale_tile_size, upscale_half,
+            upscale_model_path, upscale_crf,
+            # Motion blur
+            motion_blur_enable, motion_blur_strength, motion_blur_samples,
+        ]
+
+        interp_ui_default_keys = [
+            "interp_model_variant", "interp_checkpoint_path", "interp_config_path",
+            "interp_factor", "interp_ds_scale", "interp_output_fps",
+            "interp_raft_iters", "interp_pyr_level", "interp_seed",
+            "upscale_enable", "upscale_model", "upscale_tile_size", "upscale_half",
+            "upscale_model_path", "upscale_crf",
+            "motion_blur_enable", "motion_blur_strength", "motion_blur_samples",
+        ]
+
+        def save_interp_defaults(*values):
+            os.makedirs(UI_CONFIGS_DIR, exist_ok=True)
+            settings_to_save = {}
+            for i, key in enumerate(interp_ui_default_keys):
+                settings_to_save[key] = values[i]
+            try:
+                with open(INTERP_DEFAULTS_FILE, 'w') as f:
+                    json.dump(settings_to_save, f, indent=2)
+                return "Interpolation defaults saved successfully."
+            except Exception as e:
+                return f"Error saving Interpolation defaults: {e}"
+
+        def load_interp_defaults(request: gr.Request = None):
+            if not os.path.exists(INTERP_DEFAULTS_FILE):
+                if request:
+                    return [gr.update()] * len(interp_ui_default_keys) + ["No defaults file found."]
+                else:
+                    return [gr.update()] * len(interp_ui_default_keys) + [""]
+
+            try:
+                with open(INTERP_DEFAULTS_FILE, 'r') as f:
+                    loaded_settings = json.load(f)
+            except Exception as e:
+                return [gr.update()] * len(interp_ui_default_keys) + [f"Error loading defaults: {e}"]
+
+            updates = []
+            for i, key in enumerate(interp_ui_default_keys):
+                component = interp_ui_default_components_ORDERED_LIST[i]
+                default_value_from_component = None
+                if hasattr(component, 'value'):
+                    default_value_from_component = component.value
+
+                value_to_set = loaded_settings.get(key, default_value_from_component)
+
+                # Guard dropdowns against stale values no longer in the choices list
+                if key == "interp_model_variant" and value_to_set not in GIMM_MODELS:
+                    value_to_set = default_value_from_component
+                elif key == "upscale_model" and value_to_set not in UPSCALER_MODELS:
+                    value_to_set = default_value_from_component
+
+                updates.append(gr.update(value=value_to_set))
+
+            return updates + ["Interpolation defaults loaded successfully."]
+
+        interp_save_defaults_btn.click(
+            fn=save_interp_defaults,
+            inputs=interp_ui_default_components_ORDERED_LIST,
+            outputs=[interp_defaults_status]
+        )
+        interp_load_defaults_btn.click(
+            fn=load_interp_defaults,
+            inputs=None,
+            outputs=interp_ui_default_components_ORDERED_LIST + [interp_defaults_status]
+        )
+
+        def initial_load_interp_defaults():
+            results_and_status = load_interp_defaults(None)
+            return results_and_status[:-1]
+
+        demo.load(
+            fn=initial_load_interp_defaults,
+            inputs=None,
+            outputs=interp_ui_default_components_ORDERED_LIST
         )
 
         # =================================================================
